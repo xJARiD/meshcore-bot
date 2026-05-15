@@ -2323,7 +2323,8 @@ def format_keyword_response_with_placeholders(
     response_format: str,
     message: Any,
     bot: Any,
-    mesh_info: Optional[dict[str, Any]] = None
+    mesh_info: Optional[dict[str, Any]] = None,
+    trigger: Optional[str] = None,
 ) -> str:
     """Format a keyword response string with all available placeholders.
 
@@ -2335,6 +2336,8 @@ def format_keyword_response_with_placeholders(
         message: MeshMessage instance (can be None for scheduled messages).
         bot: Bot instance (must have config, db_manager).
         mesh_info: Optional mesh network info dict (for scheduled message placeholders).
+        trigger: Optional matched keyword. When provided, {phrase} is the first
+            MeshCore mention immediately after the trigger.
 
     Returns:
         str: Formatted response string.
@@ -2349,6 +2352,36 @@ def format_keyword_response_with_placeholders(
             replacements['path'] = message.path or "Unknown"
             replacements['snr'] = message.snr or "Unknown"
             replacements['rssi'] = message.rssi or "Unknown"
+            content = (getattr(message, 'content', '') or '').strip()
+            if content.startswith('!'):
+                content = content[1:].strip()
+            command_prefix = ''
+            try:
+                command_prefix = bot.config.get('Bot', 'command_prefix', fallback='').strip()
+            except Exception:
+                command_prefix = ''
+            if command_prefix and content.startswith(command_prefix):
+                content = content[len(command_prefix):].strip()
+
+            phrase = ""
+            if trigger:
+                trigger_text = trigger.strip()
+                content_lower = content.lower()
+                trigger_lower = trigger_text.lower()
+                if content_lower == trigger_lower:
+                    mention_source = ""
+                elif (
+                    content_lower.startswith(trigger_lower)
+                    and len(content) > len(trigger_text)
+                    and content[len(trigger_text)].isspace()
+                ):
+                    mention_source = content[len(trigger_text):].strip()
+                else:
+                    mention_source = ""
+                mention_match = re.match(r'(@\[[^\]]+\])', mention_source)
+                phrase = mention_match.group(1) if mention_match else ""
+            replacements['phrase'] = phrase
+            replacements['phrase_part'] = f": {phrase}" if phrase else ""
             # Compute elapsed from message.timestamp (same as TestCommand) so it's available
             # for all keywords. Using message.elapsed would miss when it's unset on some paths.
             _translator = getattr(bot, 'translator', None)
@@ -2411,6 +2444,8 @@ def format_keyword_response_with_placeholders(
             replacements['path'] = "Unknown"
             replacements['snr'] = "Unknown"
             replacements['rssi'] = "Unknown"
+            replacements['phrase'] = ""
+            replacements['phrase_part'] = ""
             replacements['elapsed'] = "Unknown"
             replacements['connection_info'] = "Unknown"
             replacements['path_distance'] = ""

@@ -556,7 +556,12 @@ class CommandManager:
         prefix = self.bot.config.get('Bot', 'command_prefix', fallback='')
         return prefix.strip() if prefix else ''
 
-    def format_keyword_response(self, response_format: str, message: MeshMessage) -> str:
+    def format_keyword_response(
+        self,
+        response_format: str,
+        message: MeshMessage,
+        trigger: str | None = None,
+    ) -> str:
         """Format a keyword response string with message data.
 
         Args:
@@ -571,7 +576,8 @@ class CommandManager:
             response_format,
             message,
             self.bot,
-            mesh_info=None  # Keywords don't use mesh info placeholders
+            mesh_info=None,  # Keywords don't use mesh info placeholders
+            trigger=trigger,
         )
 
     def get_max_message_length(self, message: MeshMessage) -> int:
@@ -731,7 +737,7 @@ class CommandManager:
             if keyword_lower == content_lower:
                 try:
                     # Format the response with available message data
-                    response = self.format_keyword_response(response_format, message)
+                    response = self.format_keyword_response(response_format, message, trigger=keyword)
                     matches.append((keyword, response))
                 except Exception as e:
                     # Fallback to simple response if formatting fails
@@ -744,7 +750,7 @@ class CommandManager:
                 if len(content_lower) == len(keyword_lower) or content_lower[len(keyword_lower)] == ' ':
                     try:
                         # Format the response with available message data
-                        response = self.format_keyword_response(response_format, message)
+                        response = self.format_keyword_response(response_format, message, trigger=keyword)
                         matches.append((keyword, response))
                     except Exception as e:
                         # Fallback to simple response if formatting fails
