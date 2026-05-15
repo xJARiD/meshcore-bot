@@ -789,7 +789,8 @@ class GlobalWxCommand(BaseCommand):
         city = None
         if address_info:
             # Try various address fields in order of preference
-            city = (address_info.get('city') or
+            city = (address_info.get('suburb') or
+                    address_info.get('city') or
                     address_info.get('town') or
                     address_info.get('village') or
                     address_info.get('municipality') or
