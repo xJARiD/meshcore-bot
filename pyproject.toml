@@ -44,6 +44,9 @@ geo = ["pycountry>=23.12.0", "us>=2.0.0"]
 test = ["pytest>=7.0", "pytest-asyncio>=0.21", "pytest-mock>=3.10", "pytest-cov>=4.0", "pytest-timeout>=2.1.0", "types-requests>=2.31"]
 docs = ["mkdocs-material>=9.0.0", "mkdocs-exclude>=1.0.0"]
 
+[dependency-groups]
+lint = ["ruff>=0.8.0", "mypy>=1.10.0"]
+
 [project.scripts]
 meshcore-bot = "meshcore_bot:main"
 meshcore-viewer = "modules.web_viewer.app:main"

@@ -10,13 +10,11 @@ TARGET_ASSET="modules/web_viewer/static/ico/site.webmanifest"
 echo "==> Checking package data in built artifacts"
 echo "    Target asset: ${TARGET_ASSET}"
 
-python3 -m pip install --disable-pip-version-check --no-input --quiet build
-
 rm -rf "${DIST_DIR}/_pkgcheck"
 mkdir -p "${DIST_DIR}/_pkgcheck"
 trap 'rm -rf "${DIST_DIR}/_pkgcheck"' EXIT
 
-python3 -m build --sdist --wheel --outdir "${DIST_DIR}/_pkgcheck" "${PROJECT_ROOT}"
+uv run --with build python -m build --sdist --wheel --outdir "${DIST_DIR}/_pkgcheck" "${PROJECT_ROOT}"
 
 WHEEL_FILE="$(ls "${DIST_DIR}/_pkgcheck"/*.whl | head -n 1)"
 SDIST_FILE="$(ls "${DIST_DIR}/_pkgcheck"/*.tar.gz | head -n 1)"

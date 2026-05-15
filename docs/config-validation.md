@@ -7,20 +7,20 @@ The bot can validate your `config.ini` for section names and path writability be
 **Standalone script** (no bot startup):
 
 ```bash
-python validate_config.py [--config config.ini]
+uv run python validate_config.py [--config config.ini]
 ```
 
 **At bot startup** (validate then exit):
 
 ```bash
-python meshcore_bot.py --validate-config [--config config.ini]
+uv run python meshcore_bot.py --validate-config [--config config.ini]
 ```
 
 **Inspect resolved config** (redacted, then exit):
 
 ```bash
-python meshcore_bot.py --show-config [--config config.ini]
-python meshcore_bot.py --show-config-json [--config config.ini]
+uv run python meshcore_bot.py --show-config [--config config.ini]
+uv run python meshcore_bot.py --show-config-json [--config config.ini]
 ```
 
 - **Exit 0** – No errors (warnings and info may still be printed).
@@ -76,7 +76,7 @@ The validator checks that paths for **database**, **log file**, and **Web_Viewer
 ## Example
 
 ```bash
-$ python validate_config.py --config config.ini
+$ uv run python validate_config.py --config config.ini
 Warning: Non-standard section [WebViewer]; did you mean [Web_Viewer]?
 Info: Section [Localization] absent; using defaults (language=en, translation_path=translations/).
 ```

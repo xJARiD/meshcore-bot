@@ -68,7 +68,8 @@ sudo systemctl enable meshcore-bot
 
 ### 5. Install Dependencies
 ```bash
-sudo pip3 install -r /opt/meshcore-bot/requirements.txt
+cd /opt/meshcore-bot
+sudo UV_PROJECT_ENVIRONMENT=/opt/meshcore-bot/venv uv sync --locked --no-dev
 ```
 
 ## Service Management
@@ -148,7 +149,7 @@ sudo systemctl restart meshcore-bot
 1. Check service status: `sudo systemctl status meshcore-bot`
 2. View logs: `sudo journalctl -u meshcore-bot -n 50`
 3. Check configuration: `sudo nano /opt/meshcore-bot/config.ini`
-4. Verify dependencies: `sudo pip3 list | grep meshcore`
+4. Verify dependencies: `sudo /opt/meshcore-bot/venv/bin/python -m pip list | grep meshcore`
 
 ### SyntaxError: f-string: unmatched '[' (Python 3.11)
 If the bot fails on import with this error in `meshcore/commands/contact.py`, you are on Python 3.11 and the **meshcore** dependency uses an f-string that only works on Python 3.12+.

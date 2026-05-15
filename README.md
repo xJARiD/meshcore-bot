@@ -44,6 +44,7 @@ A Python bot that connects to MeshCore mesh networks via serial port, BLE, or TC
 ## Requirements
 
 - Python 3.10+
+- uv
 - MeshCore-compatible device (Heltec V3, RAK Wireless, etc.)
 - USB cable or BLE capability
 
@@ -57,7 +58,7 @@ git clone https://github.com/agessaman/meshcore-bot
 cd meshcore-bot
 ```
 
-2. Create a virtual environment and install dependencies via Makefile:
+2. Create a uv-managed virtual environment and install dependencies via Makefile:
 ```bash
 make dev          # creates .venv, installs all deps including test tools
 ```
@@ -88,7 +89,7 @@ cp config.ini.minimal-example config.ini
 
 4. Run the bot:
 ```bash
-.venv/bin/python meshcore_bot.py
+uv run python meshcore_bot.py
 ```
 
 5. Run tests and linting:
@@ -470,12 +471,12 @@ email_send_time = 06:00         # nightly digest send time (HH:MM local)
 ### Running the Bot
 
 ```bash
-.venv/bin/python meshcore_bot.py
+uv run python meshcore_bot.py
 ```
 
 Or if installed as a package entry point:
 ```bash
-.venv/bin/meshcore-bot
+uv run meshcore-bot
 ```
 
 ### Available Commands

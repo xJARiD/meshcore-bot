@@ -1,6 +1,6 @@
 # Makefile for meshcore-bot
 # Usage:
-#   make install   — install runtime + optional dependencies into a venv
+#   make install   — install runtime + optional dependencies into a uv-managed venv
 #   make dev       — install everything needed for development (tests, lint)
 #   make test      — run pytest with coverage
 #   make lint      — run ruff check + mypy
@@ -11,10 +11,7 @@
 
 PYTHON  ?= python3
 VENV    := .venv
-PIP     := $(VENV)/bin/pip
-PYTEST  := $(VENV)/bin/pytest
-RUFF    := $(VENV)/bin/ruff
-MYPY    := $(VENV)/bin/mypy
+UV      ?= uv
 
 .PHONY: all install dev test test-no-cov lint fix deb config clean
 
@@ -24,38 +21,33 @@ all: dev
 # Environment setup
 # ---------------------------------------------------------------------------
 
-$(VENV)/bin/python:
-	$(PYTHON) -m venv $(VENV)
-	$(PIP) install --upgrade pip setuptools wheel
+install:
+	$(UV) sync --extra profanity --extra geo
 
-install: $(VENV)/bin/python
-	$(PIP) install -e ".[profanity,geo]"
-
-dev: $(VENV)/bin/python
-	$(PIP) install -e ".[profanity,geo,test]"
-	$(PIP) install ruff mypy
+dev:
+	$(UV) sync --extra profanity --extra geo --extra test --group lint
 
 # ---------------------------------------------------------------------------
 # Testing
 # ---------------------------------------------------------------------------
 
-test: $(VENV)/bin/python
-	$(PYTEST) tests/ -v --tb=short
+test:
+	$(UV) run pytest tests/ -v --tb=short
 
 # Run tests without the coverage threshold (useful during initial development)
-test-no-cov: $(VENV)/bin/python
-	$(PYTEST) tests/ -v --tb=short --no-cov
+test-no-cov:
+	$(UV) run pytest tests/ -v --tb=short --no-cov
 
 # ---------------------------------------------------------------------------
 # Linting
 # ---------------------------------------------------------------------------
 
-lint: $(VENV)/bin/python
-	$(RUFF) check modules/ tests/
-	$(MYPY) modules/
+lint:
+	$(UV) run ruff check modules/ tests/
+	$(UV) run mypy modules/
 
-fix: $(VENV)/bin/python
-	$(RUFF) check --fix modules/ tests/
+fix:
+	$(UV) run ruff check --fix modules/ tests/
 
 # ---------------------------------------------------------------------------
 # Packaging
@@ -72,8 +64,8 @@ deb:
 
 # Launch the interactive ncurses config editor.
 # Pass CONFIG= to open a specific config file (default: config.ini).
-config: $(VENV)/bin/python
-	$(VENV)/bin/python scripts/config_tui.py $(CONFIG)
+config:
+	$(UV) run python scripts/config_tui.py $(CONFIG)
 
 # ---------------------------------------------------------------------------
 # Housekeeping

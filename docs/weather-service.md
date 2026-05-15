@@ -177,7 +177,7 @@ Common issues:
 
 ### Lightning Not Working
 
-1. **Check dependencies**: `pip install paho-mqtt`
+1. **Check dependencies**: run `uv sync --locked` from the project root
 2. **Check area config** - All 4 coordinates required (min/max lat/lon)
 3. **Check MQTT connection** - Service logs "Connected to Blitzortung MQTT"
 

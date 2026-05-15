@@ -191,7 +191,7 @@ tail -f meshcore_bot.log | grep PacketCapture
 
 Common issues:
 - `enabled = false` in config
-- Missing `paho-mqtt` library: `pip install paho-mqtt`
+- Missing `paho-mqtt` library: run `uv sync --locked` from the project root
 
 ### MQTT Not Connecting
 
