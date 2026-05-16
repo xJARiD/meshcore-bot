@@ -75,6 +75,18 @@ class TestIsChannelAllowed:
         assert cmd.is_channel_allowed(msg) is False
 
 
+class TestFormatResponse:
+    """Tests for BaseCommand response placeholder formatting."""
+
+    def test_direct_dm_without_path_formats_path_as_direct(self, command_mock_bot):
+        cmd = PingCommand(command_mock_bot)
+        msg = MeshMessage(content="ping", sender_id="Alice", is_dm=True, hops=0, path=None)
+
+        response = cmd.format_response(msg, "Pong! @[{sender}] {path}")
+
+        assert response == "Pong! @[Alice] Direct"
+
+
 class TestGetConfigValue:
     """Tests for get_config_value() section migration."""
 

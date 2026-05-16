@@ -2349,7 +2349,14 @@ def format_keyword_response_with_placeholders(
         if message:
             # Basic message fields
             replacements['sender'] = message.sender_id or "Unknown"
-            replacements['path'] = message.path or "Unknown"
+            if (
+                not getattr(message, 'path', None)
+                and getattr(message, 'is_dm', False)
+                and getattr(message, 'hops', None) == 0
+            ):
+                replacements['path'] = "Direct"
+            else:
+                replacements['path'] = message.path or "Unknown"
             replacements['snr'] = message.snr or "Unknown"
             replacements['rssi'] = message.rssi or "Unknown"
             content = (getattr(message, 'content', '') or '').strip()

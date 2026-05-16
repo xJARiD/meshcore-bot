@@ -666,6 +666,7 @@ class TestFormatKeywordResponseWithPlaceholders:
         msg.content = kwargs.get("content", "ping")
         msg.sender_id = kwargs.get("sender_id", "Alice")
         msg.path = kwargs.get("path", "01,5f")
+        msg.is_dm = kwargs.get("is_dm", False)
         msg.snr = kwargs.get("snr", 10)
         msg.rssi = kwargs.get("rssi", -80)
         msg.timestamp = kwargs.get("timestamp")
@@ -678,6 +679,13 @@ class TestFormatKeywordResponseWithPlaceholders:
         with patch("modules.utils.calculate_path_distances", return_value=("", "")):
             result = format_keyword_response_with_placeholders("{sender}", msg, bot)
         assert result == "Bob"
+
+    def test_direct_dm_without_path_formats_path_as_direct(self):
+        bot = self._bot()
+        msg = self._msg(path=None, is_dm=True, hops=0)
+        with patch("modules.utils.calculate_path_distances", return_value=("", "")):
+            result = format_keyword_response_with_placeholders("{path}", msg, bot)
+        assert result == "Direct"
 
     def test_no_message_uses_unknown_defaults(self):
         bot = self._bot()
