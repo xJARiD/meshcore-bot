@@ -1022,8 +1022,8 @@ class CommandManager:
                     self.logger.debug("Using send_msg_with_retry for improved reliability")
 
                     # Use send_msg_with_retry with configurable retry parameters
-                    max_attempts = self.bot.config.getint('Bot', 'dm_max_retries', fallback=3)
-                    max_flood_attempts = self.bot.config.getint('Bot', 'dm_max_flood_attempts', fallback=2)
+                    max_attempts = self.bot.config.getint('Bot', 'dm_max_retries', fallback=1)
+                    max_flood_attempts = self.bot.config.getint('Bot', 'dm_max_flood_attempts', fallback=0)
                     flood_after = self.bot.config.getint('Bot', 'dm_flood_after', fallback=2)
                     timeout = 0  # Use suggested timeout from meshcore
 

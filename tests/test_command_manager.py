@@ -432,6 +432,29 @@ class TestSendDMRecipientResolution:
         assert sent_contact["public_key"].startswith("ab12")
 
     @pytest.mark.asyncio
+    async def test_send_dm_retry_defaults_are_single_attempt_no_flood(self, cm_bot):
+        """Default DM send retry settings avoid duplicate bot replies when ACKs are flaky."""
+        from meshcore import EventType
+
+        cm_bot.connected = True
+        cm_bot.meshcore = Mock()
+        cm_bot.meshcore.get_contact_by_name = Mock(return_value={"name": "Alice"})
+        cm_bot.meshcore.commands = Mock(spec=["send_msg_with_retry"])
+        cm_bot.meshcore.commands.send_msg_with_retry = AsyncMock(
+            return_value=Mock(type=EventType.MSG_SENT, payload=None)
+        )
+        cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
+        manager = make_manager(cm_bot)
+
+        result = await manager.send_dm("Alice", "Hello mesh")
+
+        assert result is True
+        cm_bot.meshcore.commands.send_msg_with_retry.assert_awaited_once()
+        _, kwargs = cm_bot.meshcore.commands.send_msg_with_retry.await_args
+        assert kwargs["max_attempts"] == 1
+        assert kwargs["max_flood_attempts"] == 0
+
+    @pytest.mark.asyncio
     async def test_send_dm_fails_when_name_and_prefix_lookup_miss(self, cm_bot):
         """send_dm should fail when recipient cannot be resolved by name or prefix."""
         cm_bot.connected = True
