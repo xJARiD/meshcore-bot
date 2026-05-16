@@ -57,6 +57,11 @@ class MessageHandler:
         # Message correlation system to prevent race conditions
         self.pending_messages: dict[str, PendingMessageEntry] = {}  # Store messages waiting for RF data
 
+        # Short-term inbound message dedupe. MeshCore can surface the same DM
+        # more than once as it arrives through multiple paths.
+        self._recent_processed_message_keys: OrderedDict[str, float] = OrderedDict()
+        self._message_dedupe_window = float(bot.config.get("Bot", "message_dedupe_window", fallback="10.0"))
+
         # Enhanced RF data storage with better correlation
         self.rf_data_by_timestamp: dict[int | float, dict[str, Any]] = {}  # Index by timestamp for faster lookup
         self.rf_data_by_pubkey: dict[str, list[dict[str, Any]]] = {}  # Index by pubkey for exact matches
@@ -454,10 +459,55 @@ class MessageHandler:
                 )
                 return  # Read the message to clear cache, but don't process it
 
+            if self._is_duplicate_inbound_message(message):
+                self.logger.info(
+                    f"Skipping duplicate DM from {sender_name} "
+                    f"(timestamp: {timestamp}, content: {sanitize_name(message_content)})"
+                )
+                return
+
             await self.process_message(message)
 
         except Exception as e:
             self.logger.error(f"Error handling contact message: {e}")
+
+    def _is_duplicate_inbound_message(self, message: MeshMessage) -> bool:
+        """Return True if this inbound message was already processed recently."""
+        dedupe_key = self._build_inbound_message_key(message)
+        if dedupe_key is None:
+            return False
+
+        now = time.time()
+        cutoff = now - self._message_dedupe_window
+        while self._recent_processed_message_keys:
+            oldest_key, oldest_seen = next(iter(self._recent_processed_message_keys.items()))
+            if oldest_seen >= cutoff:
+                break
+            self._recent_processed_message_keys.pop(oldest_key, None)
+
+        if dedupe_key in self._recent_processed_message_keys:
+            self._recent_processed_message_keys.move_to_end(dedupe_key)
+            self._recent_processed_message_keys[dedupe_key] = now
+            return True
+
+        self._recent_processed_message_keys[dedupe_key] = now
+        return False
+
+    @staticmethod
+    def _build_inbound_message_key(message: MeshMessage) -> str | None:
+        """Build a stable dedupe key for messages with sender timestamps."""
+        timestamp = message.timestamp
+        try:
+            timestamp_value = int(float(timestamp))
+        except (TypeError, ValueError):
+            return None
+        if timestamp_value <= 0:
+            return None
+
+        sender_key = message.sender_pubkey or message.sender_id or ""
+        context = "dm" if message.is_dm else (message.channel or "")
+        content = message.content.strip()
+        return f"{context}|{sender_key}|{timestamp_value}|{content}"
 
     async def handle_raw_data(self, event: Any, metadata: dict[str, Any] | None = None) -> None:
         """Handle raw data events (full packet data from debug mode).

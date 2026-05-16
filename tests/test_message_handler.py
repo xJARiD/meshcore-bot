@@ -543,6 +543,23 @@ class TestHandleContactMessage:
                     await handler.handle_contact_message(event)
         mock_pm.assert_called_once()
 
+    async def test_duplicate_dm_is_processed_once(self, handler):
+        self._setup_handler(handler)
+        handler.bot.connection_time = None
+        event = self._make_event({
+            "pubkey_prefix": "ab12",
+            "text": "coffee",
+            "path_len": 255,
+            "sender_timestamp": int(time.time()),
+        })
+        with patch.object(handler, "process_message", new_callable=AsyncMock) as mock_pm:
+            with patch.object(handler, "_debug_decode_message_path", new_callable=AsyncMock):
+                with patch.object(handler, "_debug_decode_packet_for_message", new_callable=AsyncMock):
+                    await handler.handle_contact_message(event)
+                    await handler.handle_contact_message(event)
+
+        mock_pm.assert_called_once()
+
     async def test_snr_from_payload(self, handler):
         self._setup_handler(handler)
         handler.bot.connection_time = None
