@@ -497,6 +497,8 @@ class MessageHandler:
     def _build_inbound_message_key(message: MeshMessage) -> str | None:
         """Build a stable dedupe key for messages with sender timestamps."""
         timestamp = message.timestamp
+        if timestamp is None:
+            return None
         try:
             timestamp_value = int(float(timestamp))
         except (TypeError, ValueError):
