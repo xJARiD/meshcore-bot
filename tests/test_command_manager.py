@@ -266,6 +266,20 @@ class TestGetHelpForCommand:
         assert call_args[0][0] == "commands.help.unknown"
         assert call_args[1]["command"] == "nonexistent"
 
+    def test_custom_keyword_help_resolves_before_unknown(self, cm_bot):
+        cm_bot.config.add_section("Keyword_Help")
+        cm_bot.config.set("Keyword_Help", "pingu", '"Usage: pingu @[Name]\\nSummons someone."')
+        manager = make_manager(cm_bot)
+
+        result = manager.get_help_for_command("pingu")
+
+        assert "Usage: pingu @[Name]\nSummons someone." in result
+        cm_bot.translator.translate.assert_called_with(
+            "commands.help.specific",
+            command="pingu",
+            help_text="Usage: pingu @[Name]\nSummons someone.",
+        )
+
     def test_keyword_mapping_alias_resolves_command(self, cm_bot):
         mock_cmd = MagicMock()
         mock_cmd.keywords = ["schedule"]

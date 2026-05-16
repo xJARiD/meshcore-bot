@@ -7,7 +7,9 @@ Provides help information for commands and general usage
 from collections import defaultdict
 from typing import Any, Optional
 
+from ..config_validation import strip_optional_quotes
 from ..models import MeshMessage
+from ..utils import decode_escape_sequences
 from .base_command import BaseCommand
 
 
@@ -96,6 +98,10 @@ class HelpCommand(BaseCommand):
         requested_name = command_name.strip()
         normalized_name = requested_name.lower()
 
+        custom_help = self._get_custom_keyword_help(normalized_name)
+        if custom_help is not None:
+            return self.translate('commands.help.specific', command=command_name, help_text=custom_help)
+
         # Get the command instance by direct name first
         command = (
             self.bot.command_manager.commands.get(normalized_name)
@@ -133,6 +139,18 @@ class HelpCommand(BaseCommand):
         else:
             available = self.get_available_commands_list(message)
             return self.translate('commands.help.unknown', command=command_name, available=available)
+
+    def _get_custom_keyword_help(self, normalized_name: str) -> str | None:
+        """Return configured help text for a custom keyword, if present."""
+        config = getattr(self.bot, 'config', None)
+        if not config or not config.has_section('Keyword_Help'):
+            return None
+
+        for keyword, help_text in config.items('Keyword_Help'):
+            if keyword.lower() == normalized_name:
+                help_text = strip_optional_quotes(help_text.strip())
+                return decode_escape_sequences(help_text) if help_text else None
+        return None
 
     def get_general_help(self) -> str:
         """Get general help text.
@@ -305,5 +323,3 @@ class HelpCommand(BaseCommand):
                         return ', '.join(result) + suffix
                 break
         return ', '.join(result)
-
-

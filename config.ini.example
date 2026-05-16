@@ -399,6 +399,11 @@ pong = "Ping!"
 # Override 'cmd' command output
 # cmd = "Available commands: test (or t), ping, version, help, hello, cmd, advert, wx, aqi, sun, moon, solar, hfcond, satpass, prefix, path, sports, dice, roll, stats"
 
+[Keyword_Help]
+# Optional detailed help for custom [Keywords] entries.
+# Example: help pingu
+# pingu = "Usage: pingu @[Name]\nSummons the named person with a penguin-themed response."
+
 [RandomLine]
 # Configurable command to act on a trigger word and respond with a random line from its file
 # triggers.<key> = csv list of trigger words

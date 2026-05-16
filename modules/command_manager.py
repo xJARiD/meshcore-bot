@@ -1254,6 +1254,14 @@ class CommandManager:
         requested_name = command_name.strip()
         normalized_name = requested_name.lower()
 
+        custom_help = self._get_custom_keyword_help(normalized_name)
+        if custom_help is not None:
+            if hasattr(self.bot, 'translator'):
+                return self.bot.translator.translate(
+                    'commands.help.specific', command=command_name, help_text=custom_help
+                )
+            return f"Help {command_name}: {custom_help}"
+
         # First, try to find a command by exact name
         command = self.commands.get(normalized_name) or self.commands.get(requested_name)
         if command:
@@ -1321,6 +1329,18 @@ class CommandManager:
         if hasattr(self.bot, 'translator'):
             return self.bot.translator.translate('commands.help.unknown', command=command_name, available=available_str)
         return f"Unknown: {command_name}. Available: {available_str}. Try 'help' for command list."
+
+    def _get_custom_keyword_help(self, normalized_name: str) -> str | None:
+        """Return configured help text for a custom keyword, if present."""
+        config = getattr(self.bot, 'config', None)
+        if not config or not config.has_section('Keyword_Help'):
+            return None
+
+        for keyword, help_text in config.items('Keyword_Help'):
+            if keyword.lower() == normalized_name:
+                help_text = strip_optional_quotes(help_text.strip())
+                return decode_escape_sequences(help_text) if help_text else None
+        return None
 
     # Prefix and suffix for general help (reserve space so suffix is never cut off)
     _HELP_PREFIX = "Bot Help: "

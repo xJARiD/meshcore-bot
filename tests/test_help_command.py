@@ -221,6 +221,20 @@ class TestGetSpecificHelp:
         result = cmd.get_specific_help("unknowncmd")
         assert "commands.help.unknown" in result
 
+    def test_custom_keyword_help(self):
+        bot = _make_bot()
+        bot.config.add_section("Keyword_Help")
+        bot.config.set("Keyword_Help", "pingu", '"Usage: pingu @[Name]\\nSummons someone."')
+        bot.command_manager.commands = {}
+        bot.translator.translate = Mock(
+            side_effect=lambda key, **kw: f"{kw.get('command')}: {kw.get('help_text')}"
+        )
+        cmd = HelpCommand(bot)
+
+        result = cmd.get_specific_help("pingu")
+
+        assert result == "pingu: Usage: pingu @[Name]\nSummons someone."
+
     def test_alias_mapping_applied(self):
         """Alias 'ping' maps to itself."""
         bot = _make_bot()
