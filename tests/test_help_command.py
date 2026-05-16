@@ -216,10 +216,18 @@ class TestGetSpecificHelp:
 
     def test_unknown_command_returns_unknown_key(self):
         bot = _make_bot()
+        bot.config.set(
+            "Keywords",
+            "help",
+            "Bot Help: ping, pingu, paths | More: 'help <command>'",
+        )
         bot.command_manager.commands = {}
+        bot.translator.translate = Mock(
+            side_effect=lambda key, **kw: f"{kw.get('command')}: {kw.get('available')}"
+        )
         cmd = HelpCommand(bot)
         result = cmd.get_specific_help("unknowncmd")
-        assert "commands.help.unknown" in result
+        assert result == "unknowncmd: ping, pingu, paths"
 
     def test_custom_keyword_help(self):
         bot = _make_bot()

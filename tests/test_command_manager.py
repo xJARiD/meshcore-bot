@@ -258,6 +258,11 @@ class TestGetHelpForCommand:
         )
 
     def test_unknown_command_returns_error(self, cm_bot):
+        cm_bot.config.set(
+            "Keywords",
+            "help",
+            "Bot Help: ping, pingu, paths | More: 'help <command>'",
+        )
         manager = make_manager(cm_bot)
         manager.get_help_for_command("nonexistent")
         # Translator receives 'commands.help.unknown' key with command name
@@ -265,6 +270,7 @@ class TestGetHelpForCommand:
         call_args = cm_bot.translator.translate.call_args
         assert call_args[0][0] == "commands.help.unknown"
         assert call_args[1]["command"] == "nonexistent"
+        assert call_args[1]["available"] == "ping, pingu, paths"
 
     def test_custom_keyword_help_resolves_before_unknown(self, cm_bot):
         cm_bot.config.add_section("Keyword_Help")

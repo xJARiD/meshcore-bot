@@ -1310,12 +1310,15 @@ class CommandManager:
                 return f"Help {command_name}: {help_text}"
 
         # If still not found, return unknown command message with helpful suggestion
-        # Use the help command's method to get popular commands (only primary names, no aliases)
-        available_str = ""
-        if 'help' in self.commands:
-            help_command = self.commands['help']
-            if hasattr(help_command, 'get_available_commands_list'):
-                available_str = help_command.get_available_commands_list(message)
+        # Prefer the operator's configured [Keywords] help text so unknown-command
+        # suggestions match the advertised command surface.
+        available_str = self._get_configured_help_available_commands()
+        if not available_str:
+            # Use the help command's method to get popular commands (only primary names, no aliases)
+            if 'help' in self.commands:
+                help_command = self.commands['help']
+                if hasattr(help_command, 'get_available_commands_list'):
+                    available_str = help_command.get_available_commands_list(message)
 
         # Fallback if help command doesn't have the method
         if not available_str:
@@ -1341,6 +1344,22 @@ class CommandManager:
                 help_text = strip_optional_quotes(help_text.strip())
                 return decode_escape_sequences(help_text) if help_text else None
         return None
+
+    def _get_configured_help_available_commands(self) -> str:
+        """Return the command list from [Keywords] help, without help-specific wrappers."""
+        help_text = self.keywords.get('help')
+        if not help_text:
+            return ""
+        return self._extract_available_commands_from_help_text(help_text)
+
+    def _extract_available_commands_from_help_text(self, help_text: str) -> str:
+        """Normalize configured help text for embedding in unknown-command replies."""
+        available = help_text.strip()
+        if available.startswith(self._HELP_PREFIX):
+            available = available[len(self._HELP_PREFIX):].strip()
+        if available.endswith(self._HELP_SUFFIX):
+            available = available[: -len(self._HELP_SUFFIX)].rstrip()
+        return available
 
     # Prefix and suffix for general help (reserve space so suffix is never cut off)
     _HELP_PREFIX = "Bot Help: "
