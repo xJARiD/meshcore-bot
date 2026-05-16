@@ -7,6 +7,7 @@ Manages a database of repeater contacts and provides purging functionality
 import asyncio
 import json
 import time
+from collections.abc import MutableMapping
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -2841,6 +2842,7 @@ class RepeaterManager:
             result = await self.bot.meshcore.commands.add_contact(contact_data)
             if hasattr(result, 'type') and result.type == EventType.OK:
                 self.logger.info("Companion %s added to device contacts", contact_name)
+                await self._refresh_added_contact_cache(contact_data, contact_name, public_key)
                 return True
 
             if self._is_meshcore_table_full(result):
@@ -2852,6 +2854,7 @@ class RepeaterManager:
                 result = await self.bot.meshcore.commands.add_contact(contact_data)
                 if hasattr(result, 'type') and result.type == EventType.OK:
                     self.logger.info('Companion %s added after retry', contact_name)
+                    await self._refresh_added_contact_cache(contact_data, contact_name, public_key)
                     return True
 
             self.logger.warning('Failed to add companion %s to device: %s', contact_name, result)
@@ -2859,6 +2862,47 @@ class RepeaterManager:
         except Exception as e:
             self.logger.error('Error adding companion %s: %s', contact_name, e)
             return False
+
+    async def _refresh_added_contact_cache(
+        self,
+        contact_data: dict[str, Any],
+        contact_name: str,
+        public_key: str,
+    ) -> None:
+        """Refresh meshcore.contacts after adding a companion, then patch cache if needed."""
+        if not self.bot.meshcore:
+            return
+
+        commands = getattr(self.bot.meshcore, 'commands', None)
+        if commands and hasattr(commands, 'get_contacts'):
+            try:
+                await commands.get_contacts()
+            except Exception as e:
+                self.logger.debug('Could not refresh contacts after adding %s: %s', contact_name, e)
+
+        contacts = getattr(self.bot.meshcore, 'contacts', None)
+        if contacts is None or not isinstance(contacts, MutableMapping):
+            try:
+                self.bot.meshcore.contacts = {}
+                contacts = self.bot.meshcore.contacts
+            except Exception as e:
+                self.logger.debug('Could not create contacts cache after adding %s: %s', contact_name, e)
+                return
+
+        public_key = (public_key or contact_data.get('public_key') or '').strip()
+        if not public_key:
+            return
+
+        if any((c.get('public_key') or '').startswith(public_key) or public_key.startswith(c.get('public_key') or '')
+               for c in contacts.values()):
+            return
+
+        cached_contact = dict(contact_data)
+        cached_contact.setdefault('public_key', public_key)
+        cached_contact.setdefault('name', contact_name)
+        cached_contact.setdefault('adv_name', contact_name)
+        contacts[public_key] = cached_contact
+        self.logger.debug('Updated local contacts cache for %s after add', contact_name)
 
     async def apply_device_mode_firmware_preferences(self) -> bool:
         """Set companion-radio firmware: manual per-type adds + overwrite oldest non-favourite + chat-only (0x03)."""
