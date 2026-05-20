@@ -1,0 +1,42 @@
+name: EastMesh Build and deploy Docs site to GitHub Pages
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - eastmesh
+
+permissions:
+  contents: write
+
+jobs:
+  github-pages:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v6.0.2
+
+      - name: Setup Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.0.0
+
+      - name: Sync Docs Tooling
+        run: uv sync --locked --extra docs
+
+      - name: Build
+        run: uv run --extra docs zensical build --strict
+
+      - name: Write CNAME
+        if: ${{ vars.PAGES_CNAME != '' }}
+        run: printf '%s\n' "${{ vars.PAGES_CNAME }}" > site/CNAME
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4.0.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          publish_branch: "gh-pages"

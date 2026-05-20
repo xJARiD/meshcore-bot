@@ -1,74 +1,49 @@
-# Material for MkDocs - meshcore-bot documentation
-site_name: Meshcore Bot Documentation
-site_description: Documentation for the MeshCore bot and its services
-site_url: https://agessaman.github.io/meshcore-bot/
+site_name: MeshCore Bot Docs
+site_url: https://xjarid.github.io/meshcore-bot/
+site_description: Documentation for the EastMesh MeshCore bot
 
-repo_name: meshcore-bot
-repo_url: https://github.com/agessaman/meshcore-bot
-edit_uri: edit/main/docs/
+repo_name: xJARiD/meshcore-bot
+repo_url: https://github.com/xJARiD/meshcore-bot
+edit_uri: edit/develop/eastmesh-docs/
+docs_dir: eastmesh-docs
 
 theme:
   name: material
-  language: en
-  palette:
-    - scheme: default
-      primary: indigo
-      accent: cyan
-      toggle:
-        icon: material/brightness-7
-        name: Switch to dark mode
-    - scheme: slate
-      primary: indigo
-      accent: cyan
-      toggle:
-        icon: material/brightness-4
-        name: Switch to light mode
+  logo: _assets/xjarid.svg
+  favicon: _assets/xjarid.svg
   features:
-    - navigation.instant
-    - navigation.tracking
-    - navigation.tabs
-    - navigation.sections
-    - toc.integrate
+    - content.action.edit
     - content.code.copy
+    - search.highlight
+    - search.suggest
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+extra_css:
+  - _stylesheets/extra.css
 
 plugins:
   - search
-  - exclude:
-      glob:
-        - local/**
 
 markdown_extensions:
-  - pymdownx.superfences
-  - pymdownx.highlight:
-      anchor_linenums: true
-  - pymdownx.tabbed:
-      alternate_style: true
   - tables
-  - attr_list
-  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
 
 nav:
   - Home: index.md
-  - Quick Start: getting-started.md
-  - Installation:
-    - Overview: installation.md
-    - Docker: docker.md
-    - Service: service-installation.md
-  - Configuration:
-    - Overview: configuration.md
-    - Data retention: data-retention.md
-    - Local plugins and services: local-plugins.md
-    - Check-in API: checkin-api.md
-    - Path Command: path-command-config.md
-    - Config validation: config-validation.md
-  - Web Viewer: web-viewer.md
-  - Command Reference: command-reference.md
-  - Service Plugins:
-    - Overview: service-plugins.md
-    - Discord Bridge: discord-bridge.md
-    - Packet Capture: packet-capture.md
-    - Map Uploader: map-uploader.md
-    - Weather Service: weather-service.md
-    - Feed Management: feeds.md
-  - FAQ: faq.md
-  - Upgrade: upgrade.md
