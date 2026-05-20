@@ -2389,6 +2389,11 @@ def format_keyword_response_with_placeholders(
                 phrase = mention_match.group(1) if mention_match else ""
             replacements['phrase'] = phrase
             replacements['phrase_part'] = f": {phrase}" if phrase else ""
+            if getattr(message, 'is_dm', False):
+                region = "dm"
+            else:
+                region = (getattr(message, 'reply_scope', None) or "").strip() or "global"
+            replacements['region'] = region
             # Compute elapsed from message.timestamp (same as TestCommand) so it's available
             # for all keywords. Using message.elapsed would miss when it's unset on some paths.
             _translator = getattr(bot, 'translator', None)
@@ -2453,6 +2458,7 @@ def format_keyword_response_with_placeholders(
             replacements['rssi'] = "Unknown"
             replacements['phrase'] = ""
             replacements['phrase_part'] = ""
+            replacements['region'] = "unknown"
             replacements['elapsed'] = "Unknown"
             replacements['connection_info'] = "Unknown"
             replacements['path_distance'] = ""
