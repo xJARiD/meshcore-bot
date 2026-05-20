@@ -671,6 +671,7 @@ class TestFormatKeywordResponseWithPlaceholders:
         msg.rssi = kwargs.get("rssi", -80)
         msg.timestamp = kwargs.get("timestamp")
         msg.hops = kwargs.get("hops")
+        msg.reply_scope = kwargs.get("reply_scope")
         return msg
 
     def test_sender_placeholder(self):
@@ -725,6 +726,27 @@ class TestFormatKeywordResponseWithPlaceholders:
             result = format_keyword_response_with_placeholders("{connection_info}", msg, bot)
         assert "SNR" in result
         assert "RSSI" in result
+
+    def test_region_placeholder_uses_reply_scope(self):
+        bot = self._bot()
+        msg = self._msg(reply_scope="#au-vic")
+        with patch("modules.utils.calculate_path_distances", return_value=("", "")):
+            result = format_keyword_response_with_placeholders("{region}", msg, bot)
+        assert result == "#au-vic"
+
+    def test_region_placeholder_defaults_to_global_for_channel(self):
+        bot = self._bot()
+        msg = self._msg(reply_scope=None, is_dm=False)
+        with patch("modules.utils.calculate_path_distances", return_value=("", "")):
+            result = format_keyword_response_with_placeholders("{region}", msg, bot)
+        assert result == "global"
+
+    def test_region_placeholder_reports_dm_for_direct_message(self):
+        bot = self._bot()
+        msg = self._msg(is_dm=True)
+        with patch("modules.utils.calculate_path_distances", return_value=("", "")):
+            result = format_keyword_response_with_placeholders("{region}", msg, bot)
+        assert result == "dm"
 
     def test_phrase_extracts_first_mention_after_trigger(self):
         bot = self._bot()
