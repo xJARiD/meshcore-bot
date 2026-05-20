@@ -83,6 +83,18 @@ class TestStatusCommandExecute:
         bot.command_manager.send_response.assert_called_once()
         text = bot.command_manager.send_response.call_args[0][1]
         assert "Bot Status" in text
-        assert "connected: True" in text
-        assert "radio_zombie: False" in text
-        assert "web_viewer_running: True" in text
+        assert "connected: yes" in text
+        assert "zombie: no" in text
+        assert "web: yes" in text
+
+    def test_execute_response_fits_single_dm(self):
+        bot = _make_bot(enabled=True)
+        cmd = StatusCommand(bot)
+        msg = mock_message(content="status", is_dm=True, sender_id="user1")
+        msg.sender_pubkey = "a" * 64
+
+        result = _run(cmd.execute(msg))
+
+        assert result is True
+        text = bot.command_manager.send_response.call_args[0][1]
+        assert len(text.encode("utf-8")) <= 158
