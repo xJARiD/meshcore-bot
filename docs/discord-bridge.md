@@ -90,7 +90,7 @@ Preview: `https://api.dicebear.com/7.x/{style}/png?seed=YourName`
   - **censor**: Replace profanity with `****` and bridge the message.
   - **off**: No filtering; bridge all messages as-is.
 - The filter checks word-based profanity (via `better-profanity` and optional `unidecode` for homoglyphs) and blocked hate symbols (e.g. swastika Unicode 卐/卍). Symbols are replaced with `***`.
-- Requires the `better-profanity` package (see `requirements.txt`). If the package is not installed and `filter_profanity` is `drop` or `censor`, a warning is logged and messages are bridged without word filtering; hate symbols are still filtered even without the package.
+- Requires the `better-profanity` package from the `profanity` extra (`uv sync --extra profanity`). If the package is not installed and `filter_profanity` is `drop` or `censor`, a warning is logged and messages are bridged without word filtering; hate symbols are still filtered even without the package.
 
 ---
 

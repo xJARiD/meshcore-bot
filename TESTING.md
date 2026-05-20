@@ -17,14 +17,14 @@ make test
 make test-no-cov
 
 # Specific file
-.venv/bin/pytest tests/test_enums.py -v
+uv run pytest tests/test_enums.py -v
 
 # Specific class or function
-.venv/bin/pytest tests/test_message_handler.py::TestShouldProcessMessage -v
-.venv/bin/pytest tests/test_enums.py::TestPayloadType::test_lookup_by_value -v
+uv run pytest tests/test_message_handler.py::TestShouldProcessMessage -v
+uv run pytest tests/test_enums.py::TestPayloadType::test_lookup_by_value -v
 
 # Stop on first failure
-.venv/bin/pytest -x
+uv run pytest -x
 ```
 
 ---
@@ -54,16 +54,16 @@ make test-no-cov
 ## Running Subsets of Tests
 
 ```bash
-pytest -m unit               # unit tests only (fast, no real DB)
-pytest -m integration        # integration tests (real SQLite via tmp_path)
-pytest -m "not slow"         # skip slow tests
-pytest tests/unit/           # tests in a subdirectory
-pytest tests/commands/
-pytest tests/integration/
-pytest tests/regression/
-pytest -x                    # stop on first failure
-pytest --tb=long             # full traceback
-pytest --collect-only        # list collected tests without running
+uv run pytest -m unit               # unit tests only (fast, no real DB)
+uv run pytest -m integration        # integration tests (real SQLite via tmp_path)
+uv run pytest -m "not slow"         # skip slow tests
+uv run pytest tests/unit/           # tests in a subdirectory
+uv run pytest tests/commands/
+uv run pytest tests/integration/
+uv run pytest tests/regression/
+uv run pytest -x                    # stop on first failure
+uv run pytest --tb=long             # full traceback
+uv run pytest --collect-only        # list collected tests without running
 ```
 
 ---
@@ -72,13 +72,13 @@ pytest --collect-only        # list collected tests without running
 
 ```bash
 # Terminal report (default via pytest.ini)
-pytest
+uv run pytest
 
 # HTML report — open htmlcov/index.html in a browser
-pytest --cov=modules --cov-report=html
+uv run pytest --cov=modules --cov-report=html
 
 # Coverage for a single module
-pytest tests/test_message_handler.py \
+uv run pytest tests/test_message_handler.py \
   --cov=modules.message_handler --cov-report=term-missing
 ```
 
@@ -96,9 +96,9 @@ make fix     # auto-fix safe ruff issues
 Or run directly:
 
 ```bash
-.venv/bin/ruff check modules/ tests/          # style/lint check
-.venv/bin/ruff check --fix modules/ tests/    # auto-fix safe issues
-.venv/bin/mypy modules/                        # type checking
+uv run ruff check modules/ tests/          # style/lint check
+uv run ruff check --fix modules/ tests/    # auto-fix safe issues
+uv run mypy modules/                       # type checking
 ```
 
 ---
@@ -608,8 +608,8 @@ Config: `tests/mqtt_test_config.ini`. Fixtures: `tests/fixtures/mqtt_packets.jso
 | `TestLiveMqttPackets`       | mqtt     | Connects to LAN broker; validates schema,           |
 |                             |          | SNR/RSSI ranges, plausibility; auto-saves fixtures  |
 
-Run live tests: `pytest tests/test_mqtt_live.py -v -m mqtt`
-Collect fixtures offline: `python tests/test_mqtt_live.py --collect-fixtures`
+Run live tests: `uv run pytest tests/test_mqtt_live.py -v -m mqtt`
+Collect fixtures offline: `uv run python tests/test_mqtt_live.py --collect-fixtures`
 
 ---
 
@@ -734,7 +734,7 @@ class TestMyFeature:
 4. Add integration tests (with `test_db`) for database-touching methods.
 5. Check coverage gaps:
    ```bash
-   pytest tests/test_<module_name>.py \
+   uv run pytest tests/test_<module_name>.py \
      --cov=modules.<module_name> --cov-report=term-missing
    ```
 
@@ -758,13 +758,13 @@ tests/
 
 ```bash
 # Offline schema + fixture tests (no network required)
-pytest tests/test_mqtt_live.py -v -m "not mqtt"
+uv run pytest tests/test_mqtt_live.py -v -m "not mqtt"
 
 # Live integration tests (requires LAN broker at 10.0.2.123:1883)
-pytest tests/test_mqtt_live.py -v -m mqtt
+uv run pytest tests/test_mqtt_live.py -v -m mqtt
 
 # Collect fresh fixtures and exit
-python tests/test_mqtt_live.py --collect-fixtures
+uv run python tests/test_mqtt_live.py --collect-fixtures
 ```
 
 ### Broker configuration (`tests/mqtt_test_config.ini`)
@@ -809,11 +809,11 @@ Tests run automatically on push/PR via GitHub Actions.
 
 | Job             | Command                                                   |
 |-----------------|-----------------------------------------------------------|
-| `lint`          | `ruff check modules/ tests/`                              |
-| `typecheck`     | `mypy modules/`                                           |
+| `lint`          | `uv run ruff check modules/ tests/`                       |
+| `typecheck`     | `uv run mypy modules/`                                    |
 | `lint-frontend` | ESLint + HTMLHint on `modules/web_viewer/templates/`      |
 | `lint-shell`    | ShellCheck `--severity=warning` on all `.sh` files        |
-| `test`          | `pytest tests/ -v --tb=short` with coverage (no `mqtt`)   |
+| `test`          | `uv run pytest tests/ -v --tb=short` with coverage (no `mqtt`) |
 
 To keep `TODO.md` in sync locally:
 

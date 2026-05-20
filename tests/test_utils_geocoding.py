@@ -549,6 +549,21 @@ class TestGeocodeCityAsync:
                 )
         assert lat == 35.68
 
+    async def test_non_us_default_region_precedes_bare_global_lookup(self, mock_bot):
+        from modules.utils import geocode_city
+        local_loc = _make_location(-38.09, 145.36)
+        geocode_mock = AsyncMock(return_value=local_loc)
+
+        with patch("modules.utils.rate_limited_nominatim_geocode", new=geocode_mock):
+            with patch("modules.utils.rate_limited_nominatim_reverse", new=AsyncMock(return_value=None)):
+                lat, lon, addr = await geocode_city(
+                    mock_bot, "Clyde", default_state="VIC", default_country="AU"
+                )
+
+        assert lat == -38.09
+        assert lon == 145.36
+        geocode_mock.assert_awaited_once_with(mock_bot, "Clyde, VIC, AU", timeout=10)
+
     async def test_nominatim_returns_none(self, mock_bot):
         from modules.utils import geocode_city
         with patch("modules.utils.rate_limited_nominatim_geocode", new=AsyncMock(return_value=None)):
@@ -614,6 +629,20 @@ class TestGeocodeCitySync:
                     mock_bot, "Wenatchee", default_state="", default_country="US"
                 )
         assert lat == 35.68
+
+    def test_non_us_default_region_precedes_bare_global_lookup(self, mock_bot):
+        from modules.utils import geocode_city_sync
+        local_loc = _make_location(-38.09, 145.36)
+
+        with patch("modules.utils.rate_limited_nominatim_geocode_sync", return_value=local_loc) as geocode:
+            with patch("modules.utils.rate_limited_nominatim_reverse_sync", return_value=None):
+                lat, lon, addr = geocode_city_sync(
+                    mock_bot, "Clyde", default_state="VIC", default_country="AU"
+                )
+
+        assert lat == -38.09
+        assert lon == 145.36
+        geocode.assert_called_once_with(mock_bot, "Clyde, VIC, AU", timeout=10)
 
     def test_nominatim_returns_none(self, mock_bot):
         from modules.utils import geocode_city_sync

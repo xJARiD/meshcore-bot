@@ -695,12 +695,13 @@ bot_tx_rate_limit_seconds = 1.0
 # Recommended: 100-500ms for busy networks, 0 for quiet networks
 tx_delay_ms = 250
 
-# DM retry settings for improved reliability (meshcore-2.1.6+)
-# Maximum number of retry attempts for failed DM sends
-dm_max_retries = 3
+# DM retry settings for meshcore-2.1.6+.
+# Keep bot replies conservative; missed ACKs can otherwise produce duplicate DMs.
+# Maximum send attempts for a DM response (1 = send once, no retry).
+dm_max_retries = 1
 
-# Maximum flood attempts (when path reset is needed)
-dm_max_flood_attempts = 2
+# Maximum flood attempts after direct attempts fail.
+dm_max_flood_attempts = 0
 
 # Number of attempts before switching to flood mode
 dm_flood_after = 2

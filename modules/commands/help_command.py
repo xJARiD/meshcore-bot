@@ -7,7 +7,9 @@ Provides help information for commands and general usage
 from collections import defaultdict
 from typing import Any, Optional
 
+from ..config_validation import strip_optional_quotes
 from ..models import MeshMessage
+from ..utils import decode_escape_sequences
 from .base_command import BaseCommand
 
 
@@ -96,6 +98,10 @@ class HelpCommand(BaseCommand):
         requested_name = command_name.strip()
         normalized_name = requested_name.lower()
 
+        custom_help = self._get_custom_keyword_help(normalized_name)
+        if custom_help is not None:
+            return self.translate('commands.help.specific', command=command_name, help_text=custom_help)
+
         # Get the command instance by direct name first
         command = (
             self.bot.command_manager.commands.get(normalized_name)
@@ -131,8 +137,42 @@ class HelpCommand(BaseCommand):
                 help_text = self.translate('commands.help.no_help')
             return self.translate('commands.help.specific', command=command_name, help_text=help_text)
         else:
-            available = self.get_available_commands_list(message)
+            available = self._get_configured_help_available_commands() or self.get_available_commands_list(message)
             return self.translate('commands.help.unknown', command=command_name, available=available)
+
+    def _get_custom_keyword_help(self, normalized_name: str) -> str | None:
+        """Return configured help text for a custom keyword, if present."""
+        config = getattr(self.bot, 'config', None)
+        if not config or not config.has_section('Keyword_Help'):
+            return None
+
+        for keyword, help_text in config.items('Keyword_Help'):
+            if keyword.lower() == normalized_name:
+                help_text = strip_optional_quotes(help_text.strip())
+                return decode_escape_sequences(help_text) if help_text else None
+        return None
+
+    def _get_configured_help_available_commands(self) -> str:
+        """Return the command list from [Keywords] help, without help-specific wrappers."""
+        help_text = ""
+        command_manager = getattr(self.bot, 'command_manager', None)
+        keywords = getattr(command_manager, 'keywords', None)
+        if isinstance(keywords, dict):
+            help_text = keywords.get('help', "")
+
+        config = getattr(self.bot, 'config', None)
+        if not help_text and config and config.has_section('Keywords') and config.has_option('Keywords', 'help'):
+            help_text = decode_escape_sequences(strip_optional_quotes(config.get('Keywords', 'help').strip()))
+
+        if not help_text:
+            return ""
+
+        available = help_text.strip()
+        if available.startswith("Bot Help: "):
+            available = available[len("Bot Help: "):].strip()
+        if available.endswith(self.HELP_LIST_SUFFIX):
+            available = available[: -len(self.HELP_LIST_SUFFIX)].rstrip()
+        return available
 
     def get_general_help(self) -> str:
         """Get general help text.
@@ -305,5 +345,3 @@ class HelpCommand(BaseCommand):
                         return ', '.join(result) + suffix
                 break
         return ', '.join(result)
-
-

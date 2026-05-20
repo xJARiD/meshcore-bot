@@ -7,4 +7,4 @@ Choose how to run the bot:
 | **[Docker](docker.md)** | Containers, consistent environments, easy updates |
 | **[Service (systemd)](service-installation.md)** | Linux servers, run at boot, no containers |
 
-See [Getting started](getting-started.md) for a quick development setup (run from the repo with `python meshcore_bot.py`).
+See [Getting started](getting-started.md) for a quick development setup (run from the repo with `uv run python meshcore_bot.py`).

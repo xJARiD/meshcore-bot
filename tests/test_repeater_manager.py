@@ -1429,10 +1429,12 @@ class TestAddCompanionFromContactData:
             "adv_lon": 0.0,
         }
         bot.meshcore = Mock()
+        bot.meshcore.contacts = {}
         bot.meshcore.commands = Mock()
         err = SimpleNamespace(type=EventType.ERROR, payload={"error_code": 3, "code_string": "ERR_CODE_TABLE_FULL"})
         ok = SimpleNamespace(type=EventType.OK, payload={})
         bot.meshcore.commands.add_contact = AsyncMock(side_effect=[err, ok])
+        bot.meshcore.commands.get_contacts = AsyncMock()
 
         rm.get_contact_list_status = AsyncMock(
             return_value={
@@ -1447,6 +1449,8 @@ class TestAddCompanionFromContactData:
         result = await rm.add_companion_from_contact_data(contact_data, "Bob", pk)
         assert result is True
         assert bot.meshcore.commands.add_contact.await_count == 2
+        bot.meshcore.commands.get_contacts.assert_awaited_once()
+        assert bot.meshcore.contacts[pk]["public_key"] == pk
         rm.manage_contact_list.assert_awaited()
 
     @pytest.mark.asyncio
@@ -1465,9 +1469,11 @@ class TestAddCompanionFromContactData:
             "adv_lon": 0.0,
         }
         bot.meshcore = Mock()
+        bot.meshcore.contacts = {}
         bot.meshcore.commands = Mock()
         ok = SimpleNamespace(type=EventType.OK, payload={})
         bot.meshcore.commands.add_contact = AsyncMock(return_value=ok)
+        bot.meshcore.commands.get_contacts = AsyncMock()
         rm.get_contact_list_status = AsyncMock(
             return_value={"is_near_limit": False, "usage_percentage": 10.0}
         )
@@ -1476,6 +1482,8 @@ class TestAddCompanionFromContactData:
         result = await rm.add_companion_from_contact_data(contact_data, "Ann", pk)
         assert result is True
         bot.meshcore.commands.add_contact.assert_awaited_once()
+        bot.meshcore.commands.get_contacts.assert_awaited_once()
+        assert bot.meshcore.contacts[pk]["public_key"] == pk
         rm.manage_contact_list.assert_not_called()
 
     @pytest.mark.asyncio

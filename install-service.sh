@@ -8,7 +8,7 @@
 #   2. Copy bot files to installation directory
 #   3. Set up proper file permissions
 #   4. Install and enable the service (systemd or launchd)
-#   5. Create a Python virtual environment with dependencies
+#   5. Create a uv-managed Python virtual environment with dependencies
 #
 # Usage:
 #   ./install-service.sh          # Normal installation (non-destructive if already installed)
@@ -17,7 +17,8 @@
 #
 # Prerequisites:
 #   - Linux system with systemd OR macOS
-#   - Python 3.9+ installed
+#   - Python 3.10+ installed
+#   - uv installed and available in PATH
 #   - sudo access (script will prompt if needed)
 #   - Run from the meshcore-bot directory
 
@@ -222,7 +223,13 @@ fi
 # Check if Python 3 is available
 if ! command -v python3 &> /dev/null; then
     print_error "Python 3 is not installed or not in PATH"
-    print_error "Please install Python 3.9 or higher before running this script"
+    print_error "Please install Python 3.10 or higher before running this script"
+    exit 1
+fi
+
+if ! command -v uv &> /dev/null; then
+    print_error "uv is not installed or not in PATH"
+    print_error "Install uv first: https://docs.astral.sh/uv/getting-started/installation/"
     exit 1
 fi
 
@@ -480,19 +487,19 @@ fi
 
 # Create venv and install dependencies before chown so the service user ends up
 # owning a complete, working venv (avoids partial root-owned venv and import errors).
-print_section "Step 4: Setting Up Python Virtual Environment"
+print_section "Step 4: Setting Up uv Environment"
 if [ -d "$INSTALL_DIR/venv" ]; then
     print_info "Virtual environment already exists at $INSTALL_DIR/venv"
     print_info "Preserving existing virtual environment"
     if [[ "$UPGRADE_MODE" == true ]]; then
         print_info "Upgrade mode: will update dependencies"
     else
-        print_info "Will update dependencies if requirements.txt changed"
+        print_info "Will sync dependencies from uv.lock"
     fi
 else
     print_info "Creating an isolated Python environment for the bot"
     print_info "This ensures dependencies don't conflict with system Python packages"
-    python3 -m venv "$INSTALL_DIR/venv"
+    uv venv "$INSTALL_DIR/venv"
     print_success "Created virtual environment at $INSTALL_DIR/venv"
 fi
 
@@ -507,26 +514,8 @@ if [ ! -x "$VENV_PYTHON" ]; then
     exit 1
 fi
 
-# Ensure pip is available and up to date inside the venv
-print_info "Ensuring pip is available and up to date in the virtual environment"
-$VENV_PYTHON -m ensurepip --upgrade >/dev/null 2>&1 || true
-$VENV_PYTHON -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
-
-# Install dependencies in venv using python -m pip (more portable than calling pip directly)
-print_info "Installing Python dependencies from requirements.txt"
-print_info "This may take a few minutes depending on your internet connection..."
-if [ ! -f "$INSTALL_DIR/requirements.txt" ]; then
-    print_error "requirements.txt not found in installation directory"
-    exit 1
-fi
-$VENV_PYTHON -m pip install --quiet -r "$INSTALL_DIR/requirements.txt" || {
-    print_error "Failed to install Python dependencies"
-    print_info "You may need to check your internet connection or Python version"
-    exit 1
-}
-print_success "Installed all Python dependencies"
-
 # Optional extras
+UV_SYNC_ARGS=(--locked --no-dev)
 echo ""
 print_info "Optional feature packages are available:"
 echo "  • Profanity filter (better-profanity, unidecode) — drop/censor offensive messages"
@@ -534,24 +523,34 @@ echo "  • Geocoding extras (pycountry, us) — improved country/state name res
 echo ""
 
 if ask_yes_no "Install profanity filter packages? (recommended if using the profanity filter feature)" "n"; then
-    print_info "Installing profanity filter packages..."
-    "$INSTALL_DIR/venv/bin/pip" install --quiet "better-profanity>=0.7.0" "unidecode>=1.3.0" || {
-        print_warning "Failed to install profanity filter packages (non-fatal)"
-    }
-    print_success "Installed profanity filter packages"
+    UV_SYNC_ARGS+=(--extra profanity)
+    print_success "Enabled profanity filter packages"
 else
     print_info "Skipping profanity filter packages"
 fi
 
 if ask_yes_no "Install geocoding extras? (recommended if using location/path commands)" "n"; then
-    print_info "Installing geocoding extras..."
-    "$INSTALL_DIR/venv/bin/pip" install --quiet "pycountry>=23.12.0" "us>=2.0.0" || {
-        print_warning "Failed to install geocoding extras (non-fatal)"
-    }
-    print_success "Installed geocoding extras"
+    UV_SYNC_ARGS+=(--extra geo)
+    print_success "Enabled geocoding extras"
 else
     print_info "Skipping geocoding extras"
 fi
+
+print_info "Syncing Python dependencies from uv.lock"
+print_info "This may take a few minutes depending on your internet connection..."
+if [ ! -f "$INSTALL_DIR/pyproject.toml" ] || [ ! -f "$INSTALL_DIR/uv.lock" ]; then
+    print_error "pyproject.toml or uv.lock not found in installation directory"
+    exit 1
+fi
+(
+    cd "$INSTALL_DIR"
+    UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" uv sync "${UV_SYNC_ARGS[@]}"
+) || {
+    print_error "Failed to install Python dependencies"
+    print_info "You may need to check your internet connection or Python version"
+    exit 1
+}
+print_success "Installed all Python dependencies"
 
 print_section "Step 5: Setting File Permissions"
 print_info "Configuring file ownership and permissions for security"

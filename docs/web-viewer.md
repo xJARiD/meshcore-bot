@@ -16,17 +16,14 @@ A web-based interface for viewing and analyzing data from your MeshCore Bot.
 
 ### Option 1: Standalone Mode
 ```bash
-# Install Flask if not already installed
-pip3 install flask
-
 # Start the web viewer (reads config from config.ini)
-python3 -m modules.web_viewer.app
+uv run python -m modules.web_viewer.app
 
 # Or use the restart script for standalone mode
 ./restart_viewer.sh
 
 # Override configuration with command line arguments
-python3 -m modules.web_viewer.app --port 8080 --host 0.0.0.0
+uv run python -m modules.web_viewer.app --port 8080 --host 0.0.0.0
 ```
 
 ### Option 2: Integrated with Bot
@@ -130,7 +127,7 @@ If you previously had the web viewer using a **separate** database (e.g. `[Web_V
 2. **Optionally preserve packet stream history** from the old viewer DB into the main DB:
    - From the project root, run:
      ```bash
-     python3 migrate_webviewer_db.py bot_data.db meshcore_bot.db
+     uv run python migrate_webviewer_db.py bot_data.db meshcore_bot.db
      ```
      Use your actual paths if they differ (e.g. full paths or different filenames). The script copies the `packet_stream` table from the first file into the second and skips rows that would duplicate IDs.
    - If you don’t care about old packet stream data, skip this step; the viewer will create a new `packet_stream` table in the main DB.
@@ -177,7 +174,7 @@ If the viewer does not load from another device (e.g. from your phone or PC whil
    - Optional: run the viewer manually to see errors in the terminal:
      ```bash
      cd /path/to/meshcore-bot
-     python3 modules/web_viewer/app.py --config config.ini --host 0.0.0.0 --port 8080
+     uv run python modules/web_viewer/app.py --config config.ini --host 0.0.0.0 --port 8080
      ```
 
 4. **Check integration startup**
@@ -208,14 +205,12 @@ If the viewer does not load from another device (e.g. from your phone or PC whil
 7. **Standalone run (no bot)**
    - To rule out bot integration issues, start the viewer by itself (same config path so it finds the DB):
      ```bash
-     python3 modules/web_viewer/app.py --config config.ini --host 0.0.0.0 --port 8080
+     uv run python modules/web_viewer/app.py --config config.ini --host 0.0.0.0 --port 8080
      ```
    - If `restart_viewer.sh` is used, note it binds to `127.0.0.1` by default; for network access run the command above with `--host 0.0.0.0` or edit the script.
 
 ### Flask Not Found
-```bash
-pip3 install flask flask-socketio
-```
+Run `uv sync --locked`; Flask and Flask-SocketIO are core project dependencies.
 
 ### Database Not Found
 - Ensure the bot has been run at least once to create the databases

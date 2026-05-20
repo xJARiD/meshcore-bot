@@ -131,7 +131,7 @@ Section: net
 Priority: optional
 Architecture: ${ARCH}
 Installed-Size: ${INSTALLED_SIZE}
-Depends: python3 (>= 3.9), python3-pip, python3-venv, adduser
+Depends: python3 (>= 3.10), uv, adduser
 Recommends: systemd
 Suggests: sqlite3
 Maintainer: MeshCore Bot Team <noreply@example.com>
@@ -173,12 +173,12 @@ chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_ROOT}"
 
 # Create virtualenv and install dependencies
 if [ ! -d "${INSTALL_ROOT}/venv" ]; then
-    echo "Creating Python virtualenv…"
-    python3 -m venv "${INSTALL_ROOT}/venv"
+    echo "Creating uv-managed Python virtualenv…"
+    uv venv "${INSTALL_ROOT}/venv"
 fi
-echo "Installing Python dependencies…"
-"${INSTALL_ROOT}/venv/bin/pip" install --quiet --upgrade pip
-"${INSTALL_ROOT}/venv/bin/pip" install --quiet -r "${INSTALL_ROOT}/requirements.txt"
+echo "Syncing Python dependencies…"
+cd "${INSTALL_ROOT}"
+UV_PROJECT_ENVIRONMENT="${INSTALL_ROOT}/venv" uv sync --locked --no-dev
 
 # Enable and start systemd service
 if command -v systemctl >/dev/null 2>&1; then

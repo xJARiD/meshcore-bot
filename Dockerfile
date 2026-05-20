@@ -8,6 +8,7 @@ FROM python:3.11-slim AS builder
 # Useful for platform-specific build steps if needed in future.
 ARG TARGETPLATFORM
 ARG TARGETARCH
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 
 # Install build dependencies.
 # apt cache mounts are scoped per-architecture to avoid cross-contamination.
@@ -21,11 +22,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=apt-$TARGETARCH \
 
 WORKDIR /build
 
-COPY requirements.txt pyproject.toml ./
+COPY --from=ghcr.io/astral-sh/uv:0.11.14 /uv /uvx /bin/
+COPY pyproject.toml uv.lock README.md ./
 
-# Pip cache is scoped per-architecture.
-RUN --mount=type=cache,target=/root/.cache/pip,id=pip-$TARGETARCH \
-    pip install --user -r requirements.txt
+# uv cache is scoped per-architecture.
+RUN --mount=type=cache,target=/root/.cache/uv,id=uv-$TARGETARCH \
+    uv sync --locked --no-dev --no-install-project --extra profanity --extra geo
 
 # ── runtime stage ──────────────────────────────────────────────────────────
 FROM python:3.11-slim
@@ -47,7 +49,7 @@ RUN useradd -m -u 1000 -G dialout,tty meshcore && \
     mkdir -p /app /data/config /data/databases /data/logs /data/backups && \
     chown -R meshcore:meshcore /app /data
 
-COPY --from=builder --chown=meshcore:meshcore /root/.local /home/meshcore/.local
+COPY --from=builder --chown=meshcore:meshcore /opt/venv /opt/venv
 
 WORKDIR /app
 
@@ -57,7 +59,7 @@ ENV MESHCORE_BOT_VERSION=${MESHCORE_BOT_VERSION}
 
 COPY --chown=meshcore:meshcore . /app/
 
-ENV PATH=/home/meshcore/.local/bin:$PATH \
+ENV PATH=/opt/venv/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 

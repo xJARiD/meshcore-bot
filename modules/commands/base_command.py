@@ -1031,6 +1031,8 @@ class BaseCommand(ABC):
                 path_str = ','.join(str(n).lower() for n in path_nodes)
                 return f"{path_str} ({len(path_nodes)} hops)"
         if not message.path:
+            if getattr(message, 'is_dm', False) and getattr(message, 'hops', None) == 0:
+                return "Direct"
             return "Unknown"
         path_string = message.path
         if " via ROUTE_TYPE_" in path_string:
@@ -1070,7 +1072,7 @@ class BaseCommand(ABC):
             return response_format.format(
                 sender=message.sender_id or "Unknown",
                 connection_info=connection_info,
-                path=message.path or "Unknown",
+                path=self.get_path_display_string(message),
                 timestamp=timestamp,
                 snr=message.snr or "Unknown",
                 rssi=message.rssi or "Unknown"

@@ -106,7 +106,7 @@ tail -f meshcore_bot.log | grep MapUploader
 
 Common issues:
 - `enabled = false` in config
-- Missing dependencies: `pip install aiohttp cryptography`
+- Missing dependencies: run `uv sync --locked` from the project root
 - No private key available
 
 ### No Uploads Happening

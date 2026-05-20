@@ -5,6 +5,7 @@ Get meshcore-bot running on your machine in a few minutes.
 ## Requirements
 
 - **Python 3.10+**
+- **uv**
 - **MeshCore-compatible device** (Heltec V3, RAK Wireless, etc.)
 - **Connection**: USB cable, BLE, or TCP/IP to the device
 
@@ -36,7 +37,7 @@ Get meshcore-bot running on your machine in a few minutes.
 3. **Run**
 
    ```bash
-   .venv/bin/python meshcore_bot.py
+   uv run python meshcore_bot.py
    ```
 
 ## Inspect effective config safely
@@ -44,8 +45,8 @@ Get meshcore-bot running on your machine in a few minutes.
 Use these commands to inspect the resolved config with sensitive keys redacted:
 
 ```bash
-.venv/bin/python meshcore_bot.py --show-config --config config.ini
-.venv/bin/python meshcore_bot.py --show-config-json --config config.ini
+uv run python meshcore_bot.py --show-config --config config.ini
+uv run python meshcore_bot.py --show-config-json --config config.ini
 ```
 
 Also available in the web UI at `/admin/config`.

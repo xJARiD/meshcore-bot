@@ -142,7 +142,7 @@
       
       propagatedBuildInputs =
         (with pkgs.python3Packages; [
-          # Core Python dependencies from requirements.txt
+          # Core Python dependencies from pyproject.toml
           aiohttp
           aiohttp-retry
           aiomqtt

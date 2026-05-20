@@ -663,8 +663,10 @@ class TestFormatKeywordResponseWithPlaceholders:
 
     def _msg(self, **kwargs):
         msg = Mock()
+        msg.content = kwargs.get("content", "ping")
         msg.sender_id = kwargs.get("sender_id", "Alice")
         msg.path = kwargs.get("path", "01,5f")
+        msg.is_dm = kwargs.get("is_dm", False)
         msg.snr = kwargs.get("snr", 10)
         msg.rssi = kwargs.get("rssi", -80)
         msg.timestamp = kwargs.get("timestamp")
@@ -677,6 +679,13 @@ class TestFormatKeywordResponseWithPlaceholders:
         with patch("modules.utils.calculate_path_distances", return_value=("", "")):
             result = format_keyword_response_with_placeholders("{sender}", msg, bot)
         assert result == "Bob"
+
+    def test_direct_dm_without_path_formats_path_as_direct(self):
+        bot = self._bot()
+        msg = self._msg(path=None, is_dm=True, hops=0)
+        with patch("modules.utils.calculate_path_distances", return_value=("", "")):
+            result = format_keyword_response_with_placeholders("{path}", msg, bot)
+        assert result == "Direct"
 
     def test_no_message_uses_unknown_defaults(self):
         bot = self._bot()
@@ -716,6 +725,33 @@ class TestFormatKeywordResponseWithPlaceholders:
             result = format_keyword_response_with_placeholders("{connection_info}", msg, bot)
         assert "SNR" in result
         assert "RSSI" in result
+
+    def test_phrase_extracts_first_mention_after_trigger(self):
+        bot = self._bot()
+        msg = self._msg(content="pingu @[Matt VK3ARD HelV3] @[Other]")
+        with patch("modules.utils.calculate_path_distances", return_value=("", "")):
+            result = format_keyword_response_with_placeholders(
+                "{phrase}", msg, bot, trigger="pingu"
+            )
+        assert result == "@[Matt VK3ARD HelV3]"
+
+    def test_phrase_requires_mention_immediately_after_trigger(self):
+        bot = self._bot()
+        msg = self._msg(content="pingu please @[Matt VK3ARD HelV3]")
+        with patch("modules.utils.calculate_path_distances", return_value=("", "")):
+            result = format_keyword_response_with_placeholders(
+                "{phrase}", msg, bot, trigger="pingu"
+            )
+        assert result == ""
+
+    def test_phrase_part_adds_prefix_only_when_mention_present(self):
+        bot = self._bot()
+        msg = self._msg(content="pingu @[Matt VK3ARD HelV3]")
+        with patch("modules.utils.calculate_path_distances", return_value=("", "")):
+            result = format_keyword_response_with_placeholders(
+                "{phrase_part}", msg, bot, trigger="pingu"
+            )
+        assert result == ": @[Matt VK3ARD HelV3]"
 
 class TestVerifyMeshcoreAdvertEd25519:
     """Tests for verify_meshcore_advert_ed25519() matching MeshCore createAdvert signing."""
@@ -876,4 +912,3 @@ class TestCalculatePacketHashEdgeCases:
         # Header 0x08 = TRANSPORT_FLOOD + TXT_MSG, 4 transport bytes, path_len=0, payload=0xFF
         h = calculate_packet_hash("0800000000" + "00" + "ff")
         assert h != "0000000000000000"
-

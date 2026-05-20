@@ -2,7 +2,6 @@
 
 A Python bot that connects to MeshCore mesh networks via serial port, BLE, or TCP/IP. The bot responds to messages containing configured keywords, executes commands, and provides various data services including weather, solar conditions, and satellite pass information. A web viewer provides a browser-based dashboard for monitoring and managing the bot.
 
-
 > [!CAUTION]
 > Before installing this bot, please take a moment to _truly_ consider if your mesh needs another bot. If there are already several bots on your mesh, it is likely that you are adding congestion without adding value.
 >
@@ -44,6 +43,7 @@ A Python bot that connects to MeshCore mesh networks via serial port, BLE, or TC
 ## Requirements
 
 - Python 3.10+
+- uv
 - MeshCore-compatible device (Heltec V3, RAK Wireless, etc.)
 - USB cable or BLE capability
 
@@ -52,17 +52,20 @@ A Python bot that connects to MeshCore mesh networks via serial port, BLE, or TC
 ### Quick Start (Development)
 
 1. Clone the repository:
+
 ```bash
 git clone https://github.com/agessaman/meshcore-bot
 cd meshcore-bot
 ```
 
-2. Create a virtual environment and install dependencies via Makefile:
+2. Create a uv-managed virtual environment and install dependencies via Makefile:
+
 ```bash
 make dev          # creates .venv, installs all deps including test tools
 ```
 
 Or for production dependencies only:
+
 ```bash
 make install      # creates .venv, installs runtime + optional deps
 ```
@@ -70,28 +73,33 @@ make install      # creates .venv, installs runtime + optional deps
 3. Configure the bot:
 
 **Interactive TUI (recommended):** Launch the ncurses config editor — it reads an existing `config.ini` or lets you start from `config.ini.example`:
+
 ```bash
 make config
 ```
 
 **Manual option (full config):** Enables all bot commands and provides all configuration options:
+
 ```bash
 cp config.ini.example config.ini
 # Edit config.ini with your settings
 ```
 
 **Manual option (minimal config):** For users who only want core testing commands (ping, test, path, prefix, multitest):
+
 ```bash
 cp config.ini.minimal-example config.ini
 # Edit config.ini with your connection and bot settings
 ```
 
 4. Run the bot:
+
 ```bash
-.venv/bin/python meshcore_bot.py
+uv run python meshcore_bot.py
 ```
 
 5. Run tests and linting:
+
 ```bash
 make test         # pytest with coverage
 make test-no-cov  # pytest without coverage (faster)
@@ -100,24 +108,29 @@ make fix          # auto-fix ruff lint errors
 ```
 
 ### Production Installation (Systemd Service)
+
 For production deployment as a system service:
 
 1. Install as systemd service:
+
 ```bash
 sudo ./install-service.sh
 ```
 
 2. Configure the bot:
+
 ```bash
 sudo nano /opt/meshcore-bot/config.ini
 ```
 
 3. Start the service:
+
 ```bash
 sudo systemctl start meshcore-bot
 ```
 
 4. Check status:
+
 ```bash
 sudo systemctl status meshcore-bot
 ```
@@ -136,9 +149,11 @@ sudo dpkg -i dist/meshcore-bot_*.deb
 The package installs the bot to `/opt/meshcore-bot/`, installs a systemd unit, and creates a `meshcore-bot` system user.
 
 ### Docker Deployment
+
 For containerized deployment using Docker:
 
 1. **Create data directories and configuration**:
+
    ```bash
    mkdir -p data/{config,databases,logs,backups}
    cp config.ini.example data/config/config.ini
@@ -146,6 +161,7 @@ For containerized deployment using Docker:
    ```
 
 2. **Update paths in config.ini** to use `/data/` directories:
+
    ```ini
    [Bot]
    db_path = /data/databases/meshcore_bot.db
@@ -155,6 +171,7 @@ For containerized deployment using Docker:
    ```
 
 3. **Build and start with Docker Compose**:
+
    ```bash
    docker compose up -d --build
    ```
@@ -167,7 +184,9 @@ For containerized deployment using Docker:
 See [Docker deployment](docs/docker.md) for detailed Docker deployment instructions, including serial port access, web viewer configuration, and troubleshooting.
 
 ## NixOS
+
 Use the Nix flake via flake.nix
+
 ```nix
 meshcore-bot.url = "github:agessaman/meshcore-bot/";
 ```
@@ -202,6 +221,7 @@ web_viewer_password = yourpassword   # optional; omit to disable auth
 ```
 
 Features:
+
 - **Contacts** — live contact list with signal, path, and location data; star any contact; purge inactive contacts by age threshold; export to CSV/JSON
 - **Mesh Graph** — interactive node graph of the mesh network
 - **Radio Settings** — manage channels, reboot or connect/disconnect the radio
@@ -217,16 +237,16 @@ The `/config` page exposes bot settings in-browser — no `config.ini` edit requ
 
 **Email & Notifications** — configure SMTP and opt in to a nightly maintenance digest:
 
-| Field | Description |
-|-------|-------------|
-| Server hostname | SMTP host (e.g. `smtp.gmail.com`) |
-| Port | 587 (STARTTLS), 465 (SSL), or 25 (plain) |
-| Security | STARTTLS / SSL / None |
-| Username / Password | SMTP credentials (app-specific passwords recommended) |
-| Sender display name | Name shown in the From field |
-| Sender email | Address shown in the From field |
-| Recipients | Comma-separated list of addresses |
-| Nightly email toggle | Enable / disable the nightly maintenance digest |
+| Field                | Description                                           |
+| -------------------- | ----------------------------------------------------- |
+| Server hostname      | SMTP host (e.g. `smtp.gmail.com`)                     |
+| Port                 | 587 (STARTTLS), 465 (SSL), or 25 (plain)              |
+| Security             | STARTTLS / SSL / None                                 |
+| Username / Password  | SMTP credentials (app-specific passwords recommended) |
+| Sender display name  | Name shown in the From field                          |
+| Sender email         | Address shown in the From field                       |
+| Recipients           | Comma-separated list of addresses                     |
+| Nightly email toggle | Enable / disable the nightly maintenance digest       |
 
 All settings are stored in the bot database (`bot_metadata` table) and take effect immediately. Use **Send test email** to verify SMTP settings before enabling the digest.
 
@@ -307,6 +327,7 @@ This launches an interactive ncurses TUI that lets you browse sections, edit val
 Key configuration sections:
 
 ### Connection
+
 ```ini
 [Connection]
 connection_type = serial          # serial, ble, or tcp
@@ -318,6 +339,7 @@ timeout = 30                      # Connection timeout
 ```
 
 ### Bot Settings
+
 ```ini
 [Bot]
 bot_name = MeshCoreBot            # Bot identification name
@@ -338,6 +360,7 @@ radio_offline_alert_email =          # alert recipient(s); falls back to nightly
 ```
 
 ### Keywords
+
 ```ini
 [Keywords]
 # Format: keyword = response_template
@@ -349,6 +372,7 @@ help = "Bot Help: test, ping, help, hello, cmd, wx, aqi, sun, moon, solar, hfcon
 ```
 
 ### Channels
+
 ```ini
 [Channels]
 monitor_channels = general,test,emergency  # Channels to monitor
@@ -358,6 +382,7 @@ respond_to_dms = true                      # Enable DM responses
 ```
 
 ### Per-Channel Rate Limiting
+
 ```ini
 [Rate_Limits]
 # Format: channel.<name>_seconds = <float>
@@ -380,6 +405,7 @@ aliases = w,weather
 ```
 
 ### Inbound Webhook
+
 ```ini
 [Webhook]
 enabled = false
@@ -391,6 +417,7 @@ max_message_length = 200
 ```
 
 Send a message to a channel:
+
 ```bash
 curl -X POST http://localhost:8765/webhook \
   -H "Authorization: Bearer <token>" \
@@ -399,6 +426,7 @@ curl -X POST http://localhost:8765/webhook \
 ```
 
 Send a DM:
+
 ```bash
 curl -X POST http://localhost:8765/webhook \
   -H "Authorization: Bearer <token>" \
@@ -407,6 +435,7 @@ curl -X POST http://localhost:8765/webhook \
 ```
 
 ### External Data APIs
+
 ```ini
 [External_Data]
 # API keys for external services
@@ -415,6 +444,7 @@ airnow_api_key =                  # Air quality data
 ```
 
 ### Alert Command
+
 ```ini
 [Alert_Command]
 enabled = true                           # Enable/disable alert command
@@ -425,6 +455,7 @@ agency.county.<county_name> = <agency_ids> # County-specific agency IDs (aggrega
 ```
 
 ### Logging
+
 ```ini
 [Logging]
 log_level = INFO                  # DEBUG, INFO, WARNING, ERROR, CRITICAL
@@ -437,11 +468,18 @@ log_backup_count = 3              # Number of rotated log files to keep
 ```
 
 When `json_logging = true` each log line is a JSON object:
+
 ```json
-{"timestamp":"2026-03-14T12:00:00.000Z","level":"INFO","logger":"MeshCoreBot","message":"Connected to radio"}
+{
+  "timestamp": "2026-03-14T12:00:00.000Z",
+  "level": "INFO",
+  "logger": "MeshCoreBot",
+  "message": "Connected to radio"
+}
 ```
 
 ### Maintenance
+
 ```ini
 [Maintenance]
 db_backup_enabled = false
@@ -453,6 +491,7 @@ email_attach_log = false        # attach current log file (≤ 5 MB) to nightly 
 ```
 
 ### Notifications
+
 ```ini
 [Notifications]
 email_enabled = false
@@ -470,12 +509,13 @@ email_send_time = 06:00         # nightly digest send time (HH:MM local)
 ### Running the Bot
 
 ```bash
-.venv/bin/python meshcore_bot.py
+uv run python meshcore_bot.py
 ```
 
 Or if installed as a package entry point:
+
 ```bash
-.venv/bin/meshcore-bot
+uv run meshcore-bot
 ```
 
 ### Available Commands
@@ -483,7 +523,8 @@ Or if installed as a package entry point:
 For a comprehensive list of all available commands with examples and detailed explanations, see [Command reference](docs/command-reference.md).
 
 Quick reference:
- - **Basic:** `test`, `ping`, `version`, `help`, `hello`, `cmd`
+
+- **Basic:** `test`, `ping`, `version`, `help`, `hello`, `cmd`
 - **Information:** `wx`, `gwx`, `aqi`, `sun`, `moon`, `solar`, `solarforecast`, `hfcond`, `satpass`, `channels`
 - **Emergency:** `alert`
 - **Gaming:** `dice`, `roll`, `magic8`
@@ -530,6 +571,7 @@ test = "Line 1\nLine 2\nLine 3"
 ```
 
 This will output:
+
 ```
 Line 1
 Line 2
@@ -540,6 +582,7 @@ To use a literal backslash + n, use `\\n` (double backslash + n).
 Other escape sequences: `\t` (tab), `\r` (carriage return), `\\` (literal backslash)
 
 Example:
+
 ```ini
 [Keywords]
 test = "Message received from {sender} | {connection_info}"
@@ -618,6 +661,7 @@ help = "Bot Help: test, ping, help, hello, cmd, wx, gwx, aqi, sun, moon, solar, 
 ### Debug Mode
 
 Enable debug logging:
+
 ```ini
 [Logging]
 log_level = DEBUG
@@ -639,6 +683,7 @@ The bot uses a modular plugin architecture:
 ### Adding New Plugins
 
 **Command Plugin:**
+
 1. Create a new file in `modules/commands/`
 2. Inherit from `BaseCommand`
 3. Implement the `execute()` method
@@ -659,12 +704,14 @@ class MyCommand(BaseCommand):
 ```
 
 **Service Plugin:**
+
 1. Create a new file in `modules/service_plugins/`
 2. Inherit from `BaseServicePlugin`, set `config_section = 'My_Section'`
 3. Implement `async start()` and `async stop()` methods
 4. Add `[My_Section] enabled = true` to `config.ini.example`
 
 **Database Migration:**
+
 1. Write `_mNNNN_short_desc(cursor)` in `modules/db_migrations.py`
 2. Append `(NNNN, "description", _mNNNN_...)` to `MIGRATIONS`
 3. Never modify or remove existing migrations — add a new one instead

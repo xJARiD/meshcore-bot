@@ -46,6 +46,7 @@ CANONICAL_NON_COMMAND_SECTIONS = frozenset({
     "Plugin_Overrides",
     "Companion_Purge",
     "Keywords",
+    "Keyword_Help",
     "Scheduled_Messages",
     "Logging",
     "Custom_Syntax",

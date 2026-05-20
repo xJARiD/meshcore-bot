@@ -1174,6 +1174,44 @@ async def geocode_city(bot: Any, city: str, default_state: Optional[str] = None,
                             address_info = {}
                 return lat, lon, address_info
 
+        # For non-US deployments, prefer the configured local region before a
+        # bare global lookup. This keeps suburbs like "Clyde" tied to VIC/AU
+        # instead of matching a more prominent overseas city first.
+        if not state_abbr and not country_name and default_country.upper() != 'US':
+            local_queries = []
+            if default_state and default_state.strip():
+                local_queries.append(f"{city_clean}, {default_state}, {default_country}")
+            local_queries.append(f"{city_clean}, {default_country}")
+
+            for local_query in local_queries:
+                cached_lat, cached_lon = bot.db_manager.get_cached_geocoding(local_query)
+                if cached_lat and cached_lon:
+                    lat, lon = cached_lat, cached_lon
+                else:
+                    location = await rate_limited_nominatim_geocode(bot, local_query, timeout=timeout)
+                    if location:
+                        bot.db_manager.cache_geocoding(local_query, location.latitude, location.longitude)
+                        lat, lon = location.latitude, location.longitude
+                    else:
+                        lat, lon = None, None
+
+                if lat and lon:
+                    address_info = None
+                    if include_address_info:
+                        reverse_cache_key = f"reverse_{lat}_{lon}"
+                        cached_address = bot.db_manager.get_cached_json(reverse_cache_key, "geolocation")
+                        if cached_address:
+                            address_info = cached_address
+                        else:
+                            try:
+                                reverse_location = await rate_limited_nominatim_reverse(bot, f"{lat}, {lon}", timeout=timeout)
+                                if reverse_location:
+                                    address_info = reverse_location.raw.get('address', {})
+                                    bot.db_manager.cache_json(reverse_cache_key, address_info, "geolocation", cache_hours=720)
+                            except:
+                                address_info = {}
+                    return lat, lon, address_info
+
         # If no country/state specified, try city name alone first (finds most prominent international city)
         # This handles cases like "Tokyo" -> Tokyo, Japan (not Tokyo, WA)
         if not state_abbr and not country_name:
@@ -1478,6 +1516,44 @@ def geocode_city_sync(bot: Any, city: str, default_state: Optional[str] = None,
                         except:
                             address_info = {}
                 return lat, lon, address_info
+
+        # For non-US deployments, prefer the configured local region before a
+        # bare global lookup. This keeps suburbs like "Clyde" tied to VIC/AU
+        # instead of matching a more prominent overseas city first.
+        if not state_abbr and not country_name and default_country.upper() != 'US':
+            local_queries = []
+            if default_state and default_state.strip():
+                local_queries.append(f"{city_clean}, {default_state}, {default_country}")
+            local_queries.append(f"{city_clean}, {default_country}")
+
+            for local_query in local_queries:
+                cached_lat, cached_lon = bot.db_manager.get_cached_geocoding(local_query)
+                if cached_lat and cached_lon:
+                    lat, lon = cached_lat, cached_lon
+                else:
+                    location = rate_limited_nominatim_geocode_sync(bot, local_query, timeout=timeout)
+                    if location:
+                        bot.db_manager.cache_geocoding(local_query, location.latitude, location.longitude)
+                        lat, lon = location.latitude, location.longitude
+                    else:
+                        lat, lon = None, None
+
+                if lat and lon:
+                    address_info = None
+                    if include_address_info:
+                        reverse_cache_key = f"reverse_{lat}_{lon}"
+                        cached_address = bot.db_manager.get_cached_json(reverse_cache_key, "geolocation")
+                        if cached_address:
+                            address_info = cached_address
+                        else:
+                            try:
+                                reverse_location = rate_limited_nominatim_reverse_sync(bot, f"{lat}, {lon}", timeout=timeout)
+                                if reverse_location:
+                                    address_info = reverse_location.raw.get('address', {})
+                                    bot.db_manager.cache_json(reverse_cache_key, address_info, "geolocation", cache_hours=720)
+                            except:
+                                address_info = {}
+                    return lat, lon, address_info
 
         # If no country/state specified, try city name alone first (finds most prominent international city)
         # This handles cases like "Tokyo" -> Tokyo, Japan (not Tokyo, WA)
@@ -2247,7 +2323,8 @@ def format_keyword_response_with_placeholders(
     response_format: str,
     message: Any,
     bot: Any,
-    mesh_info: Optional[dict[str, Any]] = None
+    mesh_info: Optional[dict[str, Any]] = None,
+    trigger: Optional[str] = None,
 ) -> str:
     """Format a keyword response string with all available placeholders.
 
@@ -2259,6 +2336,8 @@ def format_keyword_response_with_placeholders(
         message: MeshMessage instance (can be None for scheduled messages).
         bot: Bot instance (must have config, db_manager).
         mesh_info: Optional mesh network info dict (for scheduled message placeholders).
+        trigger: Optional matched keyword. When provided, {phrase} is the first
+            MeshCore mention immediately after the trigger.
 
     Returns:
         str: Formatted response string.
@@ -2270,9 +2349,46 @@ def format_keyword_response_with_placeholders(
         if message:
             # Basic message fields
             replacements['sender'] = message.sender_id or "Unknown"
-            replacements['path'] = message.path or "Unknown"
+            if (
+                not getattr(message, 'path', None)
+                and getattr(message, 'is_dm', False)
+                and getattr(message, 'hops', None) == 0
+            ):
+                replacements['path'] = "Direct"
+            else:
+                replacements['path'] = message.path or "Unknown"
             replacements['snr'] = message.snr or "Unknown"
             replacements['rssi'] = message.rssi or "Unknown"
+            content = (getattr(message, 'content', '') or '').strip()
+            if content.startswith('!'):
+                content = content[1:].strip()
+            command_prefix = ''
+            try:
+                command_prefix = bot.config.get('Bot', 'command_prefix', fallback='').strip()
+            except Exception:
+                command_prefix = ''
+            if command_prefix and content.startswith(command_prefix):
+                content = content[len(command_prefix):].strip()
+
+            phrase = ""
+            if trigger:
+                trigger_text = trigger.strip()
+                content_lower = content.lower()
+                trigger_lower = trigger_text.lower()
+                if content_lower == trigger_lower:
+                    mention_source = ""
+                elif (
+                    content_lower.startswith(trigger_lower)
+                    and len(content) > len(trigger_text)
+                    and content[len(trigger_text)].isspace()
+                ):
+                    mention_source = content[len(trigger_text):].strip()
+                else:
+                    mention_source = ""
+                mention_match = re.match(r'(@\[[^\]]+\])', mention_source)
+                phrase = mention_match.group(1) if mention_match else ""
+            replacements['phrase'] = phrase
+            replacements['phrase_part'] = f": {phrase}" if phrase else ""
             # Compute elapsed from message.timestamp (same as TestCommand) so it's available
             # for all keywords. Using message.elapsed would miss when it's unset on some paths.
             _translator = getattr(bot, 'translator', None)
@@ -2335,6 +2451,8 @@ def format_keyword_response_with_placeholders(
             replacements['path'] = "Unknown"
             replacements['snr'] = "Unknown"
             replacements['rssi'] = "Unknown"
+            replacements['phrase'] = ""
+            replacements['phrase_part'] = ""
             replacements['elapsed'] = "Unknown"
             replacements['connection_info'] = "Unknown"
             replacements['path_distance'] = ""
