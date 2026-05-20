@@ -3,13 +3,11 @@ name: Tests
 on:
   push:
     branches:
-      - main
-      - master
+      - eastmesh
       - develop
   pull_request:
     branches:
-      - main
-      - master
+      - eastmesh
       - develop
   workflow_dispatch:
 
