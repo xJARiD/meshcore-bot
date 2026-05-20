@@ -439,7 +439,8 @@ class TestSendDMRecipientResolution:
         cm_bot.connected = True
         cm_bot.meshcore = Mock()
         cm_bot.meshcore.get_contact_by_name = Mock(return_value={"name": "Alice"})
-        cm_bot.meshcore.commands = Mock(spec=["send_msg_with_retry"])
+        cm_bot.meshcore.commands = Mock(spec=["send_msg", "send_msg_with_retry"])
+        cm_bot.meshcore.commands.send_msg = AsyncMock(return_value=Mock(type=EventType.MSG_SENT, payload=None))
         cm_bot.meshcore.commands.send_msg_with_retry = AsyncMock(
             return_value=Mock(type=EventType.MSG_SENT, payload=None)
         )
@@ -449,10 +450,55 @@ class TestSendDMRecipientResolution:
         result = await manager.send_dm("Alice", "Hello mesh")
 
         assert result is True
+        cm_bot.meshcore.commands.send_msg.assert_awaited_once()
+        cm_bot.meshcore.commands.send_msg_with_retry.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_dm_uses_retry_helper_when_configured(self, cm_bot):
+        """Configured DM retries still use meshcore's retry helper."""
+        from meshcore import EventType
+
+        cm_bot.connected = True
+        cm_bot.config.set("Bot", "dm_max_retries", "2")
+        cm_bot.config.set("Bot", "dm_max_flood_attempts", "1")
+        cm_bot.meshcore = Mock()
+        cm_bot.meshcore.get_contact_by_name = Mock(return_value={"name": "Alice"})
+        cm_bot.meshcore.commands = Mock(spec=["send_msg", "send_msg_with_retry"])
+        cm_bot.meshcore.commands.send_msg = AsyncMock(return_value=Mock(type=EventType.MSG_SENT, payload=None))
+        cm_bot.meshcore.commands.send_msg_with_retry = AsyncMock(
+            return_value=Mock(type=EventType.MSG_SENT, payload=None)
+        )
+        cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
+        manager = make_manager(cm_bot)
+
+        result = await manager.send_dm("Alice", "Hello mesh")
+
+        assert result is True
+        cm_bot.meshcore.commands.send_msg.assert_not_awaited()
         cm_bot.meshcore.commands.send_msg_with_retry.assert_awaited_once()
         _, kwargs = cm_bot.meshcore.commands.send_msg_with_retry.await_args
-        assert kwargs["max_attempts"] == 1
-        assert kwargs["max_flood_attempts"] == 0
+        assert kwargs["max_attempts"] == 2
+        assert kwargs["max_flood_attempts"] == 1
+
+    @pytest.mark.asyncio
+    async def test_send_dm_unacked_retry_result_counts_as_sent(self, cm_bot):
+        """ACK loss after a DM transmit should not make keyword handling report failure."""
+        cm_bot.connected = True
+        cm_bot.config.set("Bot", "dm_max_retries", "2")
+        cm_bot.meshcore = Mock()
+        cm_bot.meshcore.get_contact_by_name = Mock(return_value={"name": "Alice"})
+        cm_bot.meshcore.commands = Mock(spec=["send_msg_with_retry"])
+        cm_bot.meshcore.commands.send_msg_with_retry = AsyncMock(return_value=None)
+        cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
+        manager = make_manager(cm_bot)
+
+        result = await manager.send_dm("Alice", "Hello mesh")
+
+        assert result is True
+        cm_bot.logger.warning.assert_called()
+        warning = cm_bot.logger.warning.call_args.args[0]
+        assert "ACK was not received" in warning
+        cm_bot.rate_limiter.record_send.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_send_dm_fails_when_name_and_prefix_lookup_miss(self, cm_bot):

@@ -405,6 +405,17 @@ class CommandManager:
         """
         if not result:
             if used_retry_method:
+                if operation_name == "DM":
+                    self.logger.warning(
+                        f"{operation_name} sent to {target} but ACK was not received (message may have been sent)"
+                    )
+                    self.bot.rate_limiter.record_send()
+                    self.bot.bot_tx_rate_limiter.record_tx()
+                    if getattr(self.bot, 'per_user_rate_limit_enabled', False) and rate_limit_key:
+                        per_user = getattr(self.bot, 'per_user_rate_limiter', None)
+                        if per_user:
+                            per_user.record_send(rate_limit_key)
+                    return True
                 self.logger.error(f"❌ {operation_name} to {target} failed - no ACK received after retries")
             else:
                 self.logger.error(f"❌ {operation_name} to {target} failed - no result returned")
@@ -413,6 +424,21 @@ class CommandManager:
         if hasattr(result, 'type'):
             if result.type == EventType.ERROR:
                 error_payload = result.payload if hasattr(result, 'payload') else {}
+                if (
+                    operation_name == "DM"
+                    and isinstance(error_payload, dict)
+                    and error_payload.get('reason') == 'no_event_received'
+                ):
+                    self.logger.warning(
+                        f"{operation_name} sent to {target} but confirmation event was not received (message may have been sent)"
+                    )
+                    self.bot.rate_limiter.record_send()
+                    self.bot.bot_tx_rate_limiter.record_tx()
+                    if getattr(self.bot, 'per_user_rate_limit_enabled', False) and rate_limit_key:
+                        per_user = getattr(self.bot, 'per_user_rate_limiter', None)
+                        if per_user:
+                            per_user.record_send(rate_limit_key)
+                    return True
                 self.logger.error(f"❌ {operation_name} failed to {target}: {error_payload if error_payload else 'Unknown error'}")
                 return False
 
@@ -1016,15 +1042,25 @@ class CommandManager:
                 # Don't fail the send if transmission tracking fails
 
             # Try to use send_msg_with_retry if available (meshcore-2.1.6+)
+            used_retry_method = False
             try:
-                # Use the meshcore commands interface for send_msg_with_retry
-                if hasattr(self.bot.meshcore, 'commands') and hasattr(self.bot.meshcore.commands, 'send_msg_with_retry'):
-                    self.logger.debug("Using send_msg_with_retry for improved reliability")
+                commands = self.bot.meshcore.commands
+                max_attempts = self.bot.config.getint('Bot', 'dm_max_retries', fallback=1)
+                max_flood_attempts = self.bot.config.getint('Bot', 'dm_max_flood_attempts', fallback=0)
+                flood_after = self.bot.config.getint('Bot', 'dm_flood_after', fallback=2)
 
-                    # Use send_msg_with_retry with configurable retry parameters
-                    max_attempts = self.bot.config.getint('Bot', 'dm_max_retries', fallback=1)
-                    max_flood_attempts = self.bot.config.getint('Bot', 'dm_max_flood_attempts', fallback=0)
-                    flood_after = self.bot.config.getint('Bot', 'dm_flood_after', fallback=2)
+                # A single-attempt DM must be a single physical transmit. Some
+                # meshcore versions still retry internally via send_msg_with_retry
+                # even with max_attempts=1, which can duplicate bot replies when
+                # ACKs arrive late.
+                single_attempt_no_flood = max_attempts <= 1 and max_flood_attempts <= 0
+
+                if single_attempt_no_flood and hasattr(commands, 'send_msg'):
+                    self.logger.debug("Using send_msg for single-attempt DM send")
+                    result = await commands.send_msg(contact, content)
+                elif hasattr(commands, 'send_msg_with_retry'):
+                    self.logger.debug("Using send_msg_with_retry for improved reliability")
+                    used_retry_method = True
                     timeout = 0  # Use suggested timeout from meshcore
 
                     self.logger.debug(f"Attempting DM send with {max_attempts} max attempts")
@@ -1045,10 +1081,6 @@ class CommandManager:
                 # Fallback to regular send_msg for older meshcore versions
                 self.logger.debug("send_msg_with_retry not available, using send_msg")
                 result = await self.bot.meshcore.commands.send_msg(contact, content)
-
-            # Check if send_msg_with_retry was used
-            used_retry_method = (hasattr(self.bot.meshcore, 'commands') and
-                               hasattr(self.bot.meshcore.commands, 'send_msg_with_retry'))
 
             # Handle result using unified handler
             return self._handle_send_result(
