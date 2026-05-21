@@ -3,7 +3,6 @@ name: Tests
 on:
   push:
     branches:
-      - eastmesh
       - develop
   pull_request:
     branches:
