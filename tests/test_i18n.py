@@ -1,6 +1,7 @@
 """Tests for modules.i18n — Translator class."""
 
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 from modules.i18n import Translator
@@ -61,6 +62,14 @@ class TestMergeTranslations:
 
 class TestTranslatorWithRealFiles:
     """Tests that use actual translation files (if available)."""
+
+    def test_channels_category_count_uses_compact_count(self):
+        translation_path = Path(__file__).resolve().parents[1] / "translations"
+        t = Translator(language="en", translation_path=str(translation_path))
+
+        result = t.translate("commands.channels.category_count", category="general", count=4)
+
+        assert result == "general (4)"
 
     def test_english_fallback_returns_key_when_missing(self, tmp_path):
         en = {"commands": {"ping": {"response": "Pong!"}}}

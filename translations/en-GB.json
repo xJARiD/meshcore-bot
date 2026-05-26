@@ -528,7 +528,7 @@
         "category": "{category}: ",
         "category_channels": "{category} channels: "
       },
-      "category_count": "{category} ({count} channels)"
+      "category_count": "{category} ({count})"
     },
     "dice": {
       "description": "Roll dice (usage: dice [sides] or dice [count]d[sides])",

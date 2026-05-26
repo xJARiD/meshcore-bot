@@ -548,7 +548,7 @@
                 "category": "{category}: ",
                 "category_channels": "{category} Kanäle: "
             },
-            "category_count": "{category} ({count} Kanäle)"
+            "category_count": "{category} ({count})"
         },
         "dice": {
             "description": "Würfel werfen (Verwendung: dice [seiten] oder dice [anzahl]d[seiten])",

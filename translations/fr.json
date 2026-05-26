@@ -528,7 +528,7 @@
                 "category": "{category}: ",
                 "category_channels": "Canaux {category}: "
             },
-            "category_count": "{category} ({count} canaux)"
+            "category_count": "{category} ({count})"
         },
         "dice": {
             "description": "Lancer dés (usage: dice [faces] ou dice [nombre]d[faces])",
