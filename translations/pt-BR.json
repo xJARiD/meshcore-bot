@@ -525,7 +525,7 @@
                 "category": "{category}: ",
                 "category_channels": "Canais {category}: "
             },
-            "category_count": "{category} ({count} canais)"
+            "category_count": "{category} ({count})"
         },
         "dice": {
             "description": "Rolar dados (uso: dado [lados] ou dado [qtd]d[lados])",

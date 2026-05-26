@@ -404,7 +404,7 @@
                 "category": "{category}: ",
                 "category_channels": "Canales de {category}: "
             },
-            "category_count": "{category} ({count} canales)"
+            "category_count": "{category} ({count})"
         },
         "dice": {
             "description": "Lanzar dados (uso: dice [lados] o dice [cantidad]d[lados])",

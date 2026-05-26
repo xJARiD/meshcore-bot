@@ -528,7 +528,7 @@
                 "category": "{category}: ",
                 "category_channels": "{category} kanalen: "
             },
-            "category_count": "{category} ({count} kanalen)"
+            "category_count": "{category} ({count})"
         },
         "dice": {
             "description": "Gooi dobbelsteen (gebruik: dice [zijden] of dice [aantal]d[zijden])",
