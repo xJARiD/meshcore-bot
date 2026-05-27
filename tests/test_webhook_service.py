@@ -206,12 +206,21 @@ class TestHandleWebhookDispatch:
         assert call_args[0][1] == "Hello!"
 
     @pytest.mark.asyncio
-    async def test_hash_stripped_from_channel_in_body(self, mock_logger):
+    async def test_hash_preserved_for_channel_lookup(self, mock_logger):
         svc, bot = _make_service(mock_logger)
         req = _make_request(body={"channel": "#general", "message": "Hello!"})
         await svc._handle_webhook(req)
         call_args = bot.command_manager.send_channel_message.call_args
-        assert call_args[0][0] == "general"
+        assert call_args[0][0] == "#general"
+
+    @pytest.mark.asyncio
+    async def test_hash_channel_matches_allowlist_without_hash(self, mock_logger):
+        svc, bot = _make_service(mock_logger, {"allowed_channels": "general"})
+        req = _make_request(body={"channel": "#general", "message": "Hello!"})
+        resp = await svc._handle_webhook(req)
+        assert resp.status == 200
+        call_args = bot.command_manager.send_channel_message.call_args
+        assert call_args[0][0] == "#general"
 
     @pytest.mark.asyncio
     async def test_dm_dispatched(self, mock_logger):

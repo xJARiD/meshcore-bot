@@ -206,7 +206,7 @@ class WebhookService(BaseServicePlugin):
         if len(message_text) > self.max_message_length:
             message_text = message_text[: self.max_message_length]
 
-        channel: str = str(body.get("channel", "")).strip().removeprefix("#")
+        channel: str = str(body.get("channel", "")).strip()
         dm_to: str = str(body.get("dm_to", "")).strip()
 
         if not channel and not dm_to:
@@ -217,7 +217,8 @@ class WebhookService(BaseServicePlugin):
             )
 
         # --- Channel whitelist check ---
-        if channel and self.allowed_channels and channel.lower() not in self.allowed_channels:
+        channel_allowlist_key = channel.removeprefix("#").lower()
+        if channel and self.allowed_channels and channel_allowlist_key not in self.allowed_channels:
             self.logger.warning(
                 f"Webhook: channel '{channel}' not in allowed_channels whitelist"
             )
@@ -232,7 +233,7 @@ class WebhookService(BaseServicePlugin):
             if channel:
                 await self._send_channel_message(channel, message_text)
                 self.logger.info(
-                    f"Webhook: sent to #{channel} from {request.remote}: "
+                    f"Webhook: sent to {channel} from {request.remote}: "
                     f"{message_text[:60]}{'...' if len(message_text) > 60 else ''}"
                 )
             else:
