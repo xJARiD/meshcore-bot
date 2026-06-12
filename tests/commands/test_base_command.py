@@ -7,6 +7,7 @@ from modules.commands.base_command import BaseCommand
 from modules.commands.dadjoke_command import DadJokeCommand
 from modules.commands.hacker_command import HackerCommand
 from modules.commands.joke_command import JokeCommand
+from modules.commands.path_command import PathCommand
 from modules.commands.ping_command import PingCommand
 from modules.commands.sports_command import SportsCommand
 from modules.commands.stats_command import StatsCommand
@@ -259,6 +260,27 @@ class TestCanExecute:
         cmd = PingCommand(command_mock_bot)
         msg = mock_message(content="ping", is_dm=True)
         assert cmd.can_execute(msg) is True
+
+    def test_path_command_honors_channel_allowlist(self, command_mock_bot):
+        command_mock_bot.config.add_section("Path_Command")
+        command_mock_bot.config.set("Path_Command", "enabled", "true")
+        command_mock_bot.config.set("Path_Command", "channels", "#meshbot,#meshbottest")
+
+        cmd = PathCommand(command_mock_bot)
+
+        assert cmd.can_execute(mock_message(content="path", channel="#meshbot", is_dm=False)) is True
+        assert cmd.can_execute(mock_message(content="path", channel="#meshbottest", is_dm=False)) is True
+        assert cmd.can_execute(mock_message(content="path", channel="#other", is_dm=False)) is False
+
+    def test_path_command_empty_channels_is_dm_only(self, command_mock_bot):
+        command_mock_bot.config.add_section("Path_Command")
+        command_mock_bot.config.set("Path_Command", "enabled", "true")
+        command_mock_bot.config.set("Path_Command", "channels", "")
+
+        cmd = PathCommand(command_mock_bot)
+
+        assert cmd.can_execute(mock_message(content="path", channel="general", is_dm=False)) is False
+        assert cmd.can_execute(mock_message(content="path", is_dm=True)) is True
 
 
 class TestMentionHelpers:

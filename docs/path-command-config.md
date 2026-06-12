@@ -26,6 +26,21 @@ path_selection_preset = balanced
 
 ## Core Settings
 
+### Channel restriction
+
+The path command supports the standard per-command `channels` setting in `[Path_Command]`.
+
+```ini
+[Path_Command]
+channels = #meshbot,#meshbottest
+```
+
+- Omit `channels` to use global `[Channels] monitor_channels`
+- Set `channels =` with no value to make the command DM-only
+- Use a comma-separated list to allow the command only in those channels
+
+Channel names are matched case-insensitively after trimming spaces.
+
 ### Geographic Proximity
 
 **`proximity_method`** (`simple` | `path`)
