@@ -177,7 +177,7 @@ class PathCommand(BaseCommand):
         """
         if not self.path_enabled:
             return False
-        return super().can_execute(message)
+        return super().can_execute(message, skip_channel_check=skip_channel_check)
 
     def matches_keyword(self, message: MeshMessage) -> bool:
         """Check if message starts with 'path' keyword or 'p' shortcut (if enabled)"""

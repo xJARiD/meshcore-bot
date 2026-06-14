@@ -865,6 +865,12 @@ mesh_connections_retention_days = 7
 # Enable or disable the path command
 enabled = true
 
+# Optional per-command channel allowlist.
+# Omit to use [Channels] monitor_channels.
+# Empty value (channels =) makes this command DM-only.
+# Example: channels = #meshbot,#meshbottest
+# channels =
+
 # Require minimum path byte length before responding to this command
 # 0 = allow all (default)
 # 1 = allow all (compatibility alias for 0)
