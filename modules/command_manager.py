@@ -1810,16 +1810,16 @@ class CommandManager:
                             self.logger.debug(f"Failed to capture command data for web viewer: {e}")
 
                 except Exception as e:
-                    self.logger.error(f"Error executing command '{command_name}': {e}")
-                    # Send error message to user
-                    error_msg = command.translate('errors.execution_error', command=command_name, error=str(e))
-                    await self.send_response(message, error_msg)
+                    # Log the failure for operators, but do NOT echo the raw exception
+                    # to the mesh — internal error strings (e.g. "invalid literal for
+                    # int()...") are noise/leakage to users. Stay silent on uncaught errors.
+                    self.logger.error(f"Error executing command '{command_name}': {e}", exc_info=True)
 
-                    # Record command execution in stats database (error response was sent)
+                    # Record command execution in stats database (no response was sent)
                     if 'stats' in self.commands:
                         stats_command = self.commands['stats']
                         if stats_command:
-                            stats_command.record_command(message, command_name, True)  # Error message counts as response
+                            stats_command.record_command(message, command_name, False)  # No response sent
 
                     # Capture failed command for web viewer
                     if (hasattr(self.bot, 'web_viewer_integration') and
