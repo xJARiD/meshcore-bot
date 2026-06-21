@@ -137,6 +137,27 @@ sudo systemctl status meshcore-bot
 
 See [Service installation](docs/service-installation.md) for detailed service installation instructions.
 
+#### Updating a Systemd Installation
+
+> **Important:** The service runs from `/opt/meshcore-bot`, **not** from your git
+> clone. A `git pull` in your working copy does **not** update the running bot —
+> you must sync the files into `/opt/meshcore-bot` and restart the service.
+
+After pulling new code in your clone, run the upgrade script (it copies the new
+files into `/opt/meshcore-bot`, updates dependencies, and restarts the service):
+
+```bash
+git pull                            # update your working copy
+sudo ./install-service.sh --upgrade # sync files to /opt/meshcore-bot + restart
+```
+
+Verify the new code is live:
+
+```bash
+PID=$(systemctl show -p MainPID --value meshcore-bot)
+ps -o pid,lstart,cmd -p "$PID"      # lstart should be the current time
+```
+
 ### Debian Package (.deb)
 
 Build and install a `.deb` package for Debian/Ubuntu systems:
