@@ -339,6 +339,7 @@ class TestSendChannelMessageListeners:
         cm_bot.channel_manager.get_channel_number = Mock(return_value=3)
         cm_bot.meshcore = Mock()
         cm_bot.meshcore.commands = Mock()
+        cm_bot.meshcore.commands.set_flood_scope = AsyncMock(return_value=None)
         cm_bot.meshcore.commands.send_chan_msg = AsyncMock(return_value=Mock(type=EventType.MSG_SENT, payload=None))
         cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
         cm_bot.channel_sent_listeners = []
@@ -552,6 +553,7 @@ class TestSendDMRecipientResolution:
         cm_bot.channel_manager.get_channel_number = Mock(return_value=1)
         cm_bot.meshcore = Mock()
         cm_bot.meshcore.commands = Mock()
+        cm_bot.meshcore.commands.set_flood_scope = AsyncMock(return_value=None)
         cm_bot.meshcore.commands.send_chan_msg = AsyncMock(return_value=Mock(type=EventType.MSG_SENT, payload=None))
         cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
         cm_bot.channel_sent_listeners = []
@@ -732,6 +734,7 @@ class TestSendChannelMessageRetry:
         cm_bot.channel_manager.get_channel_number = Mock(return_value=2)
         cm_bot.meshcore = Mock()
         cm_bot.meshcore.commands = Mock()
+        cm_bot.meshcore.commands.set_flood_scope = AsyncMock(return_value=None)
         cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
         cm_bot.channel_sent_listeners = []
         return cm_bot
@@ -817,6 +820,37 @@ class TestSendChannelMessageRetry:
         assert result is True
         assert cm_bot.meshcore.commands.send_chan_msg.call_count == 2
         assert mock_sleep.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_global_send_resets_scope_to_star_before_sending(self, cm_bot):
+        """A global (no-scope) send explicitly resets flood scope to '*' before TX.
+
+        Regression: previously the global path never called set_flood_scope, so a
+        global reply could inherit a stale regional scope left by a prior scoped
+        send (whose restore was dropped) and silently flood only that region.
+        """
+        self._setup_bot(cm_bot)
+        cm_bot.meshcore.commands.send_chan_msg = AsyncMock(
+            return_value=self._make_success_result()
+        )
+        manager = make_manager(cm_bot)
+        result = await manager.send_channel_message("general", "hi")
+        assert result is True
+        cm_bot.meshcore.commands.set_flood_scope.assert_awaited_with("*")
+
+    @pytest.mark.asyncio
+    async def test_scoped_send_sets_region_then_restores_global(self, cm_bot):
+        """A scoped send applies the region before TX and restores '*' afterward."""
+        self._setup_bot(cm_bot)
+        cm_bot.meshcore.commands.send_chan_msg = AsyncMock(
+            return_value=self._make_success_result()
+        )
+        manager = make_manager(cm_bot)
+        result = await manager.send_channel_message("general", "hi", scope="au-vic")
+        assert result is True
+        scope_calls = [c.args[0] for c in cm_bot.meshcore.commands.set_flood_scope.await_args_list]
+        # Region set before send, then restored to global.
+        assert scope_calls == ["#au-vic", "*"]
 
 
 class TestSplitTextIntoChunks:
