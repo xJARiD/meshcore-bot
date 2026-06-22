@@ -117,6 +117,10 @@ class CommandManager:
         # flood_scopes, meaning unscoped FLOOD messages are also permitted.
         self.flood_scope_allow_global: bool = False
         self.flood_scope_keys: dict[str, bytes] = self._load_flood_scope_keys()
+        # Scope the radio currently has engaged, to avoid redundant set_flood_scope
+        # calls (the firmware persists scope across sends). "*" == cleared/classic flood,
+        # which we assume on connect. See send_channel_message for the rationale.
+        self._active_flood_scope: str = "*"
 
         self.logger.info(f"CommandManager initialized with {len(self.commands)} plugins")
 
@@ -1155,26 +1159,37 @@ class CommandManager:
                 self.logger.debug(f"Error recording transmission for repeat tracking: {e}")
                 # Don't fail the send if transmission tracking fails
 
-            # Optional flood scope (region): set before send, restore after
+            # Flood scope. CRITICAL firmware behavior, verified on-air 2026-06-22:
+            # calling set_flood_scope with ANY value — including the zero-key "*" —
+            # makes the radio emit TC_FLOOD (route 0) with a transport code, and it
+            # stays in route 0 until the next reconnect. "*" does NOT restore classic
+            # flood (proven: a "*" send still came out route 0). The only way to emit
+            # classic FLOOD (route 1) — which every repeater forwards, including the
+            # regional ones that also relay unscoped — is to never call set_flood_scope.
+            #
+            # So we do NOT auto-match the incoming region on outbound: doing so flips
+            # the radio to route 0 and strands every subsequent global reply. The
+            # passed-in `scope` (matched incoming region) is intentionally ignored
+            # here. Outbound scoping is opt-in only, via [Channels]
+            # outgoing_flood_scope_override, for a deliberate single-region deployment
+            # that doesn't rely on classic flood. (The companion app can scope per
+            # message via a path the meshcore python library doesn't expose.)
             scope_cfg = ""
             if self.bot.config.has_section("Channels") and self.bot.config.has_option("Channels", "outgoing_flood_scope_override"):
                 scope_cfg = (self.bot.config.get("Channels", "outgoing_flood_scope_override") or "").strip()
-            scope_to_use = (scope if scope is not None else scope_cfg) or ""
-            scope_is_global = scope_to_use in ("", "*", "0", "None")
-            if not scope_is_global:
-                scope_to_use = self._normalize_scope_name(scope_to_use)
-            if not scope_is_global and hasattr(self.bot.meshcore.commands, "set_flood_scope"):
-                await self.bot.meshcore.commands.set_flood_scope(scope_to_use)
+            override_is_global = scope_cfg in ("", "*", "0", "None")
+            has_set_flood_scope = hasattr(self.bot.meshcore.commands, "set_flood_scope")
+            if not override_is_global:
+                desired_scope = self._normalize_scope_name(scope_cfg)
+                if has_set_flood_scope and self._active_flood_scope != desired_scope:
+                    await self.bot.meshcore.commands.set_flood_scope(desired_scope)
+                    self._active_flood_scope = desired_scope
 
             target = f"{channel} (channel {channel_num})"
             # Retry on no_event_received: max 2 extra attempts, 2s apart
             _max_retries = 2
             for _attempt in range(_max_retries + 1):
-                try:
-                    result = await self.bot.meshcore.commands.send_chan_msg(channel_num, content)
-                finally:
-                    if not scope_is_global and hasattr(self.bot.meshcore.commands, "set_flood_scope"):
-                        await self.bot.meshcore.commands.set_flood_scope("*")
+                result = await self.bot.meshcore.commands.send_chan_msg(channel_num, content)
 
                 if self._is_no_event_received(result) and _attempt < _max_retries:
                     self.logger.warning(
@@ -1182,9 +1197,6 @@ class CommandManager:
                         f"(attempt {_attempt + 1}/{_max_retries + 1}), retrying in 2s"
                     )
                     await asyncio.sleep(2)
-                    # Re-apply scope for next attempt
-                    if not scope_is_global and hasattr(self.bot.meshcore.commands, "set_flood_scope"):
-                        await self.bot.meshcore.commands.set_flood_scope(scope_to_use)
                     continue
                 break
 

@@ -292,11 +292,16 @@ async def test_send_response_passes_none_scope_when_unset():
 # ── scope normalization in send_channel_message ───────────────────────────────
 
 @pytest.mark.asyncio
-async def test_send_channel_message_normalizes_bare_scope():
-    """scope='west' passed in is normalized to '#west' before set_flood_scope call."""
+async def test_passed_scope_is_ignored_no_set_flood_scope():
+    """The matched-region scope arg is ignored: no set_flood_scope when no override.
+
+    Any set_flood_scope call (even "*") flips the radio to TC_FLOOD/route 0 on the
+    target firmware and strands later global replies, so auto-matching the incoming
+    region on outbound is disabled — replies stay classic FLOOD (route 1).
+    """
     bot = MagicMock()
     bot.logger = Mock()
-    bot.config = make_config()
+    bot.config = make_config()  # no override
     bot.connected = True
     bot.meshcore = MagicMock()
     bot.is_radio_zombie = False
@@ -307,20 +312,51 @@ async def test_send_channel_message_normalizes_bare_scope():
     cm = object.__new__(CommandManager)
     cm.bot = bot
     cm.logger = bot.logger
+    cm._active_flood_scope = "*"
 
     set_flood_scope = AsyncMock(return_value=MagicMock(type="OK"))
     send_chan_msg = AsyncMock(return_value=MagicMock(type="OK", payload={}))
     bot.meshcore.commands.set_flood_scope = set_flood_scope
     bot.meshcore.commands.send_chan_msg = send_chan_msg
 
-    # Stub out rate limiters and other helpers so the method runs end-to-end
     cm._check_rate_limits = AsyncMock(return_value=(True, None))
     cm._is_no_event_received = Mock(return_value=False)
     cm._handle_send_result = Mock(return_value=True)
 
     await cm.send_channel_message("general", "hi", scope="west")
 
-    # set_flood_scope should have been called with "#west", not "west"
-    calls = set_flood_scope.await_args_list
-    scope_set = [c.args[0] for c in calls if c.args]
-    assert "#west" in scope_set
+    set_flood_scope.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_override_scope_normalized_and_engaged():
+    """outgoing_flood_scope_override='west' is normalized to '#west' and set once."""
+    bot = MagicMock()
+    bot.logger = Mock()
+    bot.config = make_config(outgoing_flood_scope_override="west")
+    bot.connected = True
+    bot.meshcore = MagicMock()
+    bot.is_radio_zombie = False
+    bot.is_radio_offline = False
+    bot.channel_manager = MagicMock()
+    bot.channel_manager.get_channel_number = Mock(return_value=0)
+
+    cm = object.__new__(CommandManager)
+    cm.bot = bot
+    cm.logger = bot.logger
+    cm._active_flood_scope = "*"
+
+    set_flood_scope = AsyncMock(return_value=MagicMock(type="OK"))
+    send_chan_msg = AsyncMock(return_value=MagicMock(type="OK", payload={}))
+    bot.meshcore.commands.set_flood_scope = set_flood_scope
+    bot.meshcore.commands.send_chan_msg = send_chan_msg
+
+    cm._check_rate_limits = AsyncMock(return_value=(True, None))
+    cm._is_no_event_received = Mock(return_value=False)
+    cm._handle_send_result = Mock(return_value=True)
+
+    await cm.send_channel_message("general", "hi")
+
+    # Override normalized to "#west", not "west"
+    scope_set = [c.args[0] for c in set_flood_scope.await_args_list if c.args]
+    assert scope_set == ["#west"]

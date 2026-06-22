@@ -3137,7 +3137,8 @@ class MessageHandler:
                         )
                     else:
                         success = await self.bot.command_manager.send_channel_message(
-                            message.channel, response, command_id, rate_limit_key=rate_limit_key
+                            message.channel, response, command_id, rate_limit_key=rate_limit_key,
+                            scope=getattr(message, 'reply_scope', None),
                         )
 
                     if not success:
@@ -3182,7 +3183,8 @@ class MessageHandler:
                         )
                     else:
                         success = await self.bot.command_manager.send_channel_message(
-                            message.channel, response, command_id, rate_limit_key=rate_limit_key
+                            message.channel, response, command_id, rate_limit_key=rate_limit_key,
+                            scope=getattr(message, 'reply_scope', None),
                         )
 
                     if not success:

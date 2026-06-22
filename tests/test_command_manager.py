@@ -339,6 +339,7 @@ class TestSendChannelMessageListeners:
         cm_bot.channel_manager.get_channel_number = Mock(return_value=3)
         cm_bot.meshcore = Mock()
         cm_bot.meshcore.commands = Mock()
+        cm_bot.meshcore.commands.set_flood_scope = AsyncMock(return_value=None)
         cm_bot.meshcore.commands.send_chan_msg = AsyncMock(return_value=Mock(type=EventType.MSG_SENT, payload=None))
         cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
         cm_bot.channel_sent_listeners = []
@@ -552,6 +553,7 @@ class TestSendDMRecipientResolution:
         cm_bot.channel_manager.get_channel_number = Mock(return_value=1)
         cm_bot.meshcore = Mock()
         cm_bot.meshcore.commands = Mock()
+        cm_bot.meshcore.commands.set_flood_scope = AsyncMock(return_value=None)
         cm_bot.meshcore.commands.send_chan_msg = AsyncMock(return_value=Mock(type=EventType.MSG_SENT, payload=None))
         cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
         cm_bot.channel_sent_listeners = []
@@ -732,6 +734,7 @@ class TestSendChannelMessageRetry:
         cm_bot.channel_manager.get_channel_number = Mock(return_value=2)
         cm_bot.meshcore = Mock()
         cm_bot.meshcore.commands = Mock()
+        cm_bot.meshcore.commands.set_flood_scope = AsyncMock(return_value=None)
         cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
         cm_bot.channel_sent_listeners = []
         return cm_bot
@@ -817,6 +820,42 @@ class TestSendChannelMessageRetry:
         assert result is True
         assert cm_bot.meshcore.commands.send_chan_msg.call_count == 2
         assert mock_sleep.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_send_never_calls_set_flood_scope_without_override(self, cm_bot):
+        """With no override, the bot must NEVER call set_flood_scope — for any send.
+
+        On the target firmware, any set_flood_scope call — even zero-key "*" —
+        engages TC_FLOOD (route 0) and the radio stays route 0 until reconnect.
+        Not calling it keeps every reply in classic FLOOD (route 1), forwarded by
+        all repeaters (like the companion app). The matched-region `scope` arg is
+        intentionally ignored so a regional reply can't strand later global ones.
+        """
+        self._setup_bot(cm_bot)
+        cm_bot.meshcore.commands.send_chan_msg = AsyncMock(
+            return_value=self._make_success_result()
+        )
+        manager = make_manager(cm_bot)
+        # Global, then a "matched region" send, then global again.
+        await manager.send_channel_message("general", "global one")
+        await manager.send_channel_message("general", "regional", scope="au-vic")
+        await manager.send_channel_message("general", "global two")
+        cm_bot.meshcore.commands.set_flood_scope.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_override_engages_scope_once(self, cm_bot):
+        """outgoing_flood_scope_override opts into a fixed scope, set only when it changes."""
+        self._setup_bot(cm_bot)
+        cm_bot.config.set("Channels", "outgoing_flood_scope_override", "au-vic")
+        cm_bot.meshcore.commands.send_chan_msg = AsyncMock(
+            return_value=self._make_success_result()
+        )
+        manager = make_manager(cm_bot)
+        await manager.send_channel_message("general", "one")
+        await manager.send_channel_message("general", "two")
+        scope_calls = [c.args[0] for c in cm_bot.meshcore.commands.set_flood_scope.await_args_list]
+        # Override scope engaged once; second send is already on it, no repeat call.
+        assert scope_calls == ["#au-vic"]
 
 
 class TestSplitTextIntoChunks:
