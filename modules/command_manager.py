@@ -1161,9 +1161,14 @@ class CommandManager:
                 scope_cfg = (self.bot.config.get("Channels", "outgoing_flood_scope_override") or "").strip()
             scope_to_use = (scope if scope is not None else scope_cfg) or ""
             scope_is_global = scope_to_use in ("", "*", "0", "None")
-            if not scope_is_global:
-                scope_to_use = self._normalize_scope_name(scope_to_use)
-            if not scope_is_global and hasattr(self.bot.meshcore.commands, "set_flood_scope"):
+            # Resolve to a concrete scope token and ALWAYS set it before sending.
+            # Global resolves to "*" (firmware zero-key reset). Setting it explicitly
+            # every send makes the radio scope deterministic and prevents a global
+            # send from inheriting a stale regional scope left by a prior send whose
+            # restore was dropped (set_flood_scope's OK event is not retried).
+            scope_to_use = "*" if scope_is_global else self._normalize_scope_name(scope_to_use)
+            has_set_flood_scope = hasattr(self.bot.meshcore.commands, "set_flood_scope")
+            if has_set_flood_scope:
                 await self.bot.meshcore.commands.set_flood_scope(scope_to_use)
 
             target = f"{channel} (channel {channel_num})"
@@ -1173,7 +1178,9 @@ class CommandManager:
                 try:
                     result = await self.bot.meshcore.commands.send_chan_msg(channel_num, content)
                 finally:
-                    if not scope_is_global and hasattr(self.bot.meshcore.commands, "set_flood_scope"):
+                    # Leave the radio at global so any path that sends without
+                    # re-setting scope defaults to global, never a stale region.
+                    if not scope_is_global and has_set_flood_scope:
                         await self.bot.meshcore.commands.set_flood_scope("*")
 
                 if self._is_no_event_received(result) and _attempt < _max_retries:
@@ -1182,8 +1189,8 @@ class CommandManager:
                         f"(attempt {_attempt + 1}/{_max_retries + 1}), retrying in 2s"
                     )
                     await asyncio.sleep(2)
-                    # Re-apply scope for next attempt
-                    if not scope_is_global and hasattr(self.bot.meshcore.commands, "set_flood_scope"):
+                    # Re-apply the resolved scope for next attempt
+                    if has_set_flood_scope:
                         await self.bot.meshcore.commands.set_flood_scope(scope_to_use)
                     continue
                 break
