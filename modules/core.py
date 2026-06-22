@@ -1355,6 +1355,12 @@ long_jokes = false
                 # Set device name to match config if needed
                 await self.set_device_name()
 
+                # Ensure the device default flood scope is global ("classic flood").
+                # Regional replies set a temporary scope per-send; the firmware reverts
+                # the current scope to this device default, so it must be global or
+                # unscoped/global ("*") replies won't actually flood through repeaters.
+                await self.reset_default_flood_scope()
+
                 return True
             else:
                 self.logger.error("Failed to connect to MeshCore node")
@@ -1718,6 +1724,37 @@ long_jokes = false
 
         except (OSError, AttributeError, ValueError, KeyError) as e:
             self.logger.warning(f"Error checking/setting device name: {e}")
+            return False
+
+    async def reset_default_flood_scope(self) -> bool:
+        """Set the device's default flood scope to global ("*", classic flood).
+
+        Outgoing replies set a per-send scope (regional when the incoming message
+        matched a flood_scope, global otherwise). The firmware reverts the current
+        scope to the device default between sends, so if that default is a region,
+        "global" replies inherit a regional transport code and only nearby nodes
+        hear them — upstream repeaters won't relay them. Forcing the default to
+        global ensures unscoped replies actually flood the whole mesh.
+        """
+        try:
+            if not hasattr(self.meshcore, 'commands') or not hasattr(
+                self.meshcore.commands, 'set_default_flood_scope'
+            ):
+                self.logger.debug("Device does not support set_default_flood_scope; skipping")
+                return False
+
+            result = await self.meshcore.commands.set_default_flood_scope("*")
+            if getattr(result, 'type', None) == EventType.OK:
+                self.logger.info("✓ Device default flood scope set to global (classic flood)")
+                return True
+            # error_code 1 means the firmware predates flood scope support — not fatal.
+            self.logger.warning(
+                f"Could not set default flood scope to global: "
+                f"{result.payload if hasattr(result, 'payload') else result}"
+            )
+            return False
+        except (OSError, AttributeError, ValueError, KeyError) as e:
+            self.logger.warning(f"Error setting default flood scope: {e}")
             return False
 
     async def wait_for_contacts(self) -> None:
