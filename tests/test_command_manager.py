@@ -822,35 +822,40 @@ class TestSendChannelMessageRetry:
         assert mock_sleep.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_global_send_resets_scope_to_star_before_sending(self, cm_bot):
-        """A global (no-scope) send explicitly resets flood scope to '*' before TX.
+    async def test_send_never_calls_set_flood_scope_without_override(self, cm_bot):
+        """With no override, the bot must NEVER call set_flood_scope — for any send.
 
-        Regression: previously the global path never called set_flood_scope, so a
-        global reply could inherit a stale regional scope left by a prior scoped
-        send (whose restore was dropped) and silently flood only that region.
+        On the target firmware, any set_flood_scope call — even zero-key "*" —
+        engages TC_FLOOD (route 0) and the radio stays route 0 until reconnect.
+        Not calling it keeps every reply in classic FLOOD (route 1), forwarded by
+        all repeaters (like the companion app). The matched-region `scope` arg is
+        intentionally ignored so a regional reply can't strand later global ones.
         """
         self._setup_bot(cm_bot)
         cm_bot.meshcore.commands.send_chan_msg = AsyncMock(
             return_value=self._make_success_result()
         )
         manager = make_manager(cm_bot)
-        result = await manager.send_channel_message("general", "hi")
-        assert result is True
-        cm_bot.meshcore.commands.set_flood_scope.assert_awaited_with("*")
+        # Global, then a "matched region" send, then global again.
+        await manager.send_channel_message("general", "global one")
+        await manager.send_channel_message("general", "regional", scope="au-vic")
+        await manager.send_channel_message("general", "global two")
+        cm_bot.meshcore.commands.set_flood_scope.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_scoped_send_sets_region_then_restores_global(self, cm_bot):
-        """A scoped send applies the region before TX and restores '*' afterward."""
+    async def test_override_engages_scope_once(self, cm_bot):
+        """outgoing_flood_scope_override opts into a fixed scope, set only when it changes."""
         self._setup_bot(cm_bot)
+        cm_bot.config.set("Channels", "outgoing_flood_scope_override", "au-vic")
         cm_bot.meshcore.commands.send_chan_msg = AsyncMock(
             return_value=self._make_success_result()
         )
         manager = make_manager(cm_bot)
-        result = await manager.send_channel_message("general", "hi", scope="au-vic")
-        assert result is True
+        await manager.send_channel_message("general", "one")
+        await manager.send_channel_message("general", "two")
         scope_calls = [c.args[0] for c in cm_bot.meshcore.commands.set_flood_scope.await_args_list]
-        # Region set before send, then restored to global.
-        assert scope_calls == ["#au-vic", "*"]
+        # Override scope engaged once; second send is already on it, no repeat call.
+        assert scope_calls == ["#au-vic"]
 
 
 class TestSplitTextIntoChunks:

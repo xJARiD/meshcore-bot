@@ -730,39 +730,3 @@ async def _make_coro_async(value):
 def _make_coro(value):
     """Return a coroutine that immediately resolves to *value*."""
     return _make_coro_async(value)
-
-
-class TestResetDefaultFloodScope:
-    """Tests for MeshCoreBot.reset_default_flood_scope()."""
-
-    def test_sets_device_default_scope_to_global(self, bot):
-        from meshcore.events import EventType
-        ok = MagicMock()
-        ok.type = EventType.OK
-        ok.payload = None
-        bot.meshcore = MagicMock()
-        bot.meshcore.commands.set_default_flood_scope = MagicMock(
-            return_value=_make_coro(ok)
-        )
-        result = asyncio.run(bot.reset_default_flood_scope())
-        assert result is True
-        bot.meshcore.commands.set_default_flood_scope.assert_called_once_with("*")
-
-    def test_returns_false_when_command_unsupported(self, bot):
-        bot.meshcore = MagicMock()
-        # spec=[] → hasattr is False for any attribute, simulating old firmware.
-        bot.meshcore.commands = MagicMock(spec=[])
-        result = asyncio.run(bot.reset_default_flood_scope())
-        assert result is False
-
-    def test_returns_false_on_error_event(self, bot):
-        from meshcore.events import EventType
-        err = MagicMock()
-        err.type = EventType.ERROR
-        err.payload = {"error_code": 1}
-        bot.meshcore = MagicMock()
-        bot.meshcore.commands.set_default_flood_scope = MagicMock(
-            return_value=_make_coro(err)
-        )
-        result = asyncio.run(bot.reset_default_flood_scope())
-        assert result is False
