@@ -6,25 +6,46 @@ Handles scheduled messages and timing
 
 import asyncio
 import datetime
+import hashlib
 import json
 import os
+import socket
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from meshcore.events import EventType
 
 from .maintenance import MaintenanceRunner
+from .scheduled_message_cron import (
+    is_valid_legacy_hhmm,
+    parse_schedule_key,
+    parse_scheduled_message_value,
+)
 from .security_utils import validate_external_url
-from .utils import decode_escape_sequences, format_keyword_response_with_placeholders, get_config_timezone
+from .utils import (
+    decode_escape_sequences,
+    format_keyword_response_with_placeholders,
+    get_config_timezone,
+)
 
-# process_message_queue may await long per-feed intervals across many queued items; 30s is too short.
-_FEED_MESSAGE_QUEUE_FUTURE_TIMEOUT = 600
+_CHANNEL_OPERATION_TYPES = ('add', 'remove')
+_RADIO_OPERATION_TYPES = (
+    'radio_reboot',
+    'radio_connect',
+    'radio_disconnect',
+    'firmware_read',
+    'firmware_write',
+    'radio_params_read',
+    'radio_params_write',
+    'radio_advert',
+)
+_CONFIG_OPERATION_TYPES = ('config_reload',)
 
 
 class MessageScheduler:
@@ -33,19 +54,36 @@ class MessageScheduler:
     def __init__(self, bot):
         self.bot = bot
         self.logger = bot.logger
+        self._claim_owner_host = socket.gethostname()
+        self._claim_owner_pid = os.getpid()
+        # Unique to this scheduler/process start; retained with the PID to make
+        # ownership auditable and prevent one scheduler instance finalizing a
+        # claim made by another instance in the same process.
+        self._claim_owner_boot_id = uuid.uuid4().hex
         self.scheduled_messages = {}
         self.scheduler_thread = None
         self._apscheduler: Optional[BackgroundScheduler] = None
         self.last_channel_ops_check_time = 0
         self.last_message_queue_check_time = 0
         self.last_radio_ops_check_time = 0
-        # Align with nightly email: first retention run after ~24h uptime (not immediately on boot).
-        self.last_data_retention_run = time.time()
         self._data_retention_interval_seconds = 86400  # 24 hours
+        self._data_retention_startup_delay_seconds = 60
+        # Enforce retention shortly after startup, independently of the nightly
+        # email timer. After that first run, the scheduler resets this timestamp
+        # and retains the normal daily cadence.
+        self.last_data_retention_run = (
+            time.time()
+            - self._data_retention_interval_seconds
+            + self._data_retention_startup_delay_seconds
+        )
         self.last_nightly_email_time = time.time()     # don't send immediately on startup
         self.last_db_backup_run = 0
         self.last_log_rotation_check_time = 0
         self.maintenance = MaintenanceRunner(bot, get_current_time=self.get_current_time)
+        db_manager = getattr(bot, 'db_manager', None)
+        db_path = getattr(db_manager, 'db_path', None)
+        if db_manager is not None and isinstance(db_path, (str, os.PathLike)):
+            self._recover_interrupted_operations()
 
     def get_current_time(self):
         """Get current time in configured timezone"""
@@ -73,33 +111,57 @@ class MessageScheduler:
 
         if self.bot.config.has_section('Scheduled_Messages'):
             self.logger.info("Found Scheduled_Messages section")
-            for time_str, message_info in self.bot.config.items('Scheduled_Messages'):
-                self.logger.info(f"Processing scheduled message: '{time_str}' -> '{message_info}'")
+            for schedule_key, message_info in self.bot.config.items('Scheduled_Messages'):
+                self.logger.info(f"Processing scheduled message: '{schedule_key}' -> '{message_info}'")
                 try:
-                    # Validate time format first
-                    if not self._is_valid_time_format(time_str):
-                        self.logger.warning(f"Invalid time format '{time_str}' for scheduled message: {message_info}")
+                    parsed = parse_schedule_key(schedule_key, tz)
+                    if parsed.trigger is None:
+                        self.logger.warning(
+                            f"Invalid schedule '{schedule_key}' for scheduled message: {message_info}"
+                        )
                         continue
 
-                    channel, message = message_info.split(':', 1)
-                    channel = channel.strip()
-                    message = decode_escape_sequences(message.strip())
-                    hour = int(time_str[:2])
-                    minute = int(time_str[2:])
+                    if parsed.is_deprecated_hhmm:
+                        hh = int(schedule_key[:2])
+                        mm = int(schedule_key[2:])
+                        cron_suggestion = f"{mm} {hh} * * *"
+                        self.logger.warning(
+                            "Scheduled_Messages key %r uses deprecated HHMM daily format; "
+                            "migrate to 5-field cron (minute hour dom mon dow), e.g. %r. "
+                            "HHMM support will be removed in a future release.",
+                            schedule_key,
+                            cron_suggestion,
+                        )
+
+                    channel, message, scope = parse_scheduled_message_value(message_info)
+                    message = decode_escape_sequences(message)
+
+                    job_id = "schedmsg_" + hashlib.sha256(
+                        f"{schedule_key}\0{channel}\0{scope or ''}\0{message}".encode()
+                    ).hexdigest()[:24]
 
                     self._apscheduler.add_job(
                         self.send_scheduled_message,
-                        CronTrigger(hour=hour, minute=minute),
+                        parsed.trigger,
                         args=[channel, message],
-                        id=f"msg_{time_str}_{channel}",
+                        kwargs={"schedule_key": schedule_key, "scope": scope},
+                        id=job_id,
                         replace_existing=True,
                     )
-                    self.scheduled_messages[time_str] = (channel, message)
-                    self.logger.info(f"Scheduled message: {hour:02d}:{minute:02d} -> {channel}: {message}")
+                    self.scheduled_messages[schedule_key] = (
+                        channel,
+                        message,
+                        parsed.display_label,
+                        scope,
+                    )
+                    scope_note = f" scope={scope}" if scope else ""
+                    self.logger.info(
+                        f"Scheduled message: {parsed.display_label} -> {channel}{scope_note}: {message}"
+                    )
                 except ValueError:
                     self.logger.warning(f"Invalid scheduled message format: {message_info}")
                 except Exception as e:
-                    self.logger.warning(f"Error setting up scheduled message '{time_str}': {e}")
+                    self.logger.warning(f"Error setting up scheduled message '{schedule_key}': {e}")
 
         self._apscheduler.start()
         self.logger.info(f"APScheduler started with {len(self.scheduled_messages)} scheduled message(s)")
@@ -127,7 +189,7 @@ class MessageScheduler:
         """One-shot jobs for auto_manage_contacts=device: firmware autoadd + favourite hygiene."""
         if self._apscheduler is None:
             return
-        if self.bot.config.get('Bot', 'auto_manage_contacts', fallback='false').lower() != 'device':
+        if self.bot.config.get('Bot', 'auto_manage_contacts', fallback='device').lower() != 'device':
             return
         try:
             delay_fw = max(0, self.bot.config.getint('Bot', 'device_mode_firmware_delay_seconds', fallback=30))
@@ -165,16 +227,30 @@ class MessageScheduler:
         """Run async coroutine on bot main loop from APScheduler thread (same pattern as send_scheduled_message)."""
         import asyncio
 
-        if hasattr(self.bot, 'main_event_loop') and self.bot.main_event_loop and self.bot.main_event_loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(coro, self.bot.main_event_loop)
-            try:
-                future.result(timeout=timeout)
-            except RuntimeError as e:
-                self.logger.warning('Event loop gone during device-mode job: %s', e)
-            except Exception as e:
-                self.logger.error('Device-mode scheduled job failed: %s', e)
-        else:
+        loop = getattr(self.bot, 'main_event_loop', None)
+        if not loop or not loop.is_running():
+            # Close the coroutine we were handed. Dropping it unawaited leaks it and
+            # emits "coroutine ... was never awaited" RuntimeWarning.
+            coro.close()
             self.logger.warning('No running main_event_loop — skipping device-mode scheduled job')
+            return
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+        except RuntimeError as e:
+            # This job runs on an APScheduler thread, so the loop can stop between
+            # the is_running() check above and this submit. The coroutine never got
+            # scheduled, so close it here too.
+            coro.close()
+            self.logger.warning('Event loop gone during device-mode job: %s', e)
+            return
+
+        try:
+            future.result(timeout=timeout)
+        except RuntimeError as e:
+            self.logger.warning('Event loop gone during device-mode job: %s', e)
+        except Exception as e:
+            self.logger.error('Device-mode scheduled job failed: %s', e)
 
     async def _device_mode_firmware_coro(self) -> None:
         await self.bot.repeater_manager.apply_device_mode_firmware_preferences()
@@ -186,33 +262,43 @@ class MessageScheduler:
         await self.bot.repeater_manager.sync_device_mode_favourites_pass2()
 
     def _device_mode_firmware_job_sync(self) -> None:
-        if self.bot.config.get('Bot', 'auto_manage_contacts', fallback='false').lower() != 'device':
+        if self.bot.config.get('Bot', 'auto_manage_contacts', fallback='device').lower() != 'device':
             self.logger.debug('Skipping device_mode_firmware job — not device mode')
             return
         self._run_async_on_main_loop(self._device_mode_firmware_coro(), timeout=120.0)
 
     def _device_mode_favourite_pass1_job_sync(self) -> None:
-        if self.bot.config.get('Bot', 'auto_manage_contacts', fallback='false').lower() != 'device':
+        if self.bot.config.get('Bot', 'auto_manage_contacts', fallback='device').lower() != 'device':
             return
         self._run_async_on_main_loop(self._device_mode_favourite_pass1_coro(), timeout=600.0)
 
     def _device_mode_favourite_pass2_job_sync(self) -> None:
-        if self.bot.config.get('Bot', 'auto_manage_contacts', fallback='false').lower() != 'device':
+        if self.bot.config.get('Bot', 'auto_manage_contacts', fallback='device').lower() != 'device':
             return
         self._run_async_on_main_loop(self._device_mode_favourite_pass2_coro(), timeout=600.0)
 
     def _is_valid_time_format(self, time_str: str) -> bool:
-        """Validate time format (HHMM)"""
-        try:
-            if len(time_str) != 4:
-                return False
-            hour = int(time_str[:2])
-            minute = int(time_str[2:])
-            return 0 <= hour <= 23 and 0 <= minute <= 59
-        except ValueError:
-            return False
+        """Validate deprecated legacy time format (HHMM). Prefer cron in config keys."""
+        return is_valid_legacy_hhmm(time_str)
 
-    def send_scheduled_message(self, channel: str, message: str):
+    def _scheduled_message_stagger_seconds(self, schedule_key: str) -> float:
+        """Deterministic delay in [0, max) so simultaneous cron jobs do not stack on the radio."""
+        max_s = self.bot.config.getfloat(
+            "Bot", "scheduled_message_max_stagger_seconds", fallback=1.5
+        )
+        if max_s <= 0 or not (schedule_key or "").strip():
+            return 0.0
+        digest = hashlib.sha256(schedule_key.encode("utf-8")).digest()
+        slot = int.from_bytes(digest[:4], "big") / (2**32)
+        return float(slot * max_s)
+
+    def send_scheduled_message(
+        self,
+        channel: str,
+        message: str,
+        schedule_key: str = "",
+        scope: str | None = None,
+    ):
         """Send a scheduled message (synchronous wrapper for schedule library)"""
         if self.bot.is_radio_zombie:
             self.logger.warning("send_scheduled_message suppressed — radio is in zombie state")
@@ -222,7 +308,11 @@ class MessageScheduler:
             return
 
         current_time = self.get_current_time()
-        self.logger.info(f"📅 Sending scheduled message at {current_time.strftime('%H:%M:%S')} to {channel}: {message}")
+        scope_note = f" [{scope}]" if scope else ""
+        self.logger.info(
+            f"📅 Sending scheduled message at {current_time.strftime('%H:%M:%S')} "
+            f"to {channel}{scope_note}: {message}"
+        )
 
         import asyncio
 
@@ -231,8 +321,10 @@ class MessageScheduler:
         if hasattr(self.bot, 'main_event_loop') and self.bot.main_event_loop and self.bot.main_event_loop.is_running():
             # Schedule coroutine in the running main event loop
             future = asyncio.run_coroutine_threadsafe(
-                self._send_scheduled_message_async(channel, message),
-                self.bot.main_event_loop
+                self._send_scheduled_message_async(
+                    channel, message, schedule_key=schedule_key, scope=scope
+                ),
+                self.bot.main_event_loop,
             )
             # Wait for completion (with timeout to prevent indefinite blocking)
             try:
@@ -247,7 +339,11 @@ class MessageScheduler:
             # Fallback: create a temporary event loop and close it when done
             loop = asyncio.new_event_loop()
             try:
-                loop.run_until_complete(self._send_scheduled_message_async(channel, message))
+                loop.run_until_complete(
+                    self._send_scheduled_message_async(
+                        channel, message, schedule_key=schedule_key, scope=scope
+                    )
+                )
             finally:
                 loop.close()
 
@@ -407,8 +503,22 @@ class MessageScheduler:
         ]
         return any(placeholder in message for placeholder in placeholders)
 
-    async def _send_scheduled_message_async(self, channel: str, message: str):
+    async def _send_scheduled_message_async(
+        self,
+        channel: str,
+        message: str,
+        *,
+        schedule_key: str = "",
+        scope: str | None = None,
+    ):
         """Send a scheduled message (async implementation)"""
+        stagger = self._scheduled_message_stagger_seconds(schedule_key)
+        if stagger > 0:
+            self.logger.debug(
+                "Scheduled message stagger %.2fs (schedule_key=%r)", stagger, schedule_key
+            )
+            await asyncio.sleep(stagger)
+
         # Check if message contains mesh info placeholders
         if self._has_mesh_info_placeholders(message):
             try:
@@ -430,7 +540,9 @@ class MessageScheduler:
         import asyncio as _asyncio
         send_timeout = self.bot.config.getint('Bot', 'send_timeout_seconds', fallback=30)
         await _asyncio.wait_for(
-            self.bot.command_manager.send_channel_message(channel, message),
+            self.bot.command_manager.send_channel_message(
+                channel, message, skip_user_rate_limit=True, scope=scope
+            ),
             timeout=send_timeout,
         )
 
@@ -546,41 +658,34 @@ class MessageScheduler:
                         lambda f: self.logger.exception("Error processing radio operations: %s", f.exception())
                         if not f.cancelled() and f.exception() else None
                     )
+                    # Config-reload requests from the web viewer use the same table.
+                    config_future = asyncio.run_coroutine_threadsafe(
+                        self._process_config_operations(),
+                        self.bot.main_event_loop
+                    )
+                    config_future.add_done_callback(
+                        lambda f: self.logger.exception("Error processing config operations: %s", f.exception())
+                        if not f.cancelled() and f.exception() else None
+                    )
                 self.last_radio_ops_check_time = time.time()
 
-            # Process feed message queue (every 2 seconds)
-            if time.time() - self.last_message_queue_check_time >= 2:  # Every 2 seconds
+            # Process feed message queue (every 2 seconds, fire-and-forget)
+            # process_message_queue() returns immediately if a run is already in progress,
+            # so we never block this thread waiting for per-feed send intervals.
+            if time.time() - self.last_message_queue_check_time >= 2:
                 if (hasattr(self.bot, 'feed_manager') and self.bot.feed_manager and
                     hasattr(self.bot, 'connected') and self.bot.connected):
                     import asyncio
                     if hasattr(self.bot, 'main_event_loop') and self.bot.main_event_loop and self.bot.main_event_loop.is_running():
-                        # Schedule coroutine in the running main event loop
                         future = asyncio.run_coroutine_threadsafe(
                             self.bot.feed_manager.process_message_queue(),
                             self.bot.main_event_loop
                         )
-                        try:
-                            future.result(timeout=_FEED_MESSAGE_QUEUE_FUTURE_TIMEOUT)
-                        except TimeoutError:
-                            self.logger.warning(
-                                "Timed out waiting for feed message queue after %ss; "
-                                "work may still be running on the main loop (per-feed send spacing).",
-                                _FEED_MESSAGE_QUEUE_FUTURE_TIMEOUT,
-                            )
-                        except RuntimeError as e:
-                            self.logger.warning("Event loop gone during feed message queue: %s", e)
-                        except Exception as e:
-                            self.logger.exception(f"Error processing message queue: {e}")
-                    else:
-                        # Fallback: create new event loop if main loop not available
-                        try:
-                            loop = asyncio.get_event_loop()
-                        except RuntimeError:
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
-
-                        loop.run_until_complete(self.bot.feed_manager.process_message_queue())
-                    self.last_message_queue_check_time = time.time()
+                        future.add_done_callback(
+                            lambda f: self.logger.exception("Error processing message queue: %s", f.exception())
+                            if not f.cancelled() and f.exception() else None
+                        )
+                self.last_message_queue_check_time = time.time()
 
             # Data retention: run daily (packet_stream, repeater tables, stats, caches, mesh_connections)
             if time.time() - self.last_data_retention_run >= self._data_retention_interval_seconds:
@@ -672,7 +777,7 @@ class MessageScheduler:
             if hasattr(self.bot, 'mesh_graph') and self.bot.mesh_graph and hasattr(self.bot.mesh_graph, 'delete_expired_edges_from_db'):
                 self.bot.mesh_graph.delete_expired_edges_from_db(mesh_connections_days)
 
-            ran_at = datetime.datetime.now(datetime.UTC).isoformat()
+            ran_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
             self._last_retention_stats['ran_at'] = ran_at
             try:
                 self.bot.db_manager.set_metadata('maint.status.data_retention_ran_at', ran_at)
@@ -684,7 +789,7 @@ class MessageScheduler:
             self.logger.exception(f"Error during data retention cleanup: {e}")
             self._last_retention_stats['error'] = str(e)
             try:
-                ran_at = datetime.datetime.now(datetime.UTC).isoformat()
+                ran_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 self.bot.db_manager.set_metadata('maint.status.data_retention_ran_at', ran_at)
                 self.bot.db_manager.set_metadata('maint.status.data_retention_outcome', f'error: {e}')
             except Exception:
@@ -780,106 +885,237 @@ class MessageScheduler:
             raise RuntimeError(f"send_advert failed: {reason}")
         self.logger.info("Interval-based flood advert sent successfully")
 
-    async def _process_channel_operations(self):
-        """Process pending channel operations from the web viewer"""
+    def _claim_operation(self, operation_types: tuple[str, ...]) -> Optional[dict[str, Any]]:
+        """Atomically claim the oldest pending operation in one serialized group.
+
+        ``BEGIN IMMEDIATE`` prevents two scheduler ticks (or two bot processes)
+        from selecting the same pending row.  A group permits only one
+        ``processing`` operation at a time, preserving device-operation order
+        when an earlier command is slow.
+
+        Processing rows are never auto-requeued.  If a previous same-host owner
+        is provably dead at startup, its claim becomes ``interrupted`` so later
+        work can proceed without replaying the ambiguous action.  Live or
+        unprovable owners continue to block the group conservatively.
+        """
+        if not operation_types:
+            raise ValueError("operation_types must not be empty")
+
+        placeholders = ', '.join('?' for _ in operation_types)
+        with self.bot.db_manager.connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute('BEGIN IMMEDIATE')
+
+            cursor.execute(
+                f'''SELECT id
+                    FROM channel_operations
+                    WHERE status = 'processing'
+                      AND operation_type IN ({placeholders})
+                    LIMIT 1''',
+                operation_types,
+            )
+            if cursor.fetchone() is not None:
+                conn.commit()
+                return None
+
+            cursor.execute(
+                f'''SELECT *
+                    FROM channel_operations
+                    WHERE status = 'pending'
+                      AND operation_type IN ({placeholders})
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT 1''',
+                operation_types,
+            )
+            row = cursor.fetchone()
+            if row is None:
+                conn.commit()
+                return None
+
+            cursor.execute(
+                '''UPDATE channel_operations
+                   SET status = 'processing',
+                       claimed_at = CURRENT_TIMESTAMP,
+                       claim_owner_host = ?,
+                       claim_owner_pid = ?,
+                       claim_owner_boot_id = ?,
+                       processed_at = NULL,
+                       error_message = NULL,
+                       result_data = NULL
+                   WHERE id = ? AND status = 'pending' ''',
+                (
+                    self._claim_owner_host,
+                    self._claim_owner_pid,
+                    self._claim_owner_boot_id,
+                    row['id'],
+                ),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return None
+
+            conn.commit()
+            claimed = dict(row)
+            claimed['status'] = 'processing'
+            return claimed
+
+    @staticmethod
+    def _is_local_pid_alive(pid: int) -> Optional[bool]:
+        """Return PID liveness, or ``None`` when it cannot be proven either way."""
+        if not isinstance(pid, int) or pid <= 0:
+            return None
         try:
-            # Get pending operations
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # The kernel found the process but this user cannot signal it.
+            return True
+        except OSError:
+            return None
+        return True
+
+    def _recover_interrupted_operations(self) -> int:
+        """Resolve only startup claims provably abandoned by a local process.
+
+        Legacy ownerless rows may be interrupted.  An owned row is interrupted
+        only when it belongs to this host and its PID is provably dead.  Live
+        same-host owners, other hosts, and incomplete/unknown identities stay
+        blocked conservatively.  This method is only invoked during scheduler
+        construction, never by polling or a timer.
+        """
+        explanation = (
+            "Bot restarted while this operation was processing; the action may "
+            "already have reached the device. Automatic retry is disabled. "
+            "Verify device state before submitting another operation."
+        )
+        try:
             with self.bot.db_manager.connection() as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
+                cursor.execute('BEGIN IMMEDIATE')
+                cursor.execute(
+                    '''SELECT id, claim_owner_host, claim_owner_pid,
+                              claim_owner_boot_id
+                       FROM channel_operations
+                       WHERE status = 'processing' ''',
+                )
+                rows = cursor.fetchall()
+                recovered = 0
+                blocked = 0
+                for row in rows:
+                    owner_host = row['claim_owner_host']
+                    owner_pid = row['claim_owner_pid']
+                    owner_boot_id = row['claim_owner_boot_id']
+                    legacy_ownerless = (
+                        owner_host is None
+                        and owner_pid is None
+                        and owner_boot_id is None
+                    )
+                    same_host_dead = (
+                        owner_host == self._claim_owner_host
+                        and self._is_local_pid_alive(owner_pid) is False
+                    )
+                    if not legacy_ownerless and not same_host_dead:
+                        blocked += 1
+                        continue
 
-                cursor.execute('''
-                    SELECT id, operation_type, channel_idx, channel_name, channel_key_hex
-                    FROM channel_operations
-                    WHERE status = 'pending'
-                      AND operation_type IN ('add', 'remove')
-                    ORDER BY created_at ASC
-                    LIMIT 10
-                ''')
+                    cursor.execute(
+                        '''UPDATE channel_operations
+                           SET status = 'interrupted',
+                               processed_at = CURRENT_TIMESTAMP,
+                               error_message = ?
+                           WHERE id = ? AND status = 'processing' ''',
+                        (explanation, row['id']),
+                    )
+                    recovered += cursor.rowcount
+                conn.commit()
+        except sqlite3.Error as exc:
+            self.logger.exception(
+                "Could not recover interrupted channel/radio operations at startup: %s",
+                exc,
+            )
+            return 0
 
-                operations = cursor.fetchall()
+        if recovered:
+            self.logger.warning(
+                "Marked %s operation(s) interrupted after restart; verify device state before retrying",
+                recovered,
+            )
+        if blocked:
+            self.logger.warning(
+                "Left %s processing operation(s) blocked because their owner is live or cannot be proven dead",
+                blocked,
+            )
+        return recovered
 
-            if not operations:
-                return
+    def _finish_claimed_operation(
+        self,
+        op_id: int,
+        *,
+        success: bool,
+        result_payload: Optional[dict[str, Any]] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Finalize a claim without overwriting externally resolved state."""
+        with self.bot.db_manager.connection() as conn:
+            cursor = conn.cursor()
+            if success:
+                cursor.execute(
+                    '''UPDATE channel_operations
+                       SET status = 'completed',
+                           processed_at = CURRENT_TIMESTAMP,
+                           result_data = ?,
+                           error_message = NULL
+                       WHERE id = ? AND status = 'processing'
+                         AND claim_owner_host = ?
+                         AND claim_owner_pid = ?
+                         AND claim_owner_boot_id = ? ''',
+                    (
+                        json.dumps(result_payload or {'success': True}),
+                        op_id,
+                        self._claim_owner_host,
+                        self._claim_owner_pid,
+                        self._claim_owner_boot_id,
+                    ),
+                )
+            else:
+                cursor.execute(
+                    '''UPDATE channel_operations
+                       SET status = 'failed',
+                           processed_at = CURRENT_TIMESTAMP,
+                           error_message = ?
+                       WHERE id = ? AND status = 'processing'
+                         AND claim_owner_host = ?
+                         AND claim_owner_pid = ?
+                         AND claim_owner_boot_id = ? ''',
+                    (
+                        error_message or 'Unknown error',
+                        op_id,
+                        self._claim_owner_host,
+                        self._claim_owner_pid,
+                        self._claim_owner_boot_id,
+                    ),
+                )
+            if cursor.rowcount != 1:
+                self.logger.warning(
+                    "Operation %s was no longer processing when finalization was attempted",
+                    op_id,
+                )
+            conn.commit()
 
-            self.logger.info(f"Processing {len(operations)} pending channel operation(s)")
-
-            for op in operations:
-                op_id = op['id']
-                op_type = op['operation_type']
-                channel_idx = op['channel_idx']
-                channel_name = op['channel_name']
-                channel_key_hex = op['channel_key_hex']
-
-                try:
-                    success = False
-                    error_msg = None
-
-                    if op_type == 'add':
-                        # Add channel
-                        if channel_key_hex:
-                            # Custom channel with key
-                            channel_secret = bytes.fromhex(channel_key_hex)
-                            success = await self.bot.channel_manager.add_channel(
-                                channel_idx, channel_name, channel_secret=channel_secret
-                            )
-                        else:
-                            # Hashtag channel (firmware generates key)
-                            success = await self.bot.channel_manager.add_channel(
-                                channel_idx, channel_name
-                            )
-
-                        if success:
-                            self.logger.info(f"Successfully processed channel add operation: {channel_name} at index {channel_idx}")
-                        else:
-                            error_msg = "Failed to add channel"
-
-                    elif op_type == 'remove':
-                        # Remove channel
-                        success = await self.bot.channel_manager.remove_channel(channel_idx)
-
-                        if success:
-                            self.logger.info(f"Successfully processed channel remove operation: index {channel_idx}")
-                        else:
-                            error_msg = "Failed to remove channel"
-
-                    # Update operation status
-                    with self.bot.db_manager.connection() as conn:
-                        cursor = conn.cursor()
-                        if success:
-                            cursor.execute('''
-                                UPDATE channel_operations
-                                SET status = 'completed',
-                                    processed_at = CURRENT_TIMESTAMP,
-                                    result_data = ?
-                                WHERE id = ?
-                            ''', (json.dumps({'success': True}), op_id))
-                        else:
-                            cursor.execute('''
-                                UPDATE channel_operations
-                                SET status = 'failed',
-                                    processed_at = CURRENT_TIMESTAMP,
-                                    error_message = ?
-                                WHERE id = ?
-                            ''', (error_msg or 'Unknown error', op_id))
-                        conn.commit()
-
-                except Exception as e:
-                    self.logger.error(f"Error processing channel operation {op_id}: {e}")
-                    # Mark as failed
-                    try:
-                        with self.bot.db_manager.connection() as conn:
-                            cursor = conn.cursor()
-                            cursor.execute('''
-                                UPDATE channel_operations
-                                SET status = 'failed',
-                                    processed_at = CURRENT_TIMESTAMP,
-                                    error_message = ?
-                                WHERE id = ?
-                            ''', (str(e), op_id))
-                            conn.commit()
-                    except Exception as update_error:
-                        self.logger.error(f"Error updating operation status: {update_error}")
+    async def _process_channel_operations(self):
+        """Process pending channel operations from the web viewer"""
+        try:
+            # Preserve the previous per-tick batch capacity, but claim only one
+            # row immediately before executing it.  The next claim cannot
+            # succeed until the previous row has reached a terminal state.
+            for _ in range(10):
+                op = self._claim_operation(_CHANNEL_OPERATION_TYPES)
+                if not op:
+                    return
+                await self._execute_claimed_channel_operation(op)
 
         except Exception as e:
             db_path = getattr(self.bot.db_manager, 'db_path', 'unknown')
@@ -895,26 +1131,60 @@ class MessageScheduler:
             else:
                 self.logger.error(f"Database path: {db_path_str}")
 
+    async def _execute_claimed_channel_operation(self, op: dict[str, Any]) -> None:
+        """Execute and finalize one already-claimed channel operation."""
+        op_id = op['id']
+        op_type = op['operation_type']
+        channel_idx = op['channel_idx']
+        channel_name = op['channel_name']
+        channel_key_hex = op['channel_key_hex']
+        self.logger.info("Processing claimed channel operation %s: %s", op_id, op_type)
+
+        try:
+            success = False
+            error_msg = None
+
+            if op_type == 'add':
+                if channel_key_hex:
+                    channel_secret = bytes.fromhex(channel_key_hex)
+                    success = await self.bot.channel_manager.add_channel(
+                        channel_idx, channel_name, channel_secret=channel_secret
+                    )
+                else:
+                    success = await self.bot.channel_manager.add_channel(
+                        channel_idx, channel_name
+                    )
+
+                if success:
+                    self.logger.info(f"Successfully processed channel add operation: {channel_name} at index {channel_idx}")
+                else:
+                    error_msg = "Failed to add channel"
+
+            elif op_type == 'remove':
+                success = await self.bot.channel_manager.remove_channel(channel_idx)
+
+                if success:
+                    self.logger.info(f"Successfully processed channel remove operation: index {channel_idx}")
+                else:
+                    error_msg = "Failed to remove channel"
+
+            self._finish_claimed_operation(
+                op_id,
+                success=success,
+                error_message=error_msg,
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error processing channel operation {op_id}: {e}")
+            try:
+                self._finish_claimed_operation(op_id, success=False, error_message=str(e))
+            except Exception as update_error:
+                self.logger.error(f"Error updating operation status: {update_error}")
+
     async def _process_radio_operations(self):
         """Process pending radio connect/disconnect/reboot/firmware operations from the web viewer."""
         try:
-            with self.bot.db_manager.connection() as conn:
-                conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT id, operation_type, payload_data
-                    FROM channel_operations
-                    WHERE status = 'pending'
-                      AND operation_type IN (
-                          'radio_reboot', 'radio_connect', 'radio_disconnect',
-                          'firmware_read', 'firmware_write',
-                          'radio_params_read', 'radio_params_write'
-                      )
-                    ORDER BY created_at ASC
-                    LIMIT 1
-                ''')
-                op = cursor.fetchone()
-
+            op = self._claim_operation(_RADIO_OPERATION_TYPES)
             if not op:
                 return
 
@@ -940,52 +1210,67 @@ class MessageScheduler:
                 elif op_type == 'radio_params_write':
                     payload = json.loads(op['payload_data'] or '{}')
                     success, result_payload = await self._radio_params_write_op(payload)
+                elif op_type == 'radio_advert':
+                    payload = json.loads(op['payload_data'] or '{}')
+                    success, result_payload = await self._radio_advert_op(payload)
                 else:
                     success = False
 
-                with self.bot.db_manager.connection() as conn:
-                    cursor = conn.cursor()
-                    if success:
-                        cursor.execute('''
-                            UPDATE channel_operations
-                            SET status = 'completed',
-                                processed_at = CURRENT_TIMESTAMP,
-                                result_data = ?
-                            WHERE id = ?
-                        ''', (json.dumps(result_payload), op_id))
-                    else:
-                        error_msg = result_payload.get('error', 'Radio operation returned False') \
-                            if isinstance(result_payload, dict) else 'Radio operation returned False'
-                        cursor.execute('''
-                            UPDATE channel_operations
-                            SET status = 'failed',
-                                processed_at = CURRENT_TIMESTAMP,
-                                error_message = ?
-                            WHERE id = ?
-                        ''', (error_msg, op_id))
-                    conn.commit()
+                error_msg = result_payload.get('error', 'Radio operation returned False') \
+                    if isinstance(result_payload, dict) else 'Radio operation returned False'
+                self._finish_claimed_operation(
+                    op_id,
+                    success=success,
+                    result_payload=result_payload,
+                    error_message=error_msg,
+                )
 
             except Exception as e:
                 self.logger.error(f"Error executing radio operation {op_id}: {e}")
                 try:
-                    with self.bot.db_manager.connection() as conn:
-                        cursor = conn.cursor()
-                        cursor.execute('''
-                            UPDATE channel_operations
-                            SET status = 'failed',
-                                processed_at = CURRENT_TIMESTAMP,
-                                error_message = ?
-                            WHERE id = ?
-                        ''', (str(e), op_id))
-                        conn.commit()
+                    self._finish_claimed_operation(op_id, success=False, error_message=str(e))
                 except Exception as update_error:
                     self.logger.error(f"Error updating radio operation status: {update_error}")
 
         except Exception as e:
             self.logger.exception(f"Error in _process_radio_operations: {e}")
 
+    async def _process_config_operations(self):
+        """Process pending config_reload requests queued by the web viewer.
+
+        The web viewer (a separate process) inserts a ``config_reload`` row into
+        ``channel_operations``; here we call ``bot.reload_config()`` so command
+        settings saved in the UI take effect without a restart.  Service plugin
+        start/stop is not handled by reload_config and still needs a restart.
+        """
+        try:
+            op = self._claim_operation(_CONFIG_OPERATION_TYPES)
+            if not op:
+                return
+
+            op_id = op['id']
+            self.logger.info(f"Processing config reload operation {op_id}")
+
+            try:
+                success, message = self.bot.reload_config()
+            except Exception as e:  # noqa: BLE001 - never let reload crash the scheduler
+                success, message = False, str(e)
+                self.logger.exception("Error during config reload")
+
+            self._finish_claimed_operation(
+                op_id,
+                success=success,
+                result_payload={'success': True, 'message': message},
+                error_message=message,
+            )
+
+            self.logger.info("Config reload %s: %s", 'succeeded' if success else 'failed', message)
+
+        except Exception as e:
+            self.logger.exception(f"Error in _process_config_operations: {e}")
+
     async def _firmware_read_op(self):
-        """Read path.hash.mode and custom vars (including loop.detect) from radio firmware."""
+        """Read the path hash mode from radio firmware (device query)."""
         import asyncio
         try:
             meshcore = getattr(self.bot, 'meshcore', None)
@@ -996,25 +1281,13 @@ class MessageScheduler:
                 meshcore.commands.get_path_hash_mode(), timeout=10
             )
 
-            custom_vars_event = await asyncio.wait_for(
-                meshcore.commands.get_custom_vars(), timeout=10
-            )
-
-            custom_vars = {}
-            if custom_vars_event and custom_vars_event.payload:
-                custom_vars = dict(custom_vars_event.payload)
-
-            return True, {
-                'path_hash_mode': path_hash_mode,
-                'loop_detect': custom_vars.get('loop.detect'),
-                'custom_vars': custom_vars,
-            }
+            return True, {'path_hash_mode': path_hash_mode}
         except Exception as e:
             self.logger.error(f"Firmware read failed: {e}")
             return False, {'error': str(e)}
 
     async def _firmware_write_op(self, payload: dict):
-        """Write path.hash.mode and/or loop.detect to radio firmware."""
+        """Write the path hash mode to radio firmware."""
         import asyncio
 
         from meshcore.events import EventType
@@ -1036,16 +1309,6 @@ class MessageScheduler:
                 if not ok:
                     errors.append(f"set_path_hash_mode({mode}) failed: {result}")
 
-            if 'loop_detect' in payload:
-                value = str(payload['loop_detect']).lower()
-                result = await asyncio.wait_for(
-                    meshcore.commands.set_custom_var('loop.detect', value), timeout=10
-                )
-                ok = getattr(result, 'type', None) == EventType.OK
-                results['loop_detect'] = ok
-                if not ok:
-                    errors.append(f"set_custom_var(loop.detect, {value}) failed: {result}")
-
             success = len(errors) == 0
             response: dict[str, Any] = {'results': results}
             if errors:
@@ -1056,7 +1319,7 @@ class MessageScheduler:
             return False, {'error': str(e)}
 
     async def _radio_params_read_op(self):
-        """Read current radio parameters (freq, bw, sf, cr, tx_power) via SELF_INFO."""
+        """Read current radio and node parameters via SELF_INFO (appstart)."""
         try:
             meshcore = getattr(self.bot, 'meshcore', None)
             if not meshcore or not getattr(meshcore, 'is_connected', False):
@@ -1076,13 +1339,34 @@ class MessageScheduler:
                 'cr': p.get('radio_cr'),
                 'tx_power': p.get('tx_power'),
                 'max_tx_power': p.get('max_tx_power'),
+                'name': p.get('name'),
+                'adv_lat': p.get('adv_lat'),
+                'adv_lon': p.get('adv_lon'),
+                'adv_loc_policy': p.get('adv_loc_policy'),
+                'manual_add_contacts': p.get('manual_add_contacts'),
+                'multi_acks': p.get('multi_acks'),
+                'telemetry_mode_base': p.get('telemetry_mode_base'),
+                'telemetry_mode_loc': p.get('telemetry_mode_loc'),
+                'telemetry_mode_env': p.get('telemetry_mode_env'),
             }
         except Exception as e:
             self.logger.error(f"Radio params read failed: {e}")
             return False, {'error': str(e)}
 
+    # Fields applied through a single CMD_SET_OTHER_PARAMS frame (read-modify-write).
+    OTHER_PARAMS_FIELDS = (
+        'manual_add_contacts', 'multi_acks', 'adv_loc_policy',
+        'telemetry_mode_base', 'telemetry_mode_loc', 'telemetry_mode_env',
+    )
+
     async def _radio_params_write_op(self, payload: dict):
-        """Write radio parameters (freq, bw, sf, cr, tx_power) to device."""
+        """Write radio and node parameters to the device.
+
+        Accepts any mix of: freq/bw/sf/cr (together), tx_power, name, lat/lon
+        (together), rx_delay/airtime_factor (together), and the
+        CMD_SET_OTHER_PARAMS fields (manual_add_contacts, multi_acks,
+        adv_loc_policy, telemetry_mode_*).
+        """
         try:
             meshcore = getattr(self.bot, 'meshcore', None)
             if not meshcore or not getattr(meshcore, 'is_connected', False):
@@ -1113,6 +1397,63 @@ class MessageScheduler:
                 if not ok:
                     errors.append(f"set_tx_power failed: {result}")
 
+            if 'name' in payload:
+                result = await asyncio.wait_for(
+                    meshcore.commands.set_name(str(payload['name'])), timeout=10
+                )
+                ok = getattr(result, 'type', None) == EventType.OK
+                results['name'] = ok
+                if not ok:
+                    errors.append(f"set_name failed: {result}")
+
+            if 'lat' in payload and 'lon' in payload:
+                result = await asyncio.wait_for(
+                    meshcore.commands.set_coords(
+                        float(payload['lat']), float(payload['lon'])
+                    ), timeout=10
+                )
+                ok = getattr(result, 'type', None) == EventType.OK
+                results['coords'] = ok
+                if not ok:
+                    errors.append(f"set_coords failed: {result}")
+
+            if any(k in payload for k in self.OTHER_PARAMS_FIELDS):
+                # CMD_SET_OTHER_PARAMS writes all of these at once, so read the
+                # current values first and overlay only the requested changes.
+                infos_event = await asyncio.wait_for(
+                    meshcore.commands.send_appstart(), timeout=10
+                )
+                if infos_event is None or infos_event.type == EventType.ERROR:
+                    errors.append('Failed to read current device settings before update')
+                else:
+                    infos = dict(infos_event.payload or {})
+                    if 'manual_add_contacts' in payload:
+                        infos['manual_add_contacts'] = bool(payload['manual_add_contacts'])
+                    for key in ('multi_acks', 'adv_loc_policy',
+                                'telemetry_mode_base', 'telemetry_mode_loc',
+                                'telemetry_mode_env'):
+                        if key in payload:
+                            infos[key] = int(payload[key])
+                    result = await asyncio.wait_for(
+                        meshcore.commands.set_other_params_from_infos(infos), timeout=10
+                    )
+                    ok = getattr(result, 'type', None) == EventType.OK
+                    results['other_params'] = ok
+                    if not ok:
+                        errors.append(f"set_other_params failed: {result}")
+
+            if 'rx_delay' in payload and 'airtime_factor' in payload:
+                # Firmware stores these as floats; the wire format is value x1000.
+                rx_ms = int(round(float(payload['rx_delay']) * 1000))
+                af_ms = int(round(float(payload['airtime_factor']) * 1000))
+                result = await asyncio.wait_for(
+                    meshcore.commands.set_tuning(rx_ms, af_ms), timeout=10
+                )
+                ok = getattr(result, 'type', None) == EventType.OK
+                results['tuning'] = ok
+                if not ok:
+                    errors.append(f"set_tuning failed: {result}")
+
             success = len(errors) == 0
             response: dict = {'results': results}
             if errors:
@@ -1120,6 +1461,25 @@ class MessageScheduler:
             return success, response
         except Exception as e:
             self.logger.error(f"Radio params write failed: {e}")
+            return False, {'error': str(e)}
+
+    async def _radio_advert_op(self, payload: dict):
+        """Send a self-advertisement (optionally flooded) from the device."""
+        try:
+            meshcore = getattr(self.bot, 'meshcore', None)
+            if not meshcore or not getattr(meshcore, 'is_connected', False):
+                return False, {'error': 'Radio not connected'}
+
+            flood = bool(payload.get('flood', False))
+            result = await asyncio.wait_for(
+                meshcore.commands.send_advert(flood=flood), timeout=10
+            )
+            ok = getattr(result, 'type', None) == EventType.OK
+            if not ok:
+                return False, {'error': f"send_advert failed: {result}"}
+            return True, {'flood': flood}
+        except Exception as e:
+            self.logger.error(f"Radio advert failed: {e}")
             return False, {'error': str(e)}
 
     # ── Maintenance (delegates to MaintenanceRunner) ─────────────────────────
@@ -1244,7 +1604,7 @@ class MessageScheduler:
         except ValueError:
             smtp_port = 587
 
-        now_utc         = datetime.datetime.now(datetime.UTC)
+        now_utc         = datetime.datetime.now(datetime.timezone.utc)
         connection_type = self.bot.config.get('Connection', 'connection_type', fallback='unknown')
         serial_port     = self.bot.config.get('Connection', 'serial_port', fallback='n/a')
         interval_min    = interval // 60
@@ -1388,7 +1748,7 @@ class MessageScheduler:
         except ValueError:
             smtp_port = 587
 
-        now_utc         = datetime.datetime.now(datetime.UTC)
+        now_utc         = datetime.datetime.now(datetime.timezone.utc)
         connection_type = self.bot.config.get('Connection', 'connection_type', fallback='unknown')
         serial_port     = self.bot.config.get('Connection', 'serial_port', fallback='n/a')
 
@@ -1454,4 +1814,3 @@ class MessageScheduler:
             self.bot.logger.error(f"Failed to send radio-offline alert email: {e}")
 
     # ── Maintenance helpers ──────────────────────────────────────────────────
-

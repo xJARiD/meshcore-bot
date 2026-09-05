@@ -40,6 +40,11 @@ class BaseServicePlugin(ABC):
     that both transmit mesh channel messages and call ``send_external_notifications``
     should skip ``send_channel_message`` when this is true so alerts go only to
     webhook/Telegram. Subclasses implement the guard at their mesh send sites.
+
+    **Regional flood scope:** optional ``flood_scope`` in this plugin's config section
+    (e.g. ``#west``). Use ``get_mesh_flood_scope()`` when calling
+    ``send_channel_message``; omit the key to inherit
+    ``[Channels] outgoing_flood_scope_override``.
     """
 
     # Optional: Config section name (if different from class name)
@@ -51,6 +56,12 @@ class BaseServicePlugin(ABC):
 
     # Optional: Service name for metadata
     name: str = ""
+
+    # Optional machine-readable description of this service's configurable
+    # settings, used by the web viewer to render typed widgets and validate
+    # input.  See modules/settings_schema.py for the field format.  Services that
+    # leave this empty get a generic enable-toggle + raw key/value editor.
+    settings_schema: list[dict[str, Any]] = []
 
     def __init__(self, bot: Any):
         """Initialize the service plugin.
@@ -108,6 +119,22 @@ class BaseServicePlugin(ABC):
         if self._external_notify_cache is None:
             self._external_notify_cache = self._parse_external_notify_settings()
         return self._external_notify_cache
+
+    def get_mesh_flood_scope(self) -> str | None:
+        """Optional regional TC_FLOOD scope from this plugin's config section.
+
+        Reads ``flood_scope`` from ``config_section``. When omitted, returns ``None``
+        so ``send_channel_message`` uses ``[Channels] outgoing_flood_scope_override``.
+        """
+        from modules.command_manager import CommandManager
+
+        section = self.config_section or self._derive_config_section()
+        if not self.bot.config.has_section(section):
+            return None
+        raw = (self.bot.config.get(section, "flood_scope", fallback="") or "").strip()
+        if not raw:
+            return None
+        return CommandManager._normalize_scope_name(raw)
 
     def has_external_notification_targets(self) -> bool:
         """True if Discord URLs are set, or Telegram chats plus a resolved bot token."""
@@ -211,6 +238,14 @@ class BaseServicePlugin(ABC):
         """
         pass
 
+    async def on_transport_reconnected(self) -> None:
+        """Called after bot.connect() replaces meshcore; re-bind mesh subscriptions.
+
+        Override in services that subscribe to meshcore events. Default is no-op.
+        Only invoked for services that are already running (after initial start).
+        """
+        return None
+
     def get_metadata(self) -> dict[str, Any]:
         """Get service metadata.
 
@@ -223,7 +258,9 @@ class BaseServicePlugin(ABC):
             'description': getattr(self, 'description', ''),
             'enabled': self.enabled,
             'running': self._running,
-            'config_section': self.config_section or self._derive_config_section()
+            'config_section': self.config_section or self._derive_config_section(),
+            'settings_schema': self.settings_schema,
+            'has_schema': bool(self.settings_schema),
         }
 
     def _derive_service_name(self) -> str:
@@ -234,7 +271,8 @@ class BaseServicePlugin(ABC):
         """
         class_name = self.__class__.__name__
         if class_name.endswith('Service'):
-            return class_name[:-7].lower()  # Remove 'Service' suffix and lowercase
+            # Remove 'Service' suffix and lowercase
+            return class_name[:-7].lower().strip('_')
         return class_name.lower()
 
     def _derive_config_section(self) -> str:

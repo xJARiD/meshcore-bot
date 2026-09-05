@@ -48,6 +48,10 @@
       "score",
       "scores"
     ],
+    "worldcup": [
+      "wc",
+      "worldcup"
+    ],
     "stats": [
       "stats"
     ],
@@ -255,6 +259,17 @@
       "no_games_team": "No games found for {team}",
       "team_not_found": "Team/League '{team}' not found. Try: seahawks, mariners, sounders, kraken, storm, chiefs, lfc, mlb, nfl, mls, wnba, epl, etc."
     },
+    "worldcup": {
+      "description": "FIFA World Cup scores, standings & nation results (in-season only)",
+      "help": "World Cup scores. Use 'wc' for today's games, 'wc group [A-L]' for standings, or 'wc [nation]' for a team's matches.",
+      "not_in_season": "No World Cup is currently in progress.",
+      "no_games_today": "No World Cup games today.",
+      "no_games_nation": "No World Cup matches found for {nation}.",
+      "groups_list": "World Cup groups: {groups}. Try 'wc group A'.",
+      "group_not_found": "Group '{group}' not found. Try a group letter, e.g. 'wc group A'.",
+      "nation_not_found": "Nation '{nation}' not found in the current World Cup.",
+      "error_fetching": "Error fetching World Cup data"
+    },
     "stats": {
       "description": "Show statistics for past 24 hours. Use 'stats messages', 'stats channels', or 'stats paths' for specific stats.",
       "help": "Show 24h bot stats. Use 'stats' (basic), 'stats messages' (users), 'stats channels' (activity), 'stats paths' (paths)",
@@ -337,7 +352,8 @@
       "continuation_start": "...\n{line}",
       "continuation_end": "\n...",
       "truncation": "...",
-      "unknown_name": "Unknown"
+      "unknown_name": "Unknown",
+      "repeater_resolution_deferred": "Path: {path}\n\n💡 Tip: Repeater identification requires {minimum_path_bytes}-byte paths."
     },
     "prefix": {
       "description": "Look up repeaters by two-character prefix (e.g., 'prefix 1A')",
@@ -503,7 +519,7 @@
       "category_other": "🛰️ Other: ",
       "examples": "\nExamples:\n• satpass iss\n• satpass noaa15\n• satpass 25544\n• satpass 27607 visual (visual passes only)",
       "labels": {
-        "geostationary": "{satname} appears to be geostationary or has invalid pass data. Geostationary satellites don't have traditional passes - they remain in a fixed position relative to Earth.",
+        "geostationary": "{satname}: GEO (no LEO pass)",
         "no_passes": "{satname} has no {pass_type} passes in the next 10 days from this location",
         "invalid_norad": "Provide NORAD# example use:🛰️satpass 25544,33591"
       }

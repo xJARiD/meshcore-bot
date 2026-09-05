@@ -238,6 +238,56 @@ class TestCheckKeywords:
         matches = manager.check_keywords(msg)
         assert any(trigger == "help" for trigger, _ in matches)
 
+    def test_help_disabled_no_response(self, cm_bot):
+        """[Help_Command] enabled=false must suppress the help response.
+
+        The special help path bypasses the plugin loop (where can_execute() enforces
+        enablement), so it has to honor the flag itself.
+        """
+        mock_help = MagicMock()
+        mock_help.help_enabled = False
+        mock_help.keywords = ["help"]
+        mock_help.should_execute = Mock(return_value=False)
+        manager = make_manager(cm_bot, commands={"help": mock_help})
+        msg = mock_message(content="help", is_dm=True)
+        matches = manager.check_keywords(msg)
+        assert not any(trigger == "help" for trigger, _ in matches)
+
+    def test_help_enabled_responds_when_command_loaded(self, cm_bot):
+        """A loaded, enabled help command still produces a help response."""
+        cm_bot.config.set("Keywords", "help", "Help: ping, test")
+        mock_help = MagicMock()
+        mock_help.help_enabled = True
+        mock_help.keywords = ["help"]
+        manager = make_manager(cm_bot, commands={"help": mock_help})
+        msg = mock_message(content="help", is_dm=True)
+        matches = manager.check_keywords(msg)
+        assert any(trigger == "help" for trigger, _ in matches)
+
+    def test_help_channel_override_blocks_disallowed_channel(self, cm_bot):
+        """[Help_Command] channels override must gate the special help path too.
+
+        The path bypasses the plugin loop (where is_channel_allowed is enforced), so
+        it has to consult the help command's channel access directly.
+        """
+        cm_bot.config.set("Keywords", "help", "Help: ping, test")
+        mock_help = MagicMock()
+        mock_help.help_enabled = True
+        mock_help.keywords = ["help"]
+        # Disallow the channel the message arrives on.
+        mock_help.is_channel_allowed = Mock(return_value=False)
+        mock_help.should_execute = Mock(return_value=False)
+        manager = make_manager(cm_bot, commands={"help": mock_help})
+
+        msg = mock_message(content="help", channel="general", is_dm=False)
+        matches = manager.check_keywords(msg)
+        assert not any(trigger == "help" for trigger, _ in matches)
+
+        # Allowed channel still responds.
+        mock_help.is_channel_allowed = Mock(return_value=True)
+        matches = manager.check_keywords(mock_message(content="help", channel="general", is_dm=False))
+        assert any(trigger == "help" for trigger, _ in matches)
+
 
 class TestGetHelpForCommand:
     """Tests for command-specific help."""
@@ -522,6 +572,47 @@ class TestSendDMRecipientResolution:
         cm_bot.meshcore.get_contact_by_name.assert_called_once_with("ab12")
         cm_bot.logger.error.assert_called()
         assert "Contact not found for DM recipient identifier" in cm_bot.logger.error.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_send_response_dm_uses_sender_pubkey_over_name(self, cm_bot):
+        """send_response for a DM must use sender_pubkey (not sender_id/name) to avoid
+        misrouting when two nodes share a similar display name."""
+        from meshcore import EventType
+
+        cm_bot.connected = True
+        cm_bot.meshcore = Mock()
+        # Name lookup by display name would resolve the WRONG node (same name prefix)
+        cm_bot.meshcore.get_contact_by_name = Mock(return_value=None)
+        cm_bot.meshcore.contacts = {
+            "contact1": {
+                "name": "Alice",
+                "adv_name": "Alice",
+                "public_key": "aabbccddeeff001122",
+            },
+            "contact2": {
+                "name": "Alice-repeater",
+                "adv_name": "Alice-repeater",
+                "public_key": "ffeeddccbbaa998877",
+            },
+        }
+        cm_bot.meshcore.commands = Mock(spec=["send_msg"])
+        cm_bot.meshcore.commands.send_msg = AsyncMock(return_value=Mock(type=EventType.MSG_SENT, payload=None))
+        cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
+        manager = make_manager(cm_bot)
+
+        msg = MeshMessage(
+            content="hello",
+            sender_id="Alice",
+            sender_pubkey="aabbccddeeff001122",
+            is_dm=True,
+        )
+
+        result = await manager.send_response(msg, "Hi back")
+
+        assert result is True
+        cm_bot.meshcore.get_contact_by_name.assert_called_once_with("aabbccddeeff001122")
+        sent_contact = cm_bot.meshcore.commands.send_msg.await_args.args[0]
+        assert sent_contact["public_key"] == "aabbccddeeff001122"
 
     @pytest.mark.asyncio
     async def test_failed_send_does_not_invoke_listeners(self, cm_bot):
@@ -822,29 +913,31 @@ class TestSendChannelMessageRetry:
         assert mock_sleep.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_send_never_calls_set_flood_scope_without_override(self, cm_bot):
-        """With no override, the bot must NEVER call set_flood_scope — for any send.
+    async def test_passed_scope_is_set_then_restored_per_send(self, cm_bot):
+        """A regional `scope` arg engages set_flood_scope for that send only.
 
-        On the target firmware, any set_flood_scope call — even zero-key "*" —
-        engages TC_FLOOD (route 0) and the radio stays route 0 until reconnect.
-        Not calling it keeps every reply in classic FLOOD (route 1), forwarded by
-        all repeaters (like the companion app). The matched-region `scope` arg is
-        intentionally ignored so a regional reply can't strand later global ones.
+        The scope is applied before send_chan_msg and reset to "*" afterwards, so a
+        regional reply never leaks into later global sends. Global sends (no scope,
+        no override) never touch set_flood_scope.
         """
         self._setup_bot(cm_bot)
         cm_bot.meshcore.commands.send_chan_msg = AsyncMock(
             return_value=self._make_success_result()
         )
         manager = make_manager(cm_bot)
-        # Global, then a "matched region" send, then global again.
         await manager.send_channel_message("general", "global one")
         await manager.send_channel_message("general", "regional", scope="au-vic")
         await manager.send_channel_message("general", "global two")
-        cm_bot.meshcore.commands.set_flood_scope.assert_not_awaited()
+        scope_calls = [c.args[0] for c in cm_bot.meshcore.commands.set_flood_scope.await_args_list]
+        assert scope_calls == ["#au-vic", "*"]
 
     @pytest.mark.asyncio
-    async def test_override_engages_scope_once(self, cm_bot):
-        """outgoing_flood_scope_override opts into a fixed scope, set only when it changes."""
+    async def test_override_applies_on_every_send(self, cm_bot):
+        """outgoing_flood_scope_override is re-applied for each send, not cached.
+
+        Re-applying per send keeps the radio and the bot in agreement after a
+        reconnect or reboot clears the radio's RAM-only scope override.
+        """
         self._setup_bot(cm_bot)
         cm_bot.config.set("Channels", "outgoing_flood_scope_override", "au-vic")
         cm_bot.meshcore.commands.send_chan_msg = AsyncMock(
@@ -854,8 +947,7 @@ class TestSendChannelMessageRetry:
         await manager.send_channel_message("general", "one")
         await manager.send_channel_message("general", "two")
         scope_calls = [c.args[0] for c in cm_bot.meshcore.commands.set_flood_scope.await_args_list]
-        # Override scope engaged once; second send is already on it, no repeat call.
-        assert scope_calls == ["#au-vic"]
+        assert scope_calls == ["#au-vic", "*", "#au-vic", "*"]
 
 
 class TestSplitTextIntoChunks:
@@ -917,6 +1009,96 @@ class TestSplitTextIntoChunks:
         assert all(len(c) == 1 for c in result)
 
 
+class TestSplitTextIntoUtf8Chunks:
+    """Tests for CommandManager.split_text_into_utf8_chunks."""
+
+    def test_short_text_single_chunk(self):
+        result = CommandManager.split_text_into_utf8_chunks("hello", 158)
+        assert result == ["hello"]
+
+    def test_empty_string(self):
+        result = CommandManager.split_text_into_utf8_chunks("", 158)
+        assert result == [""]
+
+    def test_splits_on_spaces_within_byte_budget(self):
+        text = "word " * 50  # 250 chars ASCII
+        result = CommandManager.split_text_into_utf8_chunks(text.strip(), 158)
+        assert len(result) >= 2
+        assert all(len(c.encode("utf-8")) <= 158 for c in result)
+
+    def test_never_splits_multibyte_codepoints(self):
+        # Each emoji is 4 UTF-8 bytes
+        text = "😀" * 50
+        result = CommandManager.split_text_into_utf8_chunks(text, 20)
+        assert all(len(c.encode("utf-8")) <= 20 for c in result)
+        assert "".join(result) == text
+        for chunk in result:
+            # Re-encoding round-trip must succeed (no truncated sequences)
+            chunk.encode("utf-8").decode("utf-8")
+
+    def test_prefers_newline_boundaries(self):
+        lines = [f"line-{i}-xxxxxxxx" for i in range(20)]
+        text = "\n".join(lines)
+        result = CommandManager.split_text_into_utf8_chunks(text, 80)
+        assert all(len(c.encode("utf-8")) <= 80 for c in result)
+        # Most chunks should be whole lines (no mid-line hard splits for this input)
+        for chunk in result:
+            for line in chunk.split("\n"):
+                if line:
+                    assert line.startswith("line-")
+
+
+class TestSendDMLengthGuard:
+    """Oversized DM payloads are auto-split before the radio send."""
+
+    @pytest.mark.asyncio
+    async def test_oversized_dm_is_auto_split(self, cm_bot):
+        from meshcore import EventType
+
+        cm_bot.connected = True
+        cm_bot.meshcore = Mock()
+        contact = {"name": "Alice", "public_key": "ab12deadbeef"}
+        cm_bot.meshcore.get_contact_by_name = Mock(return_value=contact)
+        cm_bot.meshcore.commands = Mock(spec=["send_msg"])
+        cm_bot.meshcore.commands.send_msg = AsyncMock(
+            return_value=Mock(type=EventType.MSG_SENT, payload=None)
+        )
+        cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
+        cm_bot.config.set("Bot", "bot_tx_rate_limit_seconds", "0")
+        manager = make_manager(cm_bot)
+
+        oversized = "x" * 200
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("modules.command_manager.asyncio.sleep", AsyncMock())
+            result = await manager.send_dm("Alice", oversized)
+
+        assert result is True
+        assert cm_bot.meshcore.commands.send_msg.await_count >= 2
+        for call in cm_bot.meshcore.commands.send_msg.await_args_list:
+            payload = call.args[1]
+            assert len(payload.encode("utf-8")) <= 158
+
+    @pytest.mark.asyncio
+    async def test_under_budget_dm_sends_once(self, cm_bot):
+        from meshcore import EventType
+
+        cm_bot.connected = True
+        cm_bot.meshcore = Mock()
+        contact = {"name": "Alice", "public_key": "ab12deadbeef"}
+        cm_bot.meshcore.get_contact_by_name = Mock(return_value=contact)
+        cm_bot.meshcore.commands = Mock(spec=["send_msg"])
+        cm_bot.meshcore.commands.send_msg = AsyncMock(
+            return_value=Mock(type=EventType.MSG_SENT, payload=None)
+        )
+        cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
+        manager = make_manager(cm_bot)
+
+        result = await manager.send_dm("Alice", "short ok")
+
+        assert result is True
+        cm_bot.meshcore.commands.send_msg.assert_awaited_once()
+
+
 class TestGetMaxMessageLength:
     """Tests for CommandManager.get_max_message_length."""
 
@@ -969,6 +1151,12 @@ class TestGetMaxMessageLength:
         mgr = self._make_manager(bot_name="LongBotName")
         mgr.bot.config.set("Channels", "outgoing_flood_scope_override", "#west")
         msg = MeshMessage(content="x", channel="general", is_dm=False)
+        assert mgr.get_max_message_length(msg) == 137
+
+    def test_channel_flood_scope_reduces_budget_by_10_bytes(self):
+        mgr = self._make_manager(bot_name="LongBotName")
+        mgr.bot.config.set("Channels", "flood_scope.weather", "#sea")
+        msg = MeshMessage(content="x", channel="#Weather", is_dm=False)
         assert mgr.get_max_message_length(msg) == 137
 
     def test_parity_with_base_command_get_max_message_length(self):

@@ -29,6 +29,72 @@ class EarthquakeService(BaseServicePlugin):
     config_section = "Earthquake_Service"
     description = "Earthquake alerts for a configured region (USGS API)"
 
+    # Web-viewer settings schema (see modules/settings_schema.py)
+    settings_schema = [
+        {
+            "key": "channel",
+            "label": "Channel",
+            "type": "str",
+            "default": "general",
+            "help": "Channel name to post alerts to (e.g. #alerts).",
+            "required": True,
+        },
+        {
+            "key": "poll_interval",
+            "label": "Poll interval",
+            "type": "int",
+            "min": 1000,
+            "default": 60000,
+            "unit": "ms",
+            "help": "How often to poll USGS, in milliseconds.",
+        },
+        {
+            "key": "time_window_minutes",
+            "label": "Time window",
+            "type": "int",
+            "min": 1,
+            "default": 10,
+            "unit": "min",
+            "help": "Look-back window for new events, in minutes.",
+        },
+        {
+            "key": "min_magnitude",
+            "label": "Minimum magnitude",
+            "type": "float",
+            "min": 0,
+            "max": 10,
+            "default": 3.0,
+            "help": "Only alert on quakes at or above this magnitude.",
+        },
+        {
+            "key": "minlatitude", "label": "Min latitude", "type": "float",
+            "min": -90, "max": 90, "default": DEFAULT_MIN_LAT,
+            "help": "Southern bound of the monitored region.",
+        },
+        {
+            "key": "maxlatitude", "label": "Max latitude", "type": "float",
+            "min": -90, "max": 90, "default": DEFAULT_MAX_LAT,
+            "help": "Northern bound of the monitored region.",
+        },
+        {
+            "key": "minlongitude", "label": "Min longitude", "type": "float",
+            "min": -180, "max": 180, "default": DEFAULT_MIN_LON,
+            "help": "Western bound of the monitored region.",
+        },
+        {
+            "key": "maxlongitude", "label": "Max longitude", "type": "float",
+            "min": -180, "max": 180, "default": DEFAULT_MAX_LON,
+            "help": "Eastern bound of the monitored region.",
+        },
+        {
+            "key": "send_link",
+            "label": "Include USGS link",
+            "type": "bool",
+            "default": True,
+            "help": "Append a link to the USGS event page in alerts.",
+        },
+    ]
+
     def __init__(self, bot: Any) -> None:
         super().__init__(bot)
 
@@ -167,12 +233,12 @@ class EarthquakeService(BaseServicePlugin):
                 text = self._format_quake(quake)
                 if text:
                     await self.bot.command_manager.send_channel_message(
-                        self.channel, text
+                        self.channel, text, scope=self.get_mesh_flood_scope()
                     )
                     url_detail = props.get("url", "")
                     if self.send_link and url_detail:
                         await self.bot.command_manager.send_channel_message(
-                            self.channel, url_detail
+                            self.channel, url_detail, scope=self.get_mesh_flood_scope()
                         )
                     self.logger.info("Earthquake alert sent: %s", event_id)
                 self.seen_event_ids.add(event_id)

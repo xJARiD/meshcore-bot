@@ -43,11 +43,11 @@ test-no-cov:
 # ---------------------------------------------------------------------------
 
 lint:
-	$(UV) run ruff check modules/ tests/
+	$(UV) run ruff check .
 	$(UV) run mypy modules/
 
 fix:
-	$(UV) run ruff check --fix modules/ tests/
+	$(UV) run ruff check --fix .
 
 # ---------------------------------------------------------------------------
 # Packaging

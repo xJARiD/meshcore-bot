@@ -30,6 +30,12 @@ class ScheduleCommand(BaseCommand):
     usage = "schedule [list]"
     examples = ["schedule", "schedule list"]
 
+    # Web-viewer settings schema (see modules/settings_schema.py)
+    settings_schema = [
+        {"key": "dm_only", "label": "DM only", "type": "bool", "default": True,
+         "help": "Restrict the schedule command to direct messages only."},
+    ]
+
     def __init__(self, bot: Any) -> None:
         super().__init__(bot)
         self._enabled = self.get_config_value(
@@ -55,7 +61,11 @@ class ScheduleCommand(BaseCommand):
 
     async def execute(self, message: MeshMessage) -> bool:
         response = self._build_response()
-        return await self.send_response(message, response)
+        max_len = self.get_max_message_length(message)
+        if len(response.encode("utf-8")) <= max_len:
+            return await self.send_response(message, response)
+        chunks = self.bot.command_manager.split_text_into_utf8_chunks(response, max_len)
+        return await self.send_response_chunked(message, chunks)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -67,13 +77,20 @@ class ScheduleCommand(BaseCommand):
         # --- Scheduled messages ---
         scheduled = self._get_scheduled_messages()
         if scheduled:
-            lines.append(f"Scheduled ({len(scheduled)}):")
-            for time_str, channel, preview in scheduled:
-                # Format HHMM → HH:MM
-                hhmm = f"{time_str[:2]}:{time_str[2:]}"
-                lines.append(f"  {hhmm} #{channel}: {preview}")
+            lines.append(f"Sched({len(scheduled)}):")
+            for sched_display, channel, preview, scope in scheduled:
+                scope_code = ""
+                if scope:
+                    scope_l = str(scope).lower()
+                    if scope_l in ("local", "l"):
+                        scope_code = "/L"
+                    elif scope_l in ("flood", "f", "global", "*", "0"):
+                        scope_code = "/F"
+                    else:
+                        scope_code = f"/{scope}"
+                lines.append(f"{sched_display} #{channel}{scope_code}: {preview}")
         else:
-            lines.append("No scheduled messages configured.")
+            lines.append("No scheduled messages.")
 
         # --- Interval advertising ---
         advert_info = self._get_advert_info()
@@ -82,22 +99,45 @@ class ScheduleCommand(BaseCommand):
 
         return "\n".join(lines)
 
-    def _get_scheduled_messages(self) -> list[tuple]:
-        """Return sorted list of (time_str, channel, preview) tuples."""
+    def _get_scheduled_messages(self) -> list[tuple[str, str, str, str | None]]:
+        """Return sorted list of (schedule_display, channel, preview, scope) tuples."""
         scheduler = getattr(self.bot, "scheduler", None)
         if scheduler is None:
             return []
 
         scheduled = getattr(scheduler, "scheduled_messages", {})
-        results = []
-        for time_str, payload in sorted(scheduled.items()):
-            channel, message = payload
+        rows: list[tuple[str, str, str, str, str | None]] = []
+        for schedule_key, payload in scheduled.items():
+            if len(payload) >= 4:
+                channel, message, display_label, scope = (
+                    payload[0],
+                    payload[1],
+                    payload[2],
+                    payload[3],
+                )
+            elif len(payload) == 3:
+                channel, message, display_label = payload
+                scope = None
+            else:
+                channel, message = payload[0], payload[1]
+                scope = None
+                sk = schedule_key
+                display_label = (
+                    f"{sk[:2]}:{sk[2:]}"
+                    if len(sk) == 4 and sk.isdigit()
+                    else sk
+                )
             # Truncate long messages so response stays compact
             # Strip control characters that could corrupt the response
-            safe_message = ''.join(c if c.isprintable() or c == ' ' else '?' for c in message)
-            preview = safe_message if len(safe_message) <= 40 else safe_message[:37] + "..."
-            results.append((time_str, channel, preview))
-        return results
+            safe_message = "".join(
+                c if c.isprintable() or c == " " else "?" for c in message
+            )
+            preview = (
+                safe_message if len(safe_message) <= 18 else safe_message[:15] + "..."
+            )
+            rows.append((display_label, schedule_key, channel, preview, scope))
+        rows.sort(key=lambda r: (r[0].lower(), r[1]))
+        return [(r[0], r[2], r[3], r[4]) for r in rows]
 
     def _get_advert_info(self) -> Optional[str]:
         """Return a one-line advert interval summary, or None if disabled."""
@@ -106,7 +146,7 @@ class ScheduleCommand(BaseCommand):
                 "Bot", "advert_interval_hours", fallback=0
             )
             if interval_hours > 0:
-                return f"Advert interval: every {interval_hours}h"
+                return f"advert={interval_hours}h"
         except Exception:
             pass
         return None

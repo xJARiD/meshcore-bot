@@ -31,6 +31,23 @@ class ChannelManager:
         self._channels_cache: dict[int, dict[str, Any]] = {}
         self._cache_valid = False
         self._fetch_timeout = 2.0  # Timeout for individual channel fetches
+        # Delay between per-channel reads during the connect-time scan, keeping
+        # the init burst gentle on the firmware. Commands are already serialized
+        # globally; this adds extra spacing for the 40-slot scan specifically.
+        try:
+            self._fetch_interval = max(
+                0.0,
+                bot.config.getfloat(
+                    'Connection', 'channel_fetch_interval_ms', fallback=300.0
+                ) / 1000.0,
+            )
+        except Exception:
+            self._fetch_interval = 0.3
+
+    @staticmethod
+    def _normalize_channel_name_for_lookup(name: str) -> str:
+        """Lowercase channel name without a leading # for cache lookups."""
+        return name.removeprefix("#").lower()
 
     async def fetch_channels(self):
         """Fetch channels from the MeshCore node using enhanced concurrent fetching"""
@@ -108,7 +125,8 @@ class ChannelManager:
                         break
 
                 # Conservative delay to avoid overwhelming the device
-                await asyncio.sleep(0.3)
+                if self._fetch_interval > 0:
+                    await asyncio.sleep(self._fetch_interval)
 
             except Exception as e:
                 consecutive_empty += 1
@@ -308,8 +326,10 @@ class ChannelManager:
         Returns:
             Channel number if found, None if not found (to distinguish from channel 0)
         """
+        name_key = self._normalize_channel_name_for_lookup(channel_name)
         for num, channel_info in self._channels_cache.items():
-            if channel_info.get('channel_name', '').lower() == channel_name.lower():
+            cached_name = channel_info.get("channel_name", "")
+            if self._normalize_channel_name_for_lookup(cached_name) == name_key:
                 return num
 
         self.logger.warning(f"Channel name '{channel_name}' not found in cached channels")
@@ -347,9 +367,10 @@ class ChannelManager:
             self.logger.warning("Cache not valid, call fetch_all_channels() first")
             return None
 
-        name_lower = name.lower()
+        name_key = self._normalize_channel_name_for_lookup(name)
         for channel in self._channels_cache.values():
-            if channel.get("channel_name", "").lower() == name_lower:
+            cached_name = channel.get("channel_name", "")
+            if self._normalize_channel_name_for_lookup(cached_name) == name_key:
                 return channel
 
         return None

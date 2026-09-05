@@ -9,14 +9,15 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import threading
 import time
 from contextlib import closing, contextmanager, suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 # When started as a script (`python modules/web_viewer/app.py`), Python puts the
@@ -29,7 +30,9 @@ if _project_root not in sys.path:
 from flask import (
     Flask,
     Response,
+    abort,
     current_app,
+    g,
     jsonify,
     make_response,
     redirect,
@@ -41,12 +44,80 @@ from flask import (
 )
 from flask_socketio import SocketIO, disconnect, emit
 
+from modules.database_restore import (
+    DEFAULT_MAX_RESTORE_BYTES,
+    DatabaseRestoreError,
+    stage_database_restore,
+)
+from modules.db_retention import (
+    delete_timestamp_rows_in_chunks,
+    retention_delete_settings,
+)
+from modules.ini_writer import IniValueError, update_ini_values
 from modules.security_utils import (
-    VALID_JOURNAL_MODES,
+    SafeUrlPolicy,
+    create_safe_requests_session,
+    safe_requests_request,
     validate_external_url,
     validate_sql_identifier,
 )
-from modules.version_info import resolve_runtime_version
+from modules.settings_schema import (
+    build_plugin_settings_view,
+    to_config_string,
+    validate_field,
+)
+from modules.settings_store import get_settings_store
+from modules.version_info import resolve_application_version
+from modules.web_viewer.dashboard_stats import (
+    SERIES_METRICS,
+    TOP_KINDS,
+    DashboardStatsService,
+    humanize_span,
+)
+
+# RFC 8594 Sunset date advertised on the deprecated /api/stats endpoint.
+STATS_ENDPOINT_SUNSET = "Fri, 01 Jan 2027 00:00:00 GMT"
+
+
+class NeighborEvidenceKeys(NamedTuple):
+    """Directed edge identities that zero-hop neighbor discovery has confirmed.
+
+    A ``mesh_connections`` edge counts as neighbor-confirmed if it matches on
+    either key space; see BotDataViewer._neighbor_evidence_edge_keys.
+    """
+
+    prefixes: set[tuple[str, str]]
+    public_keys: set[tuple[str, str]]
+
+
+def _validate_dynamic_key(key: str) -> "str | None":
+    """Validate a dynamic-section row key. Returns an error message or None.
+
+    Keys become INI option names, so they must not contain the separators or
+    comment markers that would corrupt the file on the next read.
+    """
+    if any(ch in key for ch in ('=', ':', '\n', '\r', '[', ']')):
+        return f'Invalid key "{key}": cannot contain = : [ ] or newlines'
+    if key[:1] in ('#', ';'):
+        return f'Invalid key "{key}": cannot start with # or ;'
+    return None
+
+
+def _validate_feed_interval(raw: object) -> int:
+    """Coerce a feed poll interval, rejecting values that break the poller.
+
+    feed_manager compares ``current_time - last_check >= interval``: anything
+    <= 0 leaves every feed permanently due and hammers the source URL, and a
+    None (JSON ``null``) raises a TypeError that aborts the whole poll cycle for
+    every feed, not just this one.
+    """
+    try:
+        interval = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("check_interval_seconds must be a positive integer")
+    if interval <= 0:
+        raise ValueError("check_interval_seconds must be a positive integer")
+    return interval
 
 
 def _apply_werkzeug_websocket_fix() -> None:
@@ -91,12 +162,50 @@ def _strip_ansi_codes(text: str) -> str:
 
 
 from modules.config_snapshot import config_to_redacted_sections
-from modules.feed_manager import FeedManager
-from modules.repeater_manager import RepeaterManager
-from modules.url_shortener import _coerce_url_string
-from modules.utils import calculate_distance, resolve_path
+from modules.feed_filter_eval import get_nested_value, item_passes_filter_config, parse_microsoft_date
+from modules.feed_format import format_feed_message, sort_feed_items
+from modules.feed_manager import (
+    DEFAULT_MAX_FEED_RESPONSE_BYTES,
+    DEFAULT_MAX_PARSED_FEED_ITEMS,
+    _useful_feed_content_type,
+)
+from modules.repeater_manager import RepeaterManager, validate_repeater_tables
+from modules.utils import resolve_path
 from modules.web_viewer.config_panels import CONFIG_PANELS, PANEL_CATEGORIES
 from modules.web_viewer.integration import normalized_web_viewer_password
+
+
+def _read_limited_requests_response(
+    response: Any,
+    *,
+    max_bytes: int,
+    feed_type: str,
+) -> bytes:
+    """Read a streamed, decompressed requests response under a hard byte cap."""
+    response.raise_for_status()
+    content_type = response.headers.get('Content-Type', '')
+    if not _useful_feed_content_type(content_type, feed_type):
+        raise ValueError(f"Unexpected {feed_type.upper()} content type: {content_type}")
+
+    declared_length = response.headers.get('Content-Length')
+    if declared_length:
+        try:
+            content_length = int(declared_length)
+        except ValueError:
+            content_length = None
+        if content_length is not None and content_length > max_bytes:
+            raise ValueError(f"Feed response exceeds {max_bytes} byte limit")
+
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=64 * 1024, decode_unicode=False):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(f"Feed response exceeds {max_bytes} byte limit")
+        chunks.append(chunk)
+    return b''.join(chunks)
 
 
 class BotDataViewer:
@@ -127,18 +236,31 @@ class BotDataViewer:
         'path_stats',
         'schema_version',
         'greeter_rollout',
+        'daily_rollup',
+        'dashboard_snapshot',
     }
 
     def __init__(self, db_path="meshcore_bot.db", repeater_db_path=None, config_path="config.ini"):
-        # Setup comprehensive logging
-        self._setup_logging()
-
         # Set bot root directory (project root) for path validation
         # This is the directory containing the modules folder
         self.bot_root = Path(os.path.join(os.path.dirname(__file__), '..', '..')).resolve()
         # Resolve relative config path so viewer finds config when started as subprocess (cwd may differ)
         if not os.path.isabs(config_path):
             config_path = str(self.bot_root / config_path)
+
+        # Load configuration before logging so [Logging] log_file can select
+        # journal/console-only vs file logging (same rules as the main bot).
+        self.config = self._load_config(config_path)
+        self.config_path = config_path  # kept for config.ini write-back endpoints
+
+        # Resolve db_path relative to the config file's directory — matches core.py's bot_root
+        # property which is Path(config_file).parent.resolve().  Using self.bot_root (the project
+        # code root, 2 dirs above app.py) as the base caused a mismatch when config.ini lived
+        # elsewhere (e.g. a separate deployment directory), resulting in a blank realtime monitor
+        # because the web viewer and bot opened different database files.
+        self._config_base = Path(config_path).parent.resolve() if os.path.exists(config_path) else self.bot_root
+
+        self._setup_logging()
 
         self.app = Flask(
             __name__,
@@ -151,6 +273,16 @@ class BotDataViewer:
         self.app.config['SESSION_COOKIE_HTTPONLY'] = True
         self.app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
         self.app.config['PERMANENT_SESSION_LIFETIME'] = 86400  # 24 hours
+
+        # Compress responses when the client supports it — /api/mesh/edges alone
+        # is ~16 MB of JSON uncompressed (~4 MB gzipped) on a large mesh
+        try:
+            from flask_compress import Compress
+            Compress(self.app)
+        except ImportError:
+            self.logger.warning(
+                "flask-compress not installed; web viewer responses will be sent uncompressed"
+            )
 
         # Flask-SocketIO configuration following 5.x best practices
         # CORS origins are configured after config is loaded; create without app for now
@@ -176,17 +308,38 @@ class BotDataViewer:
         self._db_lock = threading.Lock()
         self._db_last_used = 0
         self._db_timeout = 300  # 5 minutes connection timeout
+        # SQLite pragma handling (including the once-per-section WAL setup)
+        # lives in DBManager; see _configure_db_connection.
 
-        # Load configuration
-        self.config = self._load_config(config_path)
-        self.config_path = config_path  # kept for config.ini write-back endpoints
+        # The contacts list needs all-time multibyte hop-prefix evidence for its
+        # capability badge.  Cache that derived set between requests and invalidate
+        # it when the underlying multibyte-path population changes.
+        # Keyed by the recent_days window (None = all time) so the contacts list
+        # and the dashboard's 7-day view do not evict each other.
+        self._contacts_badge_cache_lock = threading.Lock()
+        self._contacts_badge_cache: dict[int | None, tuple[tuple, set[str]]] = {}
 
-        # Resolve db_path relative to the config file's directory — matches core.py's bot_root
-        # property which is Path(config_file).parent.resolve().  Using self.bot_root (the project
-        # code root, 2 dirs above app.py) as the base caused a mismatch when config.ini lived
-        # elsewhere (e.g. a separate deployment directory), resulting in a blank realtime monitor
-        # because the web viewer and bot opened different database files.
-        self._config_base = Path(config_path).parent.resolve() if os.path.exists(config_path) else self.bot_root
+        # The multi-byte mesh endpoint derives lifetime edge identity from every
+        # retained multi-byte observed path.  Cache that expensive aggregate and
+        # ensure concurrent requests share one computation.  View-specific day
+        # and observation filters remain cheap and are applied to the cached
+        # lifetime result.
+        try:
+            mesh_cache_seconds = self.config.getint(
+                'Web_Viewer',
+                'mesh_graph_cache_seconds',
+                fallback=30,
+            )
+        except (configparser.Error, ValueError, TypeError):
+            mesh_cache_seconds = 30
+        self._mesh_graph_cache_seconds = max(5, min(mesh_cache_seconds, 300))
+        self._multibyte_graph_cache_condition = threading.Condition()
+        self._multibyte_graph_cache_edges: list[dict[str, Any]] | None = None
+        self._multibyte_graph_cache_created_at = 0.0
+        self._multibyte_graph_cache_computing = False
+        self._multibyte_graph_cache_failure_at = 0.0
+        self._multibyte_graph_cache_failure: tuple[str, str] | None = None
+        self._multibyte_graph_cache_retry_seconds = 5.0
 
         # Use [Bot] db_path when [Web_Viewer] db_path is unset
         bot_db = self.config.get('Bot', 'db_path', fallback='meshcore_bot.db')
@@ -207,6 +360,16 @@ class BotDataViewer:
                 "Web viewer has NO authentication. Set web_viewer_password in [Web_Viewer] config "
                 "or restrict access with host = 127.0.0.1 and firewall rules."
             )
+
+        # Optional feature page toggle (off by default)
+        try:
+            self.multibyte_monitor_enabled = self.config.getboolean(
+                'Web_Viewer', 'multibyte_monitor_enabled', fallback=False
+            )
+        except (configparser.NoSectionError, configparser.NoOptionError, ValueError, TypeError):
+            self.multibyte_monitor_enabled = False
+
+        self._init_dashboard_service()
 
         # Configure CORS for SocketIO — default to same-origin (no cross-origin)
         cors_raw = self.config.get('Web_Viewer', 'cors_allowed_origins', fallback='').strip()
@@ -238,45 +401,96 @@ class BotDataViewer:
         # Start periodic cleanup
         self._start_cleanup_scheduler()
 
+        # Start the dashboard snapshot refresher (moves the landing page's
+        # aggregate queries off the request path)
+        self._start_dashboard_refresher()
+
         self.logger.info("BotDataViewer initialized with Flask-SocketIO 5.x best practices")
 
     def _setup_logging(self):
-        """Setup comprehensive logging with rotation"""
+        """Setup logging; file handler only when [Logging] log_file is set.
+
+        Empty log_file (or missing [Logging] section) means console/journal only,
+        matching the main bot. When a log file is configured, viewer logs go next
+        to it as web_viewer.log (e.g. /var/log/meshcore-bot/web_viewer.log).
+        """
         from logging.handlers import RotatingFileHandler
 
-        # Create logs directory if it doesn't exist
-        os.makedirs('logs', exist_ok=True)
+        log_file = ''
+        log_max_bytes = 5 * 1024 * 1024
+        log_backup_count = 3
+        if getattr(self, 'config', None) is not None and self.config.has_section('Logging'):
+            log_file = self.config.get('Logging', 'log_file', fallback='').strip()
+            try:
+                log_max_bytes = self.config.getint('Logging', 'log_max_bytes', fallback=log_max_bytes)
+            except (configparser.Error, ValueError, TypeError):
+                pass
+            try:
+                log_backup_count = self.config.getint('Logging', 'log_backup_count', fallback=log_backup_count)
+            except (configparser.Error, ValueError, TypeError):
+                pass
+
+        log_level_name = 'INFO'
+        if getattr(self, 'config', None) is not None and self.config.has_section('Logging'):
+            log_level_name = self.config.get(
+                'Logging',
+                'log_level',
+                fallback='INFO',
+            ).strip().upper()
+        log_level = getattr(logging, log_level_name, logging.INFO)
+        if not isinstance(log_level, int):
+            log_level = logging.INFO
 
         # Get or create logger (don't use basicConfig as it may conflict with existing logging)
         self.logger = logging.getLogger('modern_web_viewer')
-        self.logger.setLevel(logging.DEBUG)
+        self.logger.setLevel(log_level)
 
         # Remove existing handlers to avoid duplicates
         self.logger.handlers.clear()
 
-        # Create rotating file handler (max 5MB per file, keep 3 backups)
-        file_handler = RotatingFileHandler(
-            'logs/web_viewer_modern.log',
-            maxBytes=5 * 1024 * 1024,  # 5 MB
-            backupCount=3,
-            encoding='utf-8'
-        )
-        file_handler.setLevel(logging.DEBUG)
-        file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(file_formatter)
-        self.logger.addHandler(file_handler)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-        # Create console handler
+        # Console handler (captured by journald under systemd)
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        console_handler.setFormatter(console_formatter)
+        # Keep DEBUG out of journald even when explicitly enabled for the
+        # rotating diagnostic file, avoiding duplicate high-volume SD writes.
+        console_handler.setLevel(max(log_level, logging.INFO))
+        console_handler.setFormatter(formatter)
         self.logger.addHandler(console_handler)
 
         # Prevent propagation to root logger to avoid duplicate messages
         self.logger.propagate = False
 
-        self.logger.info("Web viewer logging initialized with rotation (5MB max, 3 backups)")
+        if not log_file:
+            self.logger.info("No log file specified, using console/journal logging only")
+            return
+
+        # Place viewer log beside the bot log (same directory as log_file)
+        bot_log_path = Path(resolve_path(log_file, self._config_base))
+        viewer_log_path = bot_log_path.parent / 'web_viewer.log'
+        try:
+            viewer_log_path.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = RotatingFileHandler(
+                str(viewer_log_path),
+                maxBytes=log_max_bytes,
+                backupCount=log_backup_count,
+                encoding='utf-8',
+            )
+            file_handler.setLevel(log_level)
+            file_handler.setFormatter(formatter)
+            self.logger.addHandler(file_handler)
+            self.logger.info(
+                "Web viewer logging initialized (file=%s, max=%s bytes, backups=%s)",
+                viewer_log_path,
+                log_max_bytes,
+                log_backup_count,
+            )
+        except (OSError, PermissionError) as e:
+            self.logger.warning(
+                "Could not open web viewer log file %s: %s. Using console/journal only.",
+                viewer_log_path,
+                e,
+            )
 
     def _load_config(self, config_path):
         """Load configuration from file"""
@@ -287,8 +501,14 @@ class BotDataViewer:
 
     def _get_version_info(self) -> dict[str, str | None]:
         """Get version info for footer via centralized version resolver. Never raises."""
-        info = resolve_runtime_version(self.bot_root)
+        info = resolve_application_version()
+        display = info.get("display")
         return {
+            # 'display' is what the footer renders — same value !version reports,
+            # so the two can't drift apart on dev or detached-tag checkouts. The
+            # "unknown" sentinel is dropped so the footer omits the version
+            # rather than advertising that we couldn't work it out.
+            "display": None if display == "unknown" else display,
             "tag": info.get("tag"),
             "branch": info.get("branch"),
             "commit": info.get("commit"),
@@ -330,6 +550,7 @@ class BotDataViewer:
                 return {
                     'greeter_enabled': greeter_enabled,
                     'feed_manager_enabled': feed_manager_enabled,
+                    'multibyte_monitor_enabled': self.multibyte_monitor_enabled,
                     'bot_name': bot_name,
                     'version_info': version_info,
                     'radio_zombie': radio_zombie,
@@ -343,6 +564,7 @@ class BotDataViewer:
                 return {
                     'greeter_enabled': False,
                     'feed_manager_enabled': False,
+                    'multibyte_monitor_enabled': False,
                     'bot_name': 'MeshCore Bot',
                     'bot_initializing': False,
                     'version_info': version_info,
@@ -371,13 +593,24 @@ class BotDataViewer:
             # Now set db_manager on the minimal bot for RepeaterManager
             minimal_bot.db_manager = self.db_manager
 
-            # Initialize repeater manager for geocoding functionality
-            self.repeater_manager = RepeaterManager(minimal_bot)
+            # The viewer only needs RepeaterManager for the manual geocode
+            # endpoint, so defer its setup until that endpoint is actually used.
+            self._repeater_manager_bot = minimal_bot
+            self._repeater_manager_lock = threading.Lock()
+            self.repeater_manager: RepeaterManager | None = None
 
-            # Initialize mesh graph for path resolution (uses same logic as path command)
-            from modules.mesh_graph import MeshGraph
-            minimal_bot.mesh_graph = MeshGraph(minimal_bot)
-            self.mesh_graph = minimal_bot.mesh_graph
+            # RepeaterManager's constructor is what used to validate these at
+            # startup. It is lazy now, so validate here: a missing migration is
+            # a startup failure, not a mystery 500 from the geocode endpoint.
+            validate_repeater_tables(self.db_manager, self.logger)
+
+            # MeshGraph is only read by the two path-decoding routes, so build it
+            # on first use rather than at startup. It is NOT optional for them:
+            # without it decode_path_nodes() falls back to geographic-only
+            # selection and disagrees with the bot's `path` command.
+            self._mesh_graph_bot = minimal_bot
+            self._mesh_graph_lock = threading.Lock()
+            self.mesh_graph = None
 
             # Store database paths for direct connection
             self.db_path = self.db_path
@@ -387,23 +620,56 @@ class BotDataViewer:
             self.logger.error(f"Failed to initialize databases: {e}")
             raise
 
+    def _get_repeater_manager(self) -> RepeaterManager:
+        """Lazily construct the manual-geocoding helper once."""
+        if self.repeater_manager is not None:
+            return self.repeater_manager
+        with self._repeater_manager_lock:
+            if self.repeater_manager is None:
+                self.repeater_manager = RepeaterManager(self._repeater_manager_bot)
+            return self.repeater_manager
+
+    def _get_mesh_graph(self):
+        """Lazily load the read-only mesh graph used to disambiguate path prefixes.
+
+        Returns None only if the graph cannot be loaded, in which case path
+        decoding degrades to geographic-only selection rather than failing the
+        request. Loaded with capture disabled: the bot process owns edge
+        capture, so the viewer must not write edges or run a batch writer.
+        """
+        if self.mesh_graph is not None:
+            return self.mesh_graph
+        with self._mesh_graph_lock:
+            if self.mesh_graph is None:
+                from modules.mesh_graph import MeshGraph
+                try:
+                    graph = MeshGraph(self._mesh_graph_bot, capture=False)
+                except Exception as e:
+                    self.logger.error(
+                        f"Mesh graph unavailable; path decoding will fall back to "
+                        f"geographic selection only: {e}"
+                    )
+                    return None
+                self._mesh_graph_bot.mesh_graph = graph
+                self.mesh_graph = graph
+            return self.mesh_graph
+
+    def _configure_db_connection(self, conn: sqlite3.Connection) -> None:
+        """Apply SQLite pragmas to a viewer connection.
+
+        Delegates to DBManager, which owns the single implementation and the
+        once-per-section WAL bookkeeping. Safe because this DBManager was built
+        for self.db_path, which is the file every viewer connection opens — the
+        journal-mode state it tracks belongs to that same database.
+        """
+        self.db_manager._apply_sqlite_pragmas(conn, for_web_viewer=True)
+
     def _get_db_connection(self):
         """Get database connection - create new connection for each request to avoid threading issues"""
         try:
             conn = sqlite3.connect(self.db_path, timeout=60)
             conn.row_factory = sqlite3.Row
-            try:
-                foreign_keys = self.config.getboolean("Web_Viewer", "sqlite_foreign_keys", fallback=True)
-                busy_timeout_ms = self.config.getint("Web_Viewer", "sqlite_busy_timeout_ms", fallback=60000)
-                journal_mode = self.config.get("Web_Viewer", "sqlite_journal_mode", fallback="WAL").strip() or "WAL"
-                if journal_mode.upper() not in VALID_JOURNAL_MODES:
-                    self.logger.warning(f"Invalid journal_mode {journal_mode!r}, falling back to WAL")
-                    journal_mode = "WAL"
-                conn.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys else 'OFF'}")
-                conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
-                conn.execute(f"PRAGMA journal_mode={journal_mode}")
-            except sqlite3.OperationalError:
-                pass
+            self._configure_db_connection(conn)
             return conn
         except Exception as e:
             self.logger.error(f"Failed to create database connection: {e}")
@@ -416,793 +682,468 @@ class BotDataViewer:
         """
         conn = sqlite3.connect(self.db_path, timeout=60)
         conn.row_factory = sqlite3.Row
-        try:
-            foreign_keys = self.config.getboolean("Web_Viewer", "sqlite_foreign_keys", fallback=True)
-            busy_timeout_ms = self.config.getint("Web_Viewer", "sqlite_busy_timeout_ms", fallback=60000)
-            journal_mode = self.config.get("Web_Viewer", "sqlite_journal_mode", fallback="WAL").strip() or "WAL"
-            if journal_mode.upper() not in VALID_JOURNAL_MODES:
-                self.logger.warning(f"Invalid journal_mode {journal_mode!r}, falling back to WAL")
-                journal_mode = "WAL"
-            conn.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys else 'OFF'}")
-            conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
-            conn.execute(f"PRAGMA journal_mode={journal_mode}")
-        except sqlite3.OperationalError:
-            pass
+        self._configure_db_connection(conn)
         try:
             yield conn
         finally:
             conn.close()
 
-    def _resolve_path(self, path_input: str) -> dict[str, Any]:
-        """Resolve a hex path to repeater names and locations using the same algorithm as PathCommand.
-
-        This method replicates the path command's logic to ensure consistency between
-        the bot's path command and the web viewer's path resolution.
-
-        Args:
-            path_input: Hex path string (e.g., "7e,01,86" or "7e 01 86")
-
-        Returns:
-            Dictionary with node_ids, repeaters list, and valid flag
-        """
-        import math
-        import re
-        from datetime import datetime
-
-        # Check if db_manager is available
-        if not hasattr(self, 'db_manager') or not self.db_manager:
-            return {
-                'node_ids': [],
-                'repeaters': [],
-                'valid': False,
-                'error': 'Database manager not initialized'
-            }
-
-        # Parse hex input - same logic as PathCommand._decode_path
-        # Handle both comma/space-separated and continuous hex strings (e.g., "8601a5")
-        prefix_hex_chars = self.config.getint('Bot', 'prefix_bytes', fallback=1) * 2
-        if prefix_hex_chars <= 0:
-            prefix_hex_chars = 2
-        # First, try to parse as continuous hex string
-        path_input_clean = path_input.replace(',', '').replace(':', '').replace(' ', '')
-        if re.match(r'^[0-9a-fA-F]{4,}$', path_input_clean):
-            # Continuous hex string - split using configured prefix length
-            hex_matches = [path_input_clean[i:i+prefix_hex_chars] for i in range(0, len(path_input_clean), prefix_hex_chars)]
-            if (len(path_input_clean) % prefix_hex_chars) != 0 and prefix_hex_chars > 2:
-                hex_matches = [path_input_clean[i:i+2] for i in range(0, len(path_input_clean), 2)]
-        else:
-            # Space/comma-separated format
-            path_input = path_input.replace(',', ' ').replace(':', ' ')
-            hex_pattern = rf'[0-9a-fA-F]{{{prefix_hex_chars}}}'
-            hex_matches = re.findall(hex_pattern, path_input)
-            if not hex_matches and prefix_hex_chars > 2:
-                hex_pattern = r'[0-9a-fA-F]{2}'
-                hex_matches = re.findall(hex_pattern, path_input)
-
-        if not hex_matches:
-            return {
-                'node_ids': [],
-                'repeaters': [],
-                'valid': False,
-                'error': 'No valid hex values found'
-            }
-
-        node_ids = [match.upper() for match in hex_matches]
-
-        # Load all Path_Command config values (same as PathCommand.__init__)
-        # Geographic guessing
-        geographic_guessing_enabled = False
-        bot_latitude = None
-        bot_longitude = None
-
-        try:
-            if self.config.has_section('Bot'):
-                lat = self.config.getfloat('Bot', 'bot_latitude', fallback=None)
-                lon = self.config.getfloat('Bot', 'bot_longitude', fallback=None)
-                if lat is not None and lon is not None and -90 <= lat <= 90 and -180 <= lon <= 180:
-                    bot_latitude = lat
-                    bot_longitude = lon
-                    geographic_guessing_enabled = True
-        except (ValueError, configparser.Error):  # malformed float or missing section
-            pass
-
-        # Path command settings
-        proximity_method = self.config.get('Path_Command', 'proximity_method', fallback='simple')
-        self.config.getboolean('Path_Command', 'path_proximity_fallback', fallback=True)
-        max_proximity_range = self.config.getfloat('Path_Command', 'max_proximity_range', fallback=200.0)
-        max_repeater_age_days = self.config.getint('Path_Command', 'max_repeater_age_days', fallback=14)
-
-        recency_weight = self.config.getfloat('Path_Command', 'recency_weight', fallback=0.4)
-        recency_weight = max(0.0, min(1.0, recency_weight))
-        proximity_weight = 1.0 - recency_weight
-
-        recency_decay_half_life_hours = self.config.getfloat('Path_Command', 'recency_decay_half_life_hours', fallback=12.0)
-
-        # Check for preset first, then apply individual settings (preset can be overridden)
-        preset = self.config.get('Path_Command', 'path_selection_preset', fallback='balanced').lower()
-
-        # Apply preset defaults, then individual settings override
-        if preset == 'geographic':
-            preset_graph_confidence_threshold = 0.5
-            preset_distance_threshold = 30.0
-            preset_distance_penalty = 0.5
-            preset_final_hop_weight = 0.4
-        elif preset == 'graph':
-            preset_graph_confidence_threshold = 0.9
-            preset_distance_threshold = 50.0
-            preset_distance_penalty = 0.2
-            preset_final_hop_weight = 0.15
-        else:  # 'balanced' (default)
-            preset_graph_confidence_threshold = 0.7
-            preset_distance_threshold = 30.0
-            preset_distance_penalty = 0.3
-            preset_final_hop_weight = 0.25
-
-        graph_based_validation = self.config.getboolean('Path_Command', 'graph_based_validation', fallback=True)
-        min_edge_observations = self.config.getint('Path_Command', 'min_edge_observations', fallback=3)
-
-        graph_use_bidirectional = self.config.getboolean('Path_Command', 'graph_use_bidirectional', fallback=True)
-        graph_use_hop_position = self.config.getboolean('Path_Command', 'graph_use_hop_position', fallback=True)
-        graph_multi_hop_enabled = self.config.getboolean('Path_Command', 'graph_multi_hop_enabled', fallback=True)
-        graph_multi_hop_max_hops = self.config.getint('Path_Command', 'graph_multi_hop_max_hops', fallback=2)
-        graph_geographic_combined = self.config.getboolean('Path_Command', 'graph_geographic_combined', fallback=False)
-        graph_geographic_weight = self.config.getfloat('Path_Command', 'graph_geographic_weight', fallback=0.7)
-        graph_geographic_weight = max(0.0, min(1.0, graph_geographic_weight))
-        graph_confidence_override_threshold = self.config.getfloat('Path_Command', 'graph_confidence_override_threshold', fallback=preset_graph_confidence_threshold)
-        graph_confidence_override_threshold = max(0.0, min(1.0, graph_confidence_override_threshold))
-        graph_distance_penalty_enabled = self.config.getboolean('Path_Command', 'graph_distance_penalty_enabled', fallback=True)
-        graph_max_reasonable_hop_distance_km = self.config.getfloat('Path_Command', 'graph_max_reasonable_hop_distance_km', fallback=preset_distance_threshold)
-        graph_distance_penalty_strength = self.config.getfloat('Path_Command', 'graph_distance_penalty_strength', fallback=preset_distance_penalty)
-        graph_distance_penalty_strength = max(0.0, min(1.0, graph_distance_penalty_strength))
-        graph_zero_hop_bonus = self.config.getfloat('Path_Command', 'graph_zero_hop_bonus', fallback=0.4)
-        graph_zero_hop_bonus = max(0.0, min(1.0, graph_zero_hop_bonus))
-        graph_prefer_stored_keys = self.config.getboolean('Path_Command', 'graph_prefer_stored_keys', fallback=True)
-
-        # Final hop proximity settings for graph selection
-        # Defaults based on LoRa ranges: typical < 30km, long up to 200km, very close < 10km
-        graph_final_hop_proximity_enabled = self.config.getboolean('Path_Command', 'graph_final_hop_proximity_enabled', fallback=True)
-        graph_final_hop_proximity_weight = self.config.getfloat('Path_Command', 'graph_final_hop_proximity_weight', fallback=preset_final_hop_weight)
-        graph_final_hop_proximity_weight = max(0.0, min(1.0, graph_final_hop_proximity_weight))
-        graph_final_hop_max_distance = self.config.getfloat('Path_Command', 'graph_final_hop_max_distance', fallback=0.0)
-        graph_final_hop_proximity_normalization_km = self.config.getfloat('Path_Command', 'graph_final_hop_proximity_normalization_km', fallback=200.0)  # Long LoRa range
-        graph_final_hop_very_close_threshold_km = self.config.getfloat('Path_Command', 'graph_final_hop_very_close_threshold_km', fallback=10.0)
-        graph_final_hop_close_threshold_km = self.config.getfloat('Path_Command', 'graph_final_hop_close_threshold_km', fallback=30.0)  # Typical LoRa range
-        graph_final_hop_max_proximity_weight = self.config.getfloat('Path_Command', 'graph_final_hop_max_proximity_weight', fallback=0.6)
-        graph_final_hop_max_proximity_weight = max(0.0, min(1.0, graph_final_hop_max_proximity_weight))
-        graph_path_validation_max_bonus = self.config.getfloat('Path_Command', 'graph_path_validation_max_bonus', fallback=0.3)
-        graph_path_validation_max_bonus = max(0.0, min(1.0, graph_path_validation_max_bonus))
-        graph_path_validation_obs_divisor = self.config.getfloat('Path_Command', 'graph_path_validation_obs_divisor', fallback=50.0)
-
-        star_bias_multiplier = self.config.getfloat('Path_Command', 'star_bias_multiplier', fallback=2.5)
-        star_bias_multiplier = max(1.0, star_bias_multiplier)
-
-        # Helper method to calculate recency scores (same as PathCommand._calculate_recency_weighted_scores)
-        def calculate_recency_weighted_scores(repeaters):
-            scored_repeaters = []
-            now = datetime.now()
-
-            for repeater in repeaters:
-                most_recent_time = None
-
-                for field in ['last_heard', 'last_advert_timestamp', 'last_seen']:
-                    value = repeater.get(field)
-                    if value:
-                        try:
-                            if isinstance(value, str):
-                                dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
-                            else:
-                                dt = value
-                            if most_recent_time is None or dt > most_recent_time:
-                                most_recent_time = dt
-                        except:
-                            pass
-
-                if most_recent_time is None:
-                    recency_score = 0.1
-                else:
-                    hours_ago = (now - most_recent_time).total_seconds() / 3600.0
-                    recency_score = math.exp(-hours_ago / recency_decay_half_life_hours)
-                    recency_score = max(0.0, min(1.0, recency_score))
-
-                scored_repeaters.append((repeater, recency_score))
-
-            scored_repeaters.sort(key=lambda x: x[1], reverse=True)
-            return scored_repeaters
-
-        # Helper to get node location (same as PathCommand._get_node_location)
-        def get_node_location(node_id):
-            try:
-                if max_repeater_age_days > 0:
-                    query = f'''
-                        SELECT latitude, longitude FROM complete_contact_tracking
-                        WHERE public_key LIKE ? AND latitude IS NOT NULL AND longitude IS NOT NULL
-                        AND latitude != 0 AND longitude != 0 AND role IN ('repeater', 'roomserver')
-                        AND (
-                            (last_advert_timestamp IS NOT NULL AND last_advert_timestamp >= datetime('now', '-{max_repeater_age_days} days'))
-                            OR (last_advert_timestamp IS NULL AND last_heard >= datetime('now', '-{max_repeater_age_days} days'))
-                        )
-                        ORDER BY is_starred DESC, COALESCE(last_advert_timestamp, last_heard) DESC
-                        LIMIT 1
-                    '''
-                else:
-                    query = '''
-                        SELECT latitude, longitude FROM complete_contact_tracking
-                        WHERE public_key LIKE ? AND latitude IS NOT NULL AND longitude IS NOT NULL
-                        AND latitude != 0 AND longitude != 0 AND role IN ('repeater', 'roomserver')
-                        ORDER BY is_starred DESC, COALESCE(last_advert_timestamp, last_heard) DESC
-                        LIMIT 1
-                    '''
-
-                results = self.db_manager.execute_query(query, (f"{node_id}%",))
-                if results:
-                    return (results[0]['latitude'], results[0]['longitude'])
-                return None
-            except Exception:
-                return None
-
-        # Helper for simple proximity selection (same as PathCommand._select_by_simple_proximity)
-        def select_by_simple_proximity(repeaters_with_location):
-            scored_repeaters = calculate_recency_weighted_scores(repeaters_with_location)
-            min_recency_threshold = 0.01
-            scored_repeaters = [(r, score) for r, score in scored_repeaters if score >= min_recency_threshold]
-
-            if not scored_repeaters:
-                return None, 0.0
-
-            if len(scored_repeaters) == 1:
-                repeater, recency_score = scored_repeaters[0]
-                distance = calculate_distance(bot_latitude, bot_longitude, repeater['latitude'], repeater['longitude'])
-                if max_proximity_range > 0 and distance > max_proximity_range:
-                    return None, 0.0
-                base_confidence = 0.4 + (recency_score * 0.5)
-                return repeater, base_confidence
-
-            combined_scores = []
-            for repeater, recency_score in scored_repeaters:
-                distance = calculate_distance(bot_latitude, bot_longitude, repeater['latitude'], repeater['longitude'])
-                if max_proximity_range > 0 and distance > max_proximity_range:
-                    continue
-
-                normalized_distance = min(distance / 1000.0, 1.0)
-                proximity_score = 1.0 - normalized_distance
-                combined_score = (recency_score * recency_weight) + (proximity_score * proximity_weight)
-
-                if repeater.get('is_starred', False):
-                    combined_score *= star_bias_multiplier
-
-                combined_scores.append((combined_score, distance, repeater))
-
-            if not combined_scores:
-                return None, 0.0
-
-            combined_scores.sort(key=lambda x: x[0], reverse=True)
-            best_score, best_distance, best_repeater = combined_scores[0]
-
-            if len(combined_scores) == 1:
-                confidence = 0.4 + (best_score * 0.5)
-            else:
-                second_best_score = combined_scores[1][0]
-                score_ratio = best_score / second_best_score if second_best_score > 0 else 1.0
-                if score_ratio > 1.5:
-                    confidence = 0.9
-                elif score_ratio > 1.2:
-                    confidence = 0.8
-                elif score_ratio > 1.1:
-                    confidence = 0.7
-                else:
-                    confidence = 0.5
-
-            return best_repeater, confidence
-
-        # Helper for path proximity (simplified - for web viewer we'll use simple proximity)
-        def select_by_path_proximity(repeaters_with_location, node_id, path_context, sender_location):
-            scored_repeaters = calculate_recency_weighted_scores(repeaters_with_location)
-            min_recency_threshold = 0.01
-            recent_repeaters = [r for r, score in scored_repeaters if score >= min_recency_threshold]
-
-            if not recent_repeaters:
-                return None, 0.0
-
-            current_index = path_context.index(node_id) if node_id in path_context else -1
-            if current_index == -1:
-                return None, 0.0
-
-            is_last_repeater = (current_index == len(path_context) - 1)
-            if is_last_repeater and geographic_guessing_enabled and bot_latitude and bot_longitude:
-                bot_location = (bot_latitude, bot_longitude)
-                return select_by_single_proximity(recent_repeaters, bot_location, "bot")
-
-            # For other positions, use simple proximity
-            return select_by_simple_proximity(recent_repeaters)
-
-        # Helper for single proximity (same as PathCommand._select_by_single_proximity)
-        def select_by_single_proximity(repeaters, reference_location, direction):
-            scored_repeaters = calculate_recency_weighted_scores(repeaters)
-            min_recency_threshold = 0.01
-            scored_repeaters = [(r, score) for r, score in scored_repeaters if score >= min_recency_threshold]
-
-            if not scored_repeaters:
-                return None, 0.0
-
-            if direction == "bot" or direction == "sender":
-                proximity_weight_local = 1.0
-                recency_weight_local = 0.0
-            else:
-                proximity_weight_local = proximity_weight
-                recency_weight_local = recency_weight
-
-            best_repeater = None
-            best_combined_score = 0.0
-
-            for repeater, recency_score in scored_repeaters:
-                distance = calculate_distance(reference_location[0], reference_location[1],
-                                            repeater['latitude'], repeater['longitude'])
-
-                if max_proximity_range > 0 and distance > max_proximity_range:
-                    continue
-
-                normalized_distance = min(distance / 1000.0, 1.0)
-                proximity_score = 1.0 - normalized_distance
-                combined_score = (recency_score * recency_weight_local) + (proximity_score * proximity_weight_local)
-
-                if repeater.get('is_starred', False):
-                    combined_score *= star_bias_multiplier
-
-                if combined_score > best_combined_score:
-                    best_combined_score = combined_score
-                    best_repeater = repeater
-
-            if best_repeater:
-                confidence = 0.4 + (best_combined_score * 0.5)
-                return best_repeater, confidence
-
-            return None, 0.0
-
-        # Helper for graph-based selection (same as PathCommand._select_repeater_by_graph)
-        # When path was decoded with 2-byte or 3-byte hops, node_id/path_context have 4 or 6 hex chars;
-        # use path_prefix_hex_chars for candidate matching and normalize to graph_n for edge lookups.
-        def select_repeater_by_graph(repeaters, node_id, path_context):
-            if not graph_based_validation or not hasattr(self, 'mesh_graph') or not self.mesh_graph:
-                return None, 0.0, None
-
-            mesh_graph = self.mesh_graph
-            graph_n = prefix_hex_chars  # graph is keyed by config prefix length
-            path_prefix_hex_chars = len(node_id) if node_id else graph_n
-            prefix_n = path_prefix_hex_chars if path_prefix_hex_chars >= 2 else graph_n
-
-            try:
-                current_index = path_context.index(node_id) if node_id in path_context else -1
-            except Exception:
-                current_index = -1
-
-            if current_index == -1:
-                return None, 0.0, None
-
-            prev_node_id = path_context[current_index - 1] if current_index > 0 else None
-            next_node_id = path_context[current_index + 1] if current_index < len(path_context) - 1 else None
-            prev_norm = (prev_node_id[:graph_n].lower() if prev_node_id and len(prev_node_id) > graph_n else (prev_node_id.lower() if prev_node_id else None))
-            next_norm = (next_node_id[:graph_n].lower() if next_node_id and len(next_node_id) > graph_n else (next_node_id.lower() if next_node_id else None))
-
-            best_repeater = None
-            best_score = 0.0
-            best_method = None
-
-            for repeater in repeaters:
-                candidate_prefix = repeater.get('public_key', '')[:prefix_n].lower() if repeater.get('public_key') else None
-                candidate_public_key = repeater.get('public_key', '').lower() if repeater.get('public_key') else None
-                if not candidate_prefix:
-                    continue
-                candidate_norm = candidate_prefix[:graph_n].lower() if len(candidate_prefix) > graph_n else candidate_prefix
-
-                graph_score = mesh_graph.get_candidate_score(
-                    candidate_norm, prev_norm, next_norm, min_edge_observations,
-                    hop_position=current_index if graph_use_hop_position else None,
-                    use_bidirectional=graph_use_bidirectional,
-                    use_hop_position=graph_use_hop_position
-                )
-
-                stored_key_bonus = 0.0
-                if graph_prefer_stored_keys and candidate_public_key:
-                    if prev_norm:
-                        prev_to_candidate_edge = mesh_graph.get_edge(prev_norm, candidate_norm)
-                        if prev_to_candidate_edge:
-                            stored_to_key = prev_to_candidate_edge.get('to_public_key', '').lower() if prev_to_candidate_edge.get('to_public_key') else None
-                            if stored_to_key and stored_to_key == candidate_public_key:
-                                stored_key_bonus = max(stored_key_bonus, 0.4)
-
-                    if next_norm:
-                        candidate_to_next_edge = mesh_graph.get_edge(candidate_norm, next_norm)
-                        if candidate_to_next_edge:
-                            stored_from_key = candidate_to_next_edge.get('from_public_key', '').lower() if candidate_to_next_edge.get('from_public_key') else None
-                            if stored_from_key and stored_from_key == candidate_public_key:
-                                stored_key_bonus = max(stored_key_bonus, 0.4)
-
-                # Zero-hop bonus: If this repeater has been heard directly by the bot (zero-hop advert),
-                # it's strong evidence it's close and should be preferred, even for intermediate hops
-                zero_hop_bonus = 0.0
-                hop_count = repeater.get('hop_count')
-                if hop_count is not None and hop_count == 0:
-                    # This repeater has been heard directly - strong evidence it's close to bot
-                    zero_hop_bonus = graph_zero_hop_bonus
-
-                graph_score_with_bonus = min(1.0, graph_score + stored_key_bonus + zero_hop_bonus)
-
-                multi_hop_score = 0.0
-                if graph_multi_hop_enabled and graph_score_with_bonus < 0.6 and prev_norm and next_norm:
-                    intermediate_candidates = mesh_graph.find_intermediate_nodes(
-                        prev_norm, next_norm, min_edge_observations,
-                        max_hops=graph_multi_hop_max_hops
+    def _derive_multibyte_evidence_edges(
+        self,
+        days: int | None = None,
+        min_observations: int | None = None,
+        *,
+        force_refresh: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return lifetime-derived multi-byte edges filtered for the API view."""
+        all_edges = self._aggregate_multibyte_evidence_edges(
+            force_refresh=force_refresh
+        )
+        return self._filter_multibyte_evidence_edges(
+            all_edges,
+            days=days,
+            min_observations=min_observations,
+        )
+
+    def _derive_multibyte_evidence_graph(
+        self,
+        days: int | None = None,
+        min_observations: int | None = None,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Return filtered edges plus the lifetime graph's prefix resolution."""
+        all_edges = self._aggregate_multibyte_evidence_edges(
+            force_refresh=force_refresh
+        )
+        prefix_hex_chars = max(
+            (len(edge['from_prefix']) for edge in all_edges),
+            default=2,
+        )
+        return (
+            self._filter_multibyte_evidence_edges(
+                all_edges,
+                days=days,
+                min_observations=min_observations,
+            ),
+            max(2, prefix_hex_chars),
+        )
+
+    @staticmethod
+    def _filter_multibyte_evidence_edges(
+        edges: list[dict[str, Any]],
+        days: int | None,
+        min_observations: int | None,
+    ) -> list[dict[str, Any]]:
+        """Apply view filters without changing lifetime edge identity or counts."""
+        cutoff_naive = datetime.now() - timedelta(days=days) if days is not None else None
+        cutoff_utc = (
+            datetime.now(timezone.utc) - timedelta(days=days)
+            if days is not None
+            else None
+        )
+        result = []
+        for edge in edges:
+            if cutoff_naive is not None and edge['last_seen']:
+                try:
+                    last_seen = datetime.fromisoformat(
+                        str(edge['last_seen']).replace('Z', '+00:00')
                     )
+                except (TypeError, ValueError):
+                    # Preserve the historical behavior for malformed timestamps:
+                    # they remain visible rather than silently losing graph data.
+                    last_seen = None
+                if last_seen is not None:
+                    if last_seen.tzinfo is None:
+                        if last_seen < cutoff_naive:
+                            continue
+                    elif cutoff_utc is not None and last_seen.astimezone(timezone.utc) < cutoff_utc:
+                        continue
+            if (
+                min_observations is not None
+                and edge['observation_count'] < min_observations
+            ):
+                continue
+            result.append(edge)
+        return result
 
-                    for intermediate_prefix, intermediate_score in intermediate_candidates:
-                        if intermediate_prefix == candidate_norm:
-                            multi_hop_score = intermediate_score
-                            break
+    def _aggregate_multibyte_evidence_edges(
+        self, *, force_refresh: bool = False
+    ) -> list[dict[str, Any]]:
+        """Return a bounded-age, single-flight lifetime multi-byte aggregate."""
+        def previous_failure(message: str) -> RuntimeError:
+            failure = self._multibyte_graph_cache_failure
+            if failure is None:
+                return RuntimeError(message)
+            failure_type, failure_message = failure
+            return RuntimeError(
+                f"{message}: {failure_type}: {failure_message}"
+            )
 
-                candidate_score = max(graph_score_with_bonus, multi_hop_score)
-                method = 'graph_multihop' if multi_hop_score > graph_score_with_bonus else 'graph'
+        now = time.monotonic()
+        with self._multibyte_graph_cache_condition:
+            cached = self._multibyte_graph_cache_edges
+            cache_age = now - self._multibyte_graph_cache_created_at
+            failure_age = now - self._multibyte_graph_cache_failure_at
+            retry_suppressed = (
+                self._multibyte_graph_cache_failure is not None
+                and failure_age < self._multibyte_graph_cache_retry_seconds
+            )
+            if retry_suppressed:
+                if cached is not None and not force_refresh:
+                    return cached
+                raise previous_failure(
+                    "Multi-byte mesh aggregation retry suppressed after failure"
+                )
+            if (
+                not force_refresh
+                and cached is not None
+                and cache_age < self._mesh_graph_cache_seconds
+            ):
+                return cached
 
-                # Apply distance penalty for intermediate hops (prevents selecting very distant repeaters)
-                # This is especially important when graph has strong evidence for long-distance links
-                if graph_distance_penalty_enabled and next_norm is not None:  # Not final hop
-                    repeater_lat = repeater.get('latitude')
-                    repeater_lon = repeater.get('longitude')
+            if self._multibyte_graph_cache_computing:
+                # Prefer a slightly stale result to making concurrent clients
+                # duplicate the same expensive SQLite aggregation.
+                if cached is not None and not force_refresh:
+                    return cached
+                while self._multibyte_graph_cache_computing:
+                    self._multibyte_graph_cache_condition.wait()
+                cached = self._multibyte_graph_cache_edges
+                if self._multibyte_graph_cache_failure is not None:
+                    if cached is not None and not force_refresh:
+                        return cached
+                    raise previous_failure(
+                        "Concurrent multi-byte mesh aggregation failed"
+                    )
+                if cached is not None:
+                    return cached
 
-                    if repeater_lat is not None and repeater_lon is not None:
-                        max_distance = 0.0
+            self._multibyte_graph_cache_computing = True
+            stale = cached
 
-                        # Check distance from previous node to candidate (use stored edge distance if available)
-                        if prev_norm:
-                            prev_to_candidate_edge = mesh_graph.get_edge(prev_norm, candidate_norm)
-                            if prev_to_candidate_edge and prev_to_candidate_edge.get('geographic_distance'):
-                                distance = prev_to_candidate_edge.get('geographic_distance')
-                                max_distance = max(max_distance, distance)
-
-                        # Check distance from candidate to next node (use stored edge distance if available)
-                        if next_norm:
-                            candidate_to_next_edge = mesh_graph.get_edge(candidate_norm, next_norm)
-                            if candidate_to_next_edge and candidate_to_next_edge.get('geographic_distance'):
-                                distance = candidate_to_next_edge.get('geographic_distance')
-                                max_distance = max(max_distance, distance)
-
-                        # Apply penalty if distance exceeds reasonable hop distance
-                        if max_distance > graph_max_reasonable_hop_distance_km:
-                            excess_distance = max_distance - graph_max_reasonable_hop_distance_km
-                            normalized_excess = min(excess_distance / graph_max_reasonable_hop_distance_km, 1.0)
-                            penalty = normalized_excess * graph_distance_penalty_strength
-                            candidate_score = candidate_score * (1.0 - penalty)
-                        elif max_distance > 0:
-                            # Even if under threshold, very long hops should get a small penalty
-                            if max_distance > graph_max_reasonable_hop_distance_km * 0.8:
-                                small_penalty = (max_distance - graph_max_reasonable_hop_distance_km * 0.8) / (graph_max_reasonable_hop_distance_km * 0.2) * graph_distance_penalty_strength * 0.5
-                                candidate_score = candidate_score * (1.0 - small_penalty)
-
-                # For final hop (next_norm is None), add bot location proximity bonus
-                # This is critical for final hop selection - the last repeater before the bot should be close
-                if next_norm is None and graph_final_hop_proximity_enabled:
-                    if bot_latitude is not None and bot_longitude is not None:
-                        repeater_lat = repeater.get('latitude')
-                        repeater_lon = repeater.get('longitude')
-
-                        if repeater_lat is not None and repeater_lon is not None:
-                            # Calculate distance to bot
-                            distance = calculate_distance(
-                                bot_latitude, bot_longitude,
-                                repeater_lat, repeater_lon
-                            )
-
-                            # Apply max distance threshold if configured
-                            if graph_final_hop_max_distance > 0 and distance > graph_final_hop_max_distance:
-                                # Beyond max distance - significantly penalize this candidate for final hop
-                                candidate_score *= 0.3  # Heavy penalty for distant final hop
-                            else:
-                                # Normalize distance to 0-1 score (inverse: closer = higher score)
-                                # Use configurable normalization distance (default 500km for more aggressive scoring)
-                                normalized_distance = min(distance / graph_final_hop_proximity_normalization_km, 1.0)
-                                proximity_score = 1.0 - normalized_distance
-
-                                # For final hop, use a higher effective weight to ensure proximity matters more
-                                # The configured weight is a minimum; we boost it for very close repeaters
-                                effective_weight = graph_final_hop_proximity_weight
-                                if distance < graph_final_hop_very_close_threshold_km:
-                                    # Very close - boost weight up to max
-                                    effective_weight = min(graph_final_hop_max_proximity_weight, graph_final_hop_proximity_weight * 2.0)
-                                elif distance < graph_final_hop_close_threshold_km:
-                                    # Close - moderate boost
-                                    effective_weight = min(0.5, graph_final_hop_proximity_weight * 1.5)
-
-                                # Combine with graph score using effective weight
-                                candidate_score = candidate_score * (1.0 - effective_weight) + proximity_score * effective_weight
-
-                # Path validation bonus: Check if candidate's stored paths match the current path context
-                path_validation_bonus = 0.0
-                if candidate_public_key and len(path_context) > 1:
-                    try:
-                        # Query stored paths from this repeater
-                        query = '''
-                            SELECT path_hex, observation_count, last_seen, from_prefix, to_prefix, bytes_per_hop
-                            FROM observed_paths
-                            WHERE public_key = ? AND packet_type = 'advert'
-                            ORDER BY observation_count DESC, last_seen DESC
-                            LIMIT 10
-                        '''
-                        stored_paths = self.db_manager.execute_query(query, (candidate_public_key,))
-
-                        if stored_paths:
-                            # Build the path we're decoding (full path context)
-                            decoded_path_hex = ''.join([node.lower() for node in path_context])
-                            # Build the path prefix up to (but not including) the current node
-                            # This helps match paths where the candidate appears at the same position
-                            path_prefix_up_to_current = ''.join([node.lower() for node in path_context[:current_index]])
-
-                            # Check if any stored path shares common segments with decoded path
-                            for stored_path in stored_paths:
-                                stored_hex = stored_path.get('path_hex', '').lower()
-                                obs_count = stored_path.get('observation_count', 1)
-
-                                if stored_hex:
-                                    # Chunk size: use stored bytes_per_hop (multi-byte path support)
-                                    n = (stored_path.get('bytes_per_hop') or 1) * 2
-                                    if n <= 0:
-                                        n = 2
-                                    stored_nodes = [stored_hex[i:i+n] for i in range(0, len(stored_hex), n)]
-                                    if (len(stored_hex) % n) != 0:
-                                        stored_nodes = [stored_hex[i:i+2] for i in range(0, len(stored_hex), 2)]
-                                    decoded_nodes = path_context if path_context else [decoded_path_hex[i:i+n] for i in range(0, len(decoded_path_hex), n)]
-
-                                    # Count how many nodes appear in both paths (in order)
-                                    common_segments = 0
-                                    min_len = min(len(stored_nodes), len(decoded_nodes))
-                                    for i in range(min_len):
-                                        if stored_nodes[i] == decoded_nodes[i]:
-                                            common_segments += 1
-                                        else:
-                                            break
-
-                                    # Also check if stored path starts with the same prefix as the decoded path up to current position
-                                    # This is important for matching paths where the candidate appears at the same position
-                                    prefix_match = False
-                                    if path_prefix_up_to_current and len(stored_hex) >= len(path_prefix_up_to_current):
-                                        if stored_hex.startswith(path_prefix_up_to_current):
-                                            # The stored path has the same prefix, and the candidate appears at the same position
-                                            # This is a strong indicator of a match
-                                            prefix_match = True
-
-                                    # Bonus based on common segments and observation count
-                                    if common_segments >= 2 or prefix_match:
-                                        # Stronger bonus for prefix matches (indicates same path structure)
-                                        if prefix_match and common_segments >= current_index:
-                                            segment_bonus = min(graph_path_validation_max_bonus, 0.1 * (current_index + 1))
-                                        else:
-                                            segment_bonus = min(0.2, 0.05 * common_segments)
-                                        obs_bonus = min(0.15, obs_count / graph_path_validation_obs_divisor)
-                                        path_validation_bonus = max(path_validation_bonus, segment_bonus + obs_bonus)
-                                        # Cap at max bonus
-                                        path_validation_bonus = min(graph_path_validation_max_bonus, path_validation_bonus)
-                                        if path_validation_bonus >= graph_path_validation_max_bonus * 0.9:
-                                            break  # Strong match found, no need to check more
-                    except (sqlite3.Error, OSError, KeyError, ValueError) as _score_err:
-                        self.logger.debug("Path-scoring graph query failed: %s", _score_err)
-
-                # Add path validation bonus to graph score
-                candidate_score = min(1.0, candidate_score + path_validation_bonus)
-
-                if repeater.get('is_starred', False):
-                    candidate_score *= star_bias_multiplier
-
-                if candidate_score > best_score:
-                    best_score = candidate_score
-                    best_repeater = repeater
-                    best_method = method
-
-            if best_repeater and best_score > 0.0:
-                confidence = min(1.0, best_score) if best_score <= 1.0 else 0.95 + (min(0.05, (best_score - 1.0) / star_bias_multiplier))
-                return best_repeater, confidence, best_method or 'graph'
-
-            return None, 0.0, None
-
-        # Main resolution logic (same as PathCommand._lookup_repeater_names)
-        repeater_info = {}
-
+        started_at = time.monotonic()
         try:
-            for node_id in node_ids:
-                # Query database for matching repeaters
-                if max_repeater_age_days > 0:
-                    query = f'''
-                        SELECT name, public_key, device_type, last_heard, last_heard as last_seen,
-                               last_advert_timestamp, latitude, longitude, city, state, country,
-                               advert_count, signal_strength, hop_count, role, is_starred
-                        FROM complete_contact_tracking
-                        WHERE public_key LIKE ? AND role IN ('repeater', 'roomserver')
-                        AND (
-                            (last_advert_timestamp IS NOT NULL AND last_advert_timestamp >= datetime('now', '-{max_repeater_age_days} days'))
-                            OR (last_advert_timestamp IS NULL AND last_heard >= datetime('now', '-{max_repeater_age_days} days'))
-                        )
-                        ORDER BY COALESCE(last_advert_timestamp, last_heard) DESC
-                    '''
-                else:
-                    query = '''
-                        SELECT name, public_key, device_type, last_heard, last_heard as last_seen,
-                               last_advert_timestamp, latitude, longitude, city, state, country,
-                               advert_count, signal_strength, hop_count, role, is_starred
-                        FROM complete_contact_tracking
-                        WHERE public_key LIKE ? AND role IN ('repeater', 'roomserver')
-                        ORDER BY COALESCE(last_advert_timestamp, last_heard) DESC
-                    '''
+            computed = self._compute_multibyte_evidence_edges()
+        except Exception as exc:
+            self.logger.warning(
+                "Multi-byte mesh aggregation failed%s",
+                "; serving cached data"
+                if stale is not None and not force_refresh
+                else "",
+                exc_info=True,
+            )
+            with self._multibyte_graph_cache_condition:
+                self._multibyte_graph_cache_failure = (
+                    type(exc).__name__,
+                    str(exc),
+                )
+                self._multibyte_graph_cache_failure_at = time.monotonic()
+                self._multibyte_graph_cache_computing = False
+                self._multibyte_graph_cache_condition.notify_all()
+            if stale is not None and not force_refresh:
+                return stale
+            raise
 
-                prefix_pattern = f"{node_id}%"
-                results = self.db_manager.execute_query(query, (prefix_pattern,))
+        elapsed = time.monotonic() - started_at
+        with self._multibyte_graph_cache_condition:
+            self._multibyte_graph_cache_edges = computed
+            self._multibyte_graph_cache_created_at = time.monotonic()
+            self._multibyte_graph_cache_failure = None
+            self._multibyte_graph_cache_failure_at = 0.0
+            self._multibyte_graph_cache_computing = False
+            self._multibyte_graph_cache_condition.notify_all()
 
-                if results:
-                    repeaters_data = [
-                        {
-                            'name': row['name'],
-                            'public_key': row['public_key'],
-                            'device_type': row['device_type'],
-                            'last_seen': row['last_seen'],
-                            'last_heard': row.get('last_heard', row['last_seen']),
-                            'last_advert_timestamp': row.get('last_advert_timestamp'),
-                            'is_active': True,
-                            'latitude': row['latitude'],
-                            'longitude': row['longitude'],
-                            'city': row['city'],
-                            'state': row['state'],
-                            'country': row['country'],
-                            'hop_count': row.get('hop_count'),  # Include hop_count for zero-hop bonus
-                            'is_starred': bool(row.get('is_starred', 0))
-                        } for row in results
-                    ]
+        self.logger.debug(
+            "Computed %d multi-byte mesh edges in %.3fs",
+            len(computed),
+            elapsed,
+        )
+        return computed
 
-                    scored_repeaters = calculate_recency_weighted_scores(repeaters_data)
-                    min_recency_threshold = 0.01
-                    recent_repeaters = [r for r, score in scored_repeaters if score >= min_recency_threshold]
+    def _compute_multibyte_evidence_edges(self) -> list[dict[str, Any]]:
+        """Derive mesh edges purely from multi-byte path evidence.
 
-                    if len(recent_repeaters) > 1:
-                        # Multiple matches - use graph and geographic selection
-                        graph_repeater = None
-                        graph_confidence = 0.0
-                        selection_method = None
-                        geo_repeater = None
-                        geo_confidence = 0.0
+        Splits each observed_paths row with bytes_per_hop >= 2 into consecutive
+        hop pairs and aggregates per directed pair. Unlike mesh_connections, this
+        never mixes in single-byte observations, so edge identity is unambiguous
+        (up to 2/3-byte prefix collisions, which are rare).
 
-                        if graph_based_validation and hasattr(self, 'mesh_graph') and self.mesh_graph:
-                            graph_repeater, graph_confidence, selection_method = select_repeater_by_graph(
-                                recent_repeaters, node_id, node_ids
-                            )
+        Edges observed at 2-byte resolution are coalesced into a 3-byte edge when
+        exactly one 3-byte edge prefix-matches both endpoints — the same
+        unique-match rule MeshGraph.add_edge applies at write time.
 
-                        if geographic_guessing_enabled:
-                            if proximity_method == 'path':
-                                geo_repeater, geo_confidence = select_by_path_proximity(
-                                    recent_repeaters, node_id, node_ids, None
-                                )
-                            else:
-                                geo_repeater, geo_confidence = select_by_simple_proximity(recent_repeaters)
+        Returns edge dicts matching the /api/mesh/edges schema, plus:
+          path_count — number of distinct observed paths crossing the edge
+          evidence   — always 'multibyte'
+        """
+        # Split paths and aggregate directed hop pairs in SQLite. This preserves
+        # lifetime counts and cross-resolution coalescing while avoiding one
+        # Python row/dict/list per observed path (hundreds of thousands on busy
+        # meshes). The selected timeframe is applied only after coalescing,
+        # matching the historical client-side filter semantics.
+        query = '''
+            WITH RECURSIVE edge_parts(
+                path_hex, step, observation_count, first_seen, last_seen,
+                hop_position, from_prefix, to_prefix, next_offset
+            ) AS (
+                SELECT
+                    LOWER(path_hex),
+                    bytes_per_hop * 2,
+                    CASE
+                        WHEN observation_count IS NULL OR observation_count = 0 THEN 1
+                        ELSE observation_count
+                    END,
+                    first_seen,
+                    last_seen,
+                    1,
+                    SUBSTR(LOWER(path_hex), 1, bytes_per_hop * 2),
+                    SUBSTR(LOWER(path_hex), bytes_per_hop * 2 + 1, bytes_per_hop * 2),
+                    bytes_per_hop * 4 + 1
+                FROM observed_paths
+                WHERE bytes_per_hop >= 2
+                  AND path_hex IS NOT NULL
+                  AND LENGTH(path_hex) > 0
+                  AND LENGTH(path_hex) % (bytes_per_hop * 2) = 0
+                  AND LENGTH(path_hex) >= bytes_per_hop * 4
 
-                        # Combine or choose
-                        selected_repeater = None
-                        confidence = 0.0
-                        final_method = None
+                UNION ALL
 
-                        if graph_geographic_combined and graph_repeater and geo_repeater:
-                            graph_pubkey = graph_repeater.get('public_key', '')
-                            geo_pubkey = geo_repeater.get('public_key', '')
+                SELECT
+                    path_hex,
+                    step,
+                    observation_count,
+                    first_seen,
+                    last_seen,
+                    hop_position + 1,
+                    to_prefix,
+                    SUBSTR(path_hex, next_offset, step),
+                    next_offset + step
+                FROM edge_parts
+                WHERE LENGTH(path_hex) >= next_offset + step - 1
+            )
+            SELECT
+                from_prefix,
+                to_prefix,
+                SUM(observation_count) AS observation_count,
+                COUNT(*) AS path_count,
+                MIN(first_seen) AS first_seen,
+                MAX(last_seen) AS last_seen,
+                SUM(hop_position * observation_count) AS hop_position_sum
+            FROM edge_parts
+            GROUP BY from_prefix, to_prefix
+        '''
 
-                            if graph_pubkey and geo_pubkey and graph_pubkey == geo_pubkey:
-                                combined_confidence = (
-                                    graph_confidence * graph_geographic_weight +
-                                    geo_confidence * (1.0 - graph_geographic_weight)
-                                )
-                                selected_repeater = graph_repeater
-                                confidence = combined_confidence
-                                final_method = 'graph_geographic_combined'
-                            else:
-                                if graph_confidence > geo_confidence:
-                                    selected_repeater = graph_repeater
-                                    confidence = graph_confidence
-                                    final_method = selection_method or 'graph'
-                                else:
-                                    selected_repeater = geo_repeater
-                                    confidence = geo_confidence
-                                    final_method = 'geographic'
-                        else:
-                            # For final hop, prefer geographic selection if available and reasonable
-                            # The final hop should be close to the bot, so geographic proximity is very important
-                            is_final_hop = (node_id == node_ids[-1] if node_ids else False)
+        with self._with_db_connection() as conn:
+            rows = conn.execute(query).fetchall()
 
-                            if is_final_hop and geo_repeater and geo_confidence >= 0.6:
-                                # For final hop, prefer geographic if it has decent confidence
-                                # This ensures we pick the closest repeater for the last hop
-                                if not graph_repeater or geo_confidence >= graph_confidence * 0.9:
-                                    selected_repeater = geo_repeater
-                                    confidence = geo_confidence
-                                    final_method = 'geographic'
-                                elif graph_repeater:
-                                    selected_repeater = graph_repeater
-                                    confidence = graph_confidence
-                                    final_method = selection_method or 'graph'
-                            elif graph_repeater and graph_confidence >= graph_confidence_override_threshold:
-                                selected_repeater = graph_repeater
-                                confidence = graph_confidence
-                                final_method = selection_method or 'graph'
-                            elif not graph_repeater or graph_confidence < graph_confidence_override_threshold:
-                                if geo_repeater and (not graph_repeater or geo_confidence > graph_confidence):
-                                    selected_repeater = geo_repeater
-                                    confidence = geo_confidence
-                                    final_method = 'geographic'
-                                elif graph_repeater:
-                                    selected_repeater = graph_repeater
-                                    confidence = graph_confidence
-                                    final_method = selection_method or 'graph'
-
-                        if selected_repeater and confidence >= 0.5:
-                            repeater_info[node_id] = {
-                                'name': selected_repeater['name'],
-                                'public_key': selected_repeater['public_key'],
-                                'device_type': selected_repeater['device_type'],
-                                'last_seen': selected_repeater['last_seen'],
-                                'is_active': selected_repeater['is_active'],
-                                'found': True,
-                                'collision': False,
-                                'geographic_guess': (final_method == 'geographic'),
-                                'graph_guess': (final_method == 'graph' or final_method == 'graph_multihop'),
-                                'confidence': confidence,
-                                'selection_method': final_method,
-                                'latitude': selected_repeater.get('latitude'),
-                                'longitude': selected_repeater.get('longitude')
-                            }
-                        else:
-                            repeater_info[node_id] = {
-                                'found': True,
-                                'collision': True,
-                                'matches': len(recent_repeaters),
-                                'node_id': node_id
-                            }
-                    elif len(recent_repeaters) == 1:
-                        repeater = recent_repeaters[0]
-                        repeater_info[node_id] = {
-                            'name': repeater['name'],
-                            'public_key': repeater['public_key'],
-                            'device_type': repeater['device_type'],
-                            'last_seen': repeater['last_seen'],
-                            'is_active': repeater['is_active'],
-                            'found': True,
-                            'collision': False,
-                            'latitude': repeater.get('latitude'),
-                            'longitude': repeater.get('longitude')
-                        }
-                    else:
-                        repeater_info[node_id] = {
-                            'found': False,
-                            'node_id': node_id
-                        }
-                else:
-                    repeater_info[node_id] = {
-                        'found': False,
-                        'node_id': node_id
-                    }
-        except Exception as e:
-            self.logger.error(f"Error resolving path: {e}")
-            return {
-                'node_ids': node_ids,
-                'repeaters': [],
-                'valid': False,
-                'error': str(e)
+        edges: dict[tuple[str, str], dict[str, Any]] = {
+            (row['from_prefix'], row['to_prefix']): {
+                'observation_count': row['observation_count'],
+                'path_count': row['path_count'],
+                'first_seen': row['first_seen'],
+                'last_seen': row['last_seen'],
+                'hop_position_sum': row['hop_position_sum'],
             }
-
-        # Format response
-        repeaters_list = []
-        for node_id in node_ids:
-            info = repeater_info.get(node_id, {'found': False, 'node_id': node_id})
-            repeaters_list.append({
-                'node_id': node_id,
-                **info
-            })
-
-        return {
-            'node_ids': node_ids,
-            'repeaters': repeaters_list,
-            'valid': True
+            for row in rows
         }
+
+        # Coalesce 2-byte edges into a 3-byte edge when exactly one matches.
+        # (Hops within a path share one resolution, so keys are homogeneous.)
+        by_truncated_key: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        for key in edges:
+            if len(key[0]) == 6:
+                by_truncated_key.setdefault((key[0][:4], key[1][:4]), []).append(key)
+        for key in [k for k in edges if len(k[0]) == 4]:
+            candidates = by_truncated_key.get(key, [])
+            if len(candidates) == 1:
+                target = edges[candidates[0]]
+                source = edges.pop(key)
+                target['observation_count'] += source['observation_count']
+                target['path_count'] += source['path_count']
+                target['hop_position_sum'] += source['hop_position_sum']
+                if source['first_seen'] and (target['first_seen'] is None or source['first_seen'] < target['first_seen']):
+                    target['first_seen'] = source['first_seen']
+                if source['last_seen'] and (target['last_seen'] is None or source['last_seen'] > target['last_seen']):
+                    target['last_seen'] = source['last_seen']
+
+        result = []
+        for (from_prefix, to_prefix), agg in edges.items():
+            result.append({
+                'from_prefix': from_prefix,
+                'to_prefix': to_prefix,
+                'from_public_key': None,
+                'to_public_key': None,
+                'observation_count': agg['observation_count'],
+                'path_count': agg['path_count'],
+                'first_seen': agg['first_seen'],
+                'last_seen': agg['last_seen'],
+                'avg_hop_position': agg['hop_position_sum'] / agg['observation_count'],
+                'geographic_distance': None,
+                'evidence': 'multibyte',
+            })
+        result.sort(key=lambda e: e['last_seen'] or '', reverse=True)
+        return result
+
+    # Nodes in the neighbor tables are stored as full 32-byte public keys, so the
+    # graph's highest resolution (3 bytes) is always available for edge identity.
+    NEIGHBOR_PREFIX_HEX_CHARS = 6
+
+    def _neighbor_evidence_edge_keys(
+        self,
+        days: int | None = None,
+    ) -> 'NeighborEvidenceKeys':
+        """Directed pairs that confirmed zero-hop discovery has proven.
+
+        Used to upgrade the evidence label in the combined view, where the edge
+        itself comes from ``mesh_connections`` and so has lost its provenance.
+        Two key spaces are returned because a ``mesh_connections`` edge can be
+        matched by either:
+
+        * ``prefixes`` — 3-byte prefix pairs, matching edges the graph stores at
+          the same resolution neighbor discovery feeds it.
+        * ``public_keys`` — full-key pairs, for edges the graph deliberately keeps
+          at a *shorter* prefix (see ``MeshGraph.add_edge``: a 1-byte edge with no
+          public key is not promoted, so several nodes keep sharing it) while
+          still filling in the public keys discovery supplied. Truncating our
+          keys down to 2 chars instead would be wrong — it would relabel every
+          other node sharing that byte.
+
+        ``days`` windows the evidence the same way the caller windows its edges.
+        ``neighbor_links`` is never pruned, so without it a link last seen years
+        ago would keep labelling a recent path-derived edge a current neighbor.
+        """
+        try:
+            edges = self._derive_neighbor_evidence_graph(days=days)[0]
+        except Exception as exc:
+            # A pre-migration-22 database simply has no neighbor evidence.
+            self.logger.debug(f"Neighbor evidence keys unavailable: {exc}")
+            return NeighborEvidenceKeys(set(), set())
+
+        # Both directions are already emitted per link, so no reversing here.
+        prefixes = {
+            (edge['from_prefix'], edge['to_prefix'])
+            for edge in edges
+            if edge['from_prefix'] and edge['to_prefix']
+        }
+        public_keys = {
+            (edge['from_public_key'], edge['to_public_key'])
+            for edge in edges
+            if edge['from_public_key'] and edge['to_public_key']
+        }
+        return NeighborEvidenceKeys(prefixes, public_keys)
+
+    def _compute_neighbor_evidence_edges(self) -> list[dict[str, Any]]:
+        """Derive mesh edges from confirmed zero-hop neighbor discovery.
+
+        This is the strongest evidence class in the database: each row is a
+        direct RF reception between two *full* public keys with a measured SNR,
+        recorded by modules/neighbors_discovery.py. Two differences from the
+        multi-byte path derivation are worth noting:
+
+        * ``from_public_key``/``to_public_key`` are populated. Path-derived edges
+          cannot fill these in, because a path carries prefixes only.
+        * ``snr``/``best_snr`` are real measurements. Unlike the dashboard's
+          one-hop panel, which withholds SNR unless two sources agree because
+          ``complete_contact_tracking.hop_count`` over-claims zero-hop, a
+          discover response *is* the authoritative first-party measurement.
+
+        Both directions are emitted per link: a discover response proves we
+        transmitted, they received, they transmitted, and we received.
+        """
+        chars = self.NEIGHBOR_PREFIX_HEX_CHARS
+        query = '''
+            SELECT
+                self_public_key,
+                neighbor_public_key,
+                observation_count,
+                snr_sum,
+                snr_count,
+                best_snr,
+                last_snr,
+                first_seen,
+                last_seen
+            FROM neighbor_links
+        '''
+        try:
+            with self._with_db_connection() as conn:
+                rows = conn.execute(query).fetchall()
+        except Exception as exc:
+            self.logger.debug(f"Neighbor evidence edges unavailable: {exc}")
+            return []
+
+        edges: list[dict[str, Any]] = []
+        for row in rows:
+            self_key = (row['self_public_key'] or '').lower()
+            neighbor_key = (row['neighbor_public_key'] or '').lower()
+            if not self_key or not neighbor_key:
+                continue
+            snr_count = row['snr_count'] or 0
+            mean_snr = (row['snr_sum'] / snr_count) if snr_count else None
+            for from_key, to_key in ((self_key, neighbor_key), (neighbor_key, self_key)):
+                edges.append({
+                    'from_prefix': from_key[:chars],
+                    'to_prefix': to_key[:chars],
+                    'from_public_key': from_key,
+                    'to_public_key': to_key,
+                    'observation_count': row['observation_count'] or 1,
+                    'first_seen': row['first_seen'],
+                    'last_seen': row['last_seen'],
+                    # A direct link is by definition the first hop of any path
+                    # that crosses it.
+                    'avg_hop_position': 1.0,
+                    'geographic_distance': None,
+                    'snr': mean_snr,
+                    'best_snr': row['best_snr'],
+                    'last_snr': row['last_snr'],
+                    'evidence': 'neighbors',
+                })
+
+        edges.sort(key=lambda e: e['last_seen'] or '', reverse=True)
+        return edges
+
+    def _derive_neighbor_evidence_graph(
+        self,
+        days: int | None = None,
+        min_observations: int | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Filtered neighbor-evidence edges plus their prefix resolution.
+
+        Reuses the multi-byte view filter: it only touches ``last_seen`` and
+        ``observation_count`` (handling both naive and aware timestamps), which
+        is exactly the filtering these edges need.
+        """
+        all_edges = self._compute_neighbor_evidence_edges()
+        filtered = self._filter_multibyte_evidence_edges(
+            all_edges, days=days, min_observations=min_observations
+        )
+        return filtered, self.NEIGHBOR_PREFIX_HEX_CHARS
+
+    def _resolve_path(self, path_input: str) -> dict[str, Any]:
+        """Resolve a hex path to repeater names/locations for the mesh map.
+
+        Thin wrapper over the shared engine (modules.path_inference.decode_path_nodes). Previously
+        this duplicated the decode logic and crashed ("must be real number, not NoneType") on
+        repeaters without coordinates; the shared engine guards that.
+        """
+        if not hasattr(self, "db_manager") or not self.db_manager:
+            return {"node_ids": [], "repeaters": [], "valid": False,
+                    "error": "Database manager not initialized"}
+        from modules.path_inference import decode_path_nodes
+        nodes = decode_path_nodes(
+            path_input,
+            None,
+            config=self.config,
+            db_manager=self.db_manager,
+            logger=self.logger,
+            mesh_graph=self._get_mesh_graph(),
+            include_location=True,
+        )
+        node_ids = [n["node_id"] for n in nodes]
+        if not node_ids:
+            return {"node_ids": [], "repeaters": [], "valid": False,
+                    "error": "No valid hex values found"}
+        return {"node_ids": node_ids, "repeaters": nodes, "valid": True}
 
     def _setup_routes(self):
         """Setup all Flask routes - complete feature parity"""
@@ -1224,6 +1165,11 @@ class BotDataViewer:
             '/apple-touch-icon.png', '/favicon-32x32.png', '/favicon-16x16.png',
             '/site.webmanifest', '/favicon.ico',
         ])
+
+        @self.app.before_request
+        def create_csp_nonce():
+            """Create a per-response nonce for templates migrated off inline-script CSP."""
+            g.csp_nonce = secrets.token_urlsafe(24)
 
         @self.app.before_request
         def require_auth():
@@ -1269,17 +1215,45 @@ class BotDataViewer:
             response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
             # Allow CDNs used by templates (base.html, login.html, mesh.html).
             # Without these hosts, browsers block external CSS/JS/fonts (not CSRF).
+            # fonts.googleapis.com serves login.html's stylesheet and fonts.gstatic.com
+            # the font files it references — both hosts are needed or the login page
+            # silently falls back to system fonts.
+            # The highest-risk admin screens have migrated their inline handlers
+            # and authorize their remaining template scripts with a per-request
+            # nonce. Other legacy screens retain unsafe-inline until their inline
+            # scripts/handlers are migrated, rather than silently breaking them.
+            nonce_hardened_endpoints = {
+                'index',
+                'feeds',
+                'config_page',
+                'radio',
+                'realtime',
+                'contacts',
+                'plugins_page',
+                'greeter',
+                'logs',
+                'multibyte_rollout',
+                'mesh',
+                'api_explorer',
+            }
+            if request.endpoint in nonce_hardened_endpoints:
+                script_source = f"script-src 'self' 'nonce-{g.csp_nonce}' "
+            else:
+                script_source = "script-src 'self' 'unsafe-inline' "
             response.headers['Content-Security-Policy'] = (
                 "default-src 'self'; "
-                "script-src 'self' 'unsafe-inline' "
-                "https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://unpkg.com; "
+                + script_source
+                + "https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://unpkg.com; "
                 "style-src 'self' 'unsafe-inline' "
-                "https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://unpkg.com; "
+                "https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://unpkg.com "
+                "https://fonts.googleapis.com; "
                 "img-src 'self' data: https://*.tile.openstreetmap.org "
+                "https://*.basemaps.cartocdn.com "
                 "https://unpkg.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; "
                 "connect-src 'self' ws: wss: "
                 "https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://unpkg.com; "
-                "font-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com"
+                "font-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com "
+                "https://fonts.gstatic.com"
             )
 
             # Sanitize error details from 5xx JSON responses to prevent info disclosure.
@@ -1323,8 +1297,23 @@ class BotDataViewer:
 
         @self.app.route('/')
         def index():
-            """Main dashboard"""
-            return render_template('index.html')
+            """Main dashboard.
+
+            Server-side config reaches the page as a JSON data block rather than
+            an inline script, so the dashboard's JavaScript can live in a static
+            file that ``script-src 'self'`` already covers.
+            """
+            database_size = None
+            with suppress(OSError):
+                database_size = os.path.getsize(self.db_path)
+            return render_template(
+                'index.html',
+                dashboard_boot={
+                    'database_size': database_size,
+                    'snapshot_interval_seconds': self.dashboard_snapshot_interval,
+                    'snapshot_enabled': self.dashboard_snapshot_enabled,
+                },
+            )
 
         @self.app.route('/realtime')
         def realtime():
@@ -1347,10 +1336,12 @@ class BotDataViewer:
             return redirect('/config#database')
 
 
-        @self.app.route('/stats')
-        def stats():
-            """Statistics page"""
-            return render_template('stats.html')
+        @self.app.route('/multibyte-rollout')
+        def multibyte_rollout():
+            """Multibyte hash rollout analytics page"""
+            if not self.multibyte_monitor_enabled:
+                return abort(404)
+            return render_template('multibyte_rollout.html')
 
         @self.app.route('/greeter')
         def greeter():
@@ -1364,8 +1355,28 @@ class BotDataViewer:
 
         @self.app.route('/radio')
         def radio():
-            """Radio settings page"""
-            return render_template('radio.html')
+            """Radio settings page.
+
+            Passes config-governance flags so the Node Settings card doesn't
+            offer device settings the bot itself manages from config.ini.
+            """
+            auto_manage = 'false'
+            bot_name = ''
+            name_managed = False
+            if self.config:
+                auto_manage = self.config.get('Bot', 'auto_manage_contacts', fallback='device').lower()
+                bot_name = (self.config.get('Bot', 'bot_name', fallback='') or '').strip()
+                try:
+                    auto_update_name = self.config.getboolean('Bot', 'auto_update_device_name', fallback=True)
+                except ValueError:
+                    auto_update_name = True
+                name_managed = bool(bot_name) and auto_update_name
+            return render_template(
+                'radio.html',
+                auto_manage_contacts=auto_manage,
+                device_name_managed=name_managed,
+                bot_name=bot_name,
+            )
 
         @self.app.route('/config')
         def config_page():
@@ -1375,6 +1386,211 @@ class BotDataViewer:
                 config_panels=sorted(CONFIG_PANELS, key=lambda panel: panel['order']),
                 panel_categories=PANEL_CATEGORIES,
             )
+
+        # ── Plugins settings panel ───────────────────────────────────────────
+
+        @self.app.route('/plugins')
+        def plugins_page():
+            """Plugin & command settings page."""
+            return render_template('plugins.html')
+
+        @self.app.route('/api/plugins')
+        def api_plugins_get():
+            """Return the settings view for every discovered command/service."""
+            try:
+                # Re-read config from disk so the UI reflects external edits.
+                self.config = self._load_config(self.config_path)
+                view = build_plugin_settings_view(self.config, logger=self.logger)
+                return jsonify({'plugins': view})
+            except Exception:
+                self.logger.exception("Error building plugin settings view")
+                return jsonify({'error': 'Internal error — see server logs'}), 500
+
+        @self.app.route('/api/plugins/<kind>/<name>', methods=['POST'])
+        def api_plugins_save(kind: str, name: str):
+            """Validate and persist one plugin's settings, then queue a reload.
+
+            Body: ``{"section": str, "enabled": bool, "values": {key: raw}}``.
+            Validation mirrors the plugin's ``settings_schema`` server-side.
+            """
+            try:
+                data = request.get_json(silent=True) or {}
+                # Locate the plugin entry so we have its schema + section.
+                self.config = self._load_config(self.config_path)
+                view = build_plugin_settings_view(self.config, logger=self.logger)
+                entry = next(
+                    (e for e in view if e['kind'] == kind and e['name'] == name),
+                    None,
+                )
+                if entry is None:
+                    return jsonify({'success': False, 'error': 'Unknown plugin'}), 404
+
+                section = entry['section']
+                schema_by_key = {f['key']: f for f in entry['fields']}
+                raw_values = data.get('values', {}) or {}
+
+                errors: dict[str, str] = {}
+                # Schema-typed keys are validated and routed to their (possibly
+                # shared) target section; any other submitted key is written raw to
+                # the plugin's own section (covers dynamic/legacy keys not in the
+                # schema, so a partial schema never hides remaining settings).
+                updates: dict[str, dict[str, str]] = {section: {}}
+                deletes: dict[str, list[str]] = {}
+                for key, val in raw_values.items():
+                    field = schema_by_key.get(key)
+                    if field is not None:
+                        ok, coerced, err = validate_field(field, val)
+                        if not ok:
+                            errors[key] = err
+                        else:
+                            tsec = field.get('section') or section
+                            updates.setdefault(tsec, {})[key] = to_config_string(field, coerced)
+                    else:
+                        updates[section][str(key)] = '' if val is None else str(val)
+
+                if errors:
+                    return jsonify({'success': False, 'errors': errors}), 400
+
+                # The enable toggle is always written to the plugin's own section.
+                enabled = bool(data.get('enabled', entry['enabled']))
+                updates[section]['enabled'] = 'true' if enabled else 'false'
+                submitted_dyn = data.get('dynamic_sections', {}) or {}
+                for ds in entry.get('dynamic_sections', []):
+                    dsec = ds['section']
+                    prefix = ds.get('key_prefix', '') or ''
+                    if dsec not in submitted_dyn:
+                        # Payload didn't include this editor's rows (partial or
+                        # scripted save) — leave the managed keys untouched
+                        # rather than treating absence as "delete everything".
+                        continue
+                    rows = submitted_dyn.get(dsec) or []
+                    new_full: dict[str, str] = {}
+                    seen_full: set[str] = set()
+                    seen_disp: set[str] = set()
+                    for row in rows:
+                        rkey = (str(row.get('key', '')) or '').strip()
+                        rval = row.get('value', '')
+                        rval = '' if rval is None else str(rval)
+                        if not rkey:
+                            continue  # skip blank rows
+                        key_err = _validate_dynamic_key(rkey)
+                        if key_err:
+                            return jsonify({'success': False, 'error': key_err}), 400
+                        if rkey.lower() in seen_disp:
+                            return jsonify({'success': False,
+                                            'error': f'Duplicate key "{rkey}" in {ds["label"]}'}), 400
+                        seen_disp.add(rkey.lower())
+                        full = f"{prefix}{rkey}"
+                        new_full[full] = rval
+                        seen_full.add(full.lower())
+                    # Merge into the target section (own section keeps schema fields).
+                    updates.setdefault(dsec, {}).update(new_full)
+                    # Delete existing managed keys that are no longer present.
+                    existing = self.config.items(dsec, raw=True) if self.config.has_section(dsec) else []
+                    pl = prefix.lower()
+                    del_keys = [
+                        k for k, _ in existing
+                        if (not prefix or k.lower().startswith(pl)) and k.lower() not in seen_full
+                    ]
+                    deletes.setdefault(dsec, []).extend(del_keys)
+
+                # Repeating structured blocks (e.g. PacketCapture mqttN_*). Blocks
+                # are renumbered contiguously from 1 (the service stops scanning at
+                # the first missing index), validated per sub-schema, and unknown
+                # sub-keys are passed through so they survive the save.
+                submitted_blocks = data.get('repeating_blocks', {}) or {}
+                for rb in entry.get('repeating_blocks', []):
+                    bid = rb['id']
+                    if bid not in submitted_blocks:
+                        # Same defensive rule as dynamic sections: absent from
+                        # the payload means "don't touch", not "delete all".
+                        continue
+                    enabled_field = rb['enabled_field']
+                    field_by_key = {f['key']: f for f in rb['fields']}
+                    written: set[str] = set()
+                    for i, block in enumerate(submitted_blocks.get(bid) or [], start=1):
+                        bvals = block.get('values', {}) or {}
+                        for k, val in bvals.items():
+                            full = f"{bid}{i}_{k}"
+                            field = field_by_key.get(k)
+                            if field is not None:
+                                ok, coerced, err = validate_field(field, val)
+                                if not ok:
+                                    return jsonify({'success': False,
+                                                    'error': f'{rb["label"]} #{i}: {err}'}), 400
+                                updates[section][full] = to_config_string(field, coerced)
+                            else:
+                                updates[section][full] = '' if val is None else str(val)
+                            written.add(full.lower())
+                        en = f"{bid}{i}_{enabled_field}"
+                        updates[section][en] = 'true' if block.get('enabled', True) else 'false'
+                        written.add(en.lower())
+                    # Delete any existing block keys (old higher indices / removed).
+                    brx = re.compile(rf"^{re.escape(bid)}\d+_", re.IGNORECASE)
+                    existing = self.config.items(section, raw=True) if self.config.has_section(section) else []
+                    for k, _ in existing:
+                        if brx.match(k) and k.lower() not in written:
+                            deletes.setdefault(section, []).append(k)
+
+                store = get_settings_store(self.config, self.config_path, self.db_manager)
+                result = store.write_sections(updates, deletes)
+                backup_path = result.get('backup_path', '') if isinstance(result, dict) else ''
+
+                # A service's start/stop only takes effect on bot restart.
+                restart_required = (kind == 'service' and enabled != entry['enabled'])
+
+                # Queue a hot reload via the channel_operations table (the bot's
+                # scheduler polls this — same pattern as radio reconnect).
+                reload_queued = False
+                try:
+                    with self.db_manager.connection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "INSERT INTO channel_operations (operation_type, status) "
+                            "VALUES ('config_reload', 'pending')"
+                        )
+                        conn.commit()
+                    reload_queued = True
+                except Exception:
+                    self.logger.exception("Failed to queue config reload")
+
+                self.logger.info(
+                    "Plugin settings saved: %s [%s] (backup=%s)",
+                    name, section, os.path.basename(backup_path) if backup_path else 'none',
+                )
+                return jsonify({
+                    'success': True,
+                    'backup_path': backup_path,
+                    'reload_queued': reload_queued,
+                    'restart_required': restart_required,
+                })
+            except IniValueError as exc:
+                # A submitted key/value would corrupt the INI (newline, [ ], …).
+                # Nothing was written; report it as a client error.
+                return jsonify({'success': False, 'error': str(exc)}), 400
+            except Exception:
+                self.logger.exception("Error saving plugin settings")
+                return jsonify({'success': False, 'error': 'Internal error — see server logs'}), 500
+
+        @self.app.route('/api/plugins/reload-status')
+        def api_plugins_reload_status():
+            """Return the status of the most recent config_reload operation."""
+            try:
+                rows = self.db_manager.execute_query(
+                    "SELECT status, result_data, processed_at FROM channel_operations "
+                    "WHERE operation_type = 'config_reload' ORDER BY id DESC LIMIT 1"
+                )
+                if not rows:
+                    return jsonify({'status': None})
+                row = rows[0]
+                return jsonify({
+                    'status': row.get('status'),
+                    'result_data': row.get('result_data'),
+                    'processed_at': row.get('processed_at'),
+                })
+            except Exception:
+                self.logger.exception("Error reading reload status")
+                return jsonify({'status': None}), 500
 
         @self.app.route('/api/config/notifications')
         def api_config_notifications_get():
@@ -1628,17 +1844,26 @@ class BotDataViewer:
                 try:
                     if not self.config.has_section('Connection'):
                         self.config.add_section('Connection')
+                    ini_updates: dict[str, str] = {}
                     if 'alert_enabled' in data:
-                        self.config.set(
-                            'Connection', 'radio_zombie_alert_enabled',
-                            'true' if str(data['alert_enabled']).lower() == 'true' else 'false',
+                        ini_updates['radio_zombie_alert_enabled'] = (
+                            'true' if str(data['alert_enabled']).lower() == 'true' else 'false'
                         )
                     if 'alert_email' in data:
-                        self.config.set('Connection', 'radio_zombie_alert_email', str(data['alert_email']))
-                    with open(self.config_path, 'w') as fh:
-                        self.config.write(fh)
+                        ini_updates['radio_zombie_alert_email'] = str(data['alert_email'])
+                    if ini_updates:
+                        # Persist first: alert_email is free-form client JSON, so
+                        # a rejected value must not leave the in-memory config
+                        # holding something that was never written to disk.
+                        update_ini_values(self.config_path, {'Connection': ini_updates})
+                        for ini_key, ini_val in ini_updates.items():
+                            self.config.set('Connection', ini_key, ini_val)
                     config_saved = True
                     self.logger.info("Zombie alert settings written to config.ini")
+                except IniValueError as exc:
+                    # Not an OSError — without this the route would 500.
+                    self.logger.warning("Rejected zombie alert config value: %s", exc)
+                    return jsonify({'success': False, 'error': str(exc)}), 400
                 except OSError as exc:
                     self.logger.error("Failed to write zombie alert settings to config.ini: %s", exc)
                     return jsonify({
@@ -1716,12 +1941,12 @@ class BotDataViewer:
                     try:
                         if not self.config.has_section('Connection'):
                             self.config.add_section('Connection')
-                        self.config.set('Connection', 'radio_debug', 'true' if enabled else 'false')
-                        with open(self.config_path, 'w') as fh:
-                            self.config.write(fh)
+                        val = 'true' if enabled else 'false'
+                        self.config.set('Connection', 'radio_debug', val)
+                        update_ini_values(self.config_path, {'Connection': {'radio_debug': val}})
                         config_saved = True
                         self.logger.info(
-                            "radio_debug=%s written to config.ini by web UI", 'true' if enabled else 'false'
+                            "radio_debug=%s written to config.ini by web UI", val
                         )
                     except OSError as exc:
                         self.logger.error("Failed to write radio_debug to config.ini: %s", exc)
@@ -1790,8 +2015,10 @@ class BotDataViewer:
                     try:
                         self.config.set('Connection', 'radio_probe_interval_seconds', str(probe_interval))
                         self.config.set('Connection', 'radio_probe_fail_threshold', str(probe_fail_threshold))
-                        with open(self.config_path, 'w') as f:
-                            self.config.write(f)
+                        update_ini_values(self.config_path, {'Connection': {
+                            'radio_probe_interval_seconds': str(probe_interval),
+                            'radio_probe_fail_threshold': str(probe_fail_threshold),
+                        }})
                         config_saved = True
                         self.logger.info("Radio probe settings written to config.ini")
                     except Exception as exc:
@@ -1847,11 +2074,18 @@ class BotDataViewer:
                 config_saved = False
                 if data.get('save_to_config', False):
                     try:
-                        self.config.set('Connection', 'radio_offline_threshold', str(offline_threshold))
-                        self.config.set('Connection', 'radio_offline_alert_enabled', 'true' if alert_enabled else 'false')
-                        self.config.set('Connection', 'radio_offline_alert_email', alert_email)
-                        with open(self.config_path, 'w') as f:
-                            self.config.write(f)
+                        enabled_val = 'true' if alert_enabled else 'false'
+                        offline_ini = {
+                            'radio_offline_threshold': str(offline_threshold),
+                            'radio_offline_alert_enabled': enabled_val,
+                            'radio_offline_alert_email': alert_email,
+                        }
+                        # Persist first: alert_email is free-form client input, so
+                        # a rejected value must not leave the in-memory config
+                        # holding something that was never written to disk.
+                        update_ini_values(self.config_path, {'Connection': offline_ini})
+                        for ini_key, ini_val in offline_ini.items():
+                            self.config.set('Connection', ini_key, ini_val)
                         config_saved = True
                         self.logger.info("Radio offline alert settings written to config.ini")
                     except Exception as exc:
@@ -1903,10 +2137,11 @@ class BotDataViewer:
 
         @self.app.route('/api/maintenance/restore', methods=['POST'])
         def api_maintenance_restore():
-            """Restore DB from a backup file.
+            """Stage a verified DB backup for the next full service restart.
 
             Body: {"db_file": "/absolute/path/to/backup.db"}
-            The active DB is overwritten; the caller must restart the bot.
+            The active DB is never modified by this request.  Normal bot startup
+            applies the sibling pending file before any DB connection is opened.
             """
             try:
                 data = request.get_json(silent=True) or {}
@@ -1942,25 +2177,37 @@ class BotDataViewer:
 
                 if not src.exists():
                     return jsonify({'error': f'File not found: {db_file}'}), 400
-                # Validate it is a real SQLite file by checking the magic header
-                _SQLITE_MAGIC = b"SQLite format 3\x00"
                 try:
-                    with open(str(src), 'rb') as _fh:
-                        _header = _fh.read(16)
-                    if _header != _SQLITE_MAGIC:
-                        raise ValueError("bad magic")
-                except Exception:
-                    return jsonify({'error': f'Not a valid SQLite file: {db_file}'}), 400
-                # Copy to active DB path
-                import shutil
-                shutil.copy2(str(src), self.db_path)
-                self.logger.info(f"Database restored from {src} to {self.db_path}")
+                    max_restore_bytes = self.config.getint(
+                        'Web_Viewer',
+                        'restore_max_bytes',
+                        fallback=DEFAULT_MAX_RESTORE_BYTES,
+                    )
+                    pending = stage_database_restore(
+                        src,
+                        self.db_path,
+                        max_bytes=max_restore_bytes,
+                    )
+                except (DatabaseRestoreError, OSError, ValueError) as exc:
+                    self.logger.warning("Database restore staging rejected for %s: %s", src, exc)
+                    return jsonify({'error': str(exc)}), 400
+
+                self.logger.warning(
+                    "Database restore staged from %s at %s; a full service restart is required",
+                    src,
+                    pending,
+                )
                 return jsonify({
                     'success': True,
-                    'restored_from': db_file,
+                    'staged_from': db_file,
+                    'pending_path': str(pending),
                     'active_db': self.db_path,
-                    'warning': 'Restart the bot for the restored database to take effect.',
-                })
+                    'requires_restart': True,
+                    'warning': (
+                        'Restore verified and staged. Restart the complete MeshCore Bot service '
+                        'to apply it before any database writer starts.'
+                    ),
+                }), 202
             except Exception as e:
                 self.logger.error(f"Error in restore: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
@@ -2008,28 +2255,16 @@ class BotDataViewer:
             Returns: {"deleted": {<table>: <count>, ...}} — only tables that were purged
             """
             _VALID_KEEP_DAYS = {"all", 1, 7, 14, 30, 60, 90}
-            # (table, sql, params) — tables created lazily by other modules may not exist
+            # (table, timestamp column) — some tables are created lazily.
             _purge_ops = [
-                ('packet_stream',
-                 'DELETE FROM packet_stream WHERE timestamp < ?',
-                 None),
-                ('message_stats',
-                 'DELETE FROM message_stats WHERE timestamp < ?',
-                 None),
-                ('complete_contact_tracking',
-                 'DELETE FROM complete_contact_tracking WHERE last_heard < ?',
-                 None),
-                ('purging_log',
-                 'DELETE FROM purging_log WHERE timestamp < ?',
-                 None),
-                ('mesh_connections',
-                 'DELETE FROM mesh_connections WHERE last_seen < ?',
-                 None),
-                ('daily_stats',
-                 'DELETE FROM daily_stats WHERE date < ?',
-                 None),
+                ('packet_stream', 'timestamp'),
+                ('message_stats', 'timestamp'),
+                ('complete_contact_tracking', 'last_heard'),
+                ('purging_log', 'timestamp'),
+                ('mesh_connections', 'last_seen'),
+                ('daily_stats', 'date'),
             ]
-            _PURGEABLE = {t for t, _, _ in _purge_ops}
+            _PURGEABLE = {table for table, _ in _purge_ops}
             try:
                 data = request.get_json(silent=True) or {}
                 raw = data.get('keep_days', 'all')
@@ -2087,24 +2322,30 @@ class BotDataViewer:
                 }
 
                 if tables_filter is None:
-                    ops_to_run = [(t, sql, _params_for[t]) for t, sql, _ in _purge_ops]
+                    ops_to_run = [
+                        (table, column, _params_for[table][0])
+                        for table, column in _purge_ops
+                    ]
                 else:
                     want = set(tables_filter)
                     ops_to_run = [
-                        (t, sql, _params_for[t])
-                        for t, sql, _ in _purge_ops
-                        if t in want
+                        (table, column, _params_for[table][0])
+                        for table, column in _purge_ops
+                        if table in want
                     ]
 
-                with self.db_manager.connection() as conn:
-                    cur = conn.cursor()
-                    for tbl, sql, params in ops_to_run:
-                        try:
-                            cur.execute(sql, params)
-                            deleted[tbl] = cur.rowcount
-                        except Exception:
-                            deleted[tbl] = 0
-                    conn.commit()
+                for table, column, cutoff in ops_to_run:
+                    try:
+                        deleted[table] = (
+                            self.db_manager.delete_timestamp_rows_in_chunks(
+                                table,
+                                column,
+                                cutoff,
+                                progress_label=f'manual {table.replace("_", " ")} purge',
+                            )
+                        )
+                    except Exception:
+                        deleted[table] = 0
 
                 total = sum(deleted.values())
                 self.logger.info(
@@ -2295,7 +2536,13 @@ class BotDataViewer:
 
         @self.app.route('/api/stats')
         def api_stats():
-            """Get comprehensive database statistics for dashboard"""
+            """Deprecated: whole-database statistics in one payload.
+
+            Superseded by /api/dashboard/summary (snapshot-backed) and
+            /api/dashboard/top (one narrow query per leaderboard).  Retained
+            with every key name intact for external consumers, and scheduled for
+            removal at the next major version.
+            """
             try:
                 # Get optional time window parameters for analytics
                 top_users_window = request.args.get('top_users_window', 'all')
@@ -2308,12 +2555,123 @@ class BotDataViewer:
                     top_paths_window=top_paths_window,
                     top_channels_window=top_channels_window
                 )
-                return jsonify(stats)
+                stats['deprecated'] = True
+                response = jsonify(stats)
+                response.headers['Deprecation'] = 'true'
+                response.headers['Sunset'] = STATS_ENDPOINT_SUNSET
+                response.headers['Link'] = '</api/dashboard/summary>; rel="successor-version"'
+                return response
             except Exception as e:
                 self.logger.error(f"Error getting stats: {e}")
                 return jsonify({'error': str(e)}), 500
 
 
+
+        @self.app.route('/api/dashboard/summary')
+        def api_dashboard_summary():
+            """Snapshot-backed dashboard payload — one row read, no aggregation.
+
+            Sparkline series are folded in so first paint costs two requests
+            (/api/health plus this) instead of the six the old page made.
+            """
+            try:
+                with self._with_db_connection() as conn:
+                    payload = self.dashboard_stats.read_summary(conn)
+                if payload is None:
+                    # No snapshot yet: the refresher runs a couple of seconds
+                    # after startup, so tell the client to retry rather than
+                    # recomputing everything on the request path.
+                    response = jsonify({
+                        'error': 'Dashboard snapshot not generated yet',
+                        'pending': True,
+                    })
+                    response.status_code = 503
+                    response.headers['Retry-After'] = '5'
+                    return response
+
+                # ETags.contains() wants the bare tag; the quotes belong only in
+                # the header itself.
+                tag = str(payload['generated_at'])
+                if request.if_none_match.contains(tag):
+                    response = self.app.response_class(status=304)
+                else:
+                    response = jsonify(payload)
+                response.headers['ETag'] = f'"{tag}"'
+                response.headers['Cache-Control'] = 'private, max-age=15'
+                return response
+            except Exception as e:
+                self.logger.error(f"Error reading dashboard summary: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/dashboard/series')
+        def api_dashboard_series():
+            """Full-history points for one metric, for the expand-chart interaction."""
+            metric = request.args.get('metric', 'messages')
+            if metric not in SERIES_METRICS:
+                return jsonify({'error': f'Unknown metric: {metric}'}), 400
+            try:
+                days = int(request.args.get('days', 30))
+            except (TypeError, ValueError):
+                days = 30
+            try:
+                with self._with_db_connection() as conn:
+                    payload = self.dashboard_stats.read_series(conn, metric, days)
+                tag = f'{metric}:{days}:{payload.pop("etag_source", None)}'
+                if request.if_none_match.contains(tag):
+                    response = self.app.response_class(status=304)
+                else:
+                    response = jsonify(payload)
+                response.headers['ETag'] = f'"{tag}"'
+                response.headers['Cache-Control'] = 'private, max-age=300'
+                return response
+            except Exception as e:
+                self.logger.error(f"Error reading dashboard series: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/dashboard/top')
+        def api_dashboard_top():
+            """One leaderboard, one narrow query — replaces four whole-payload reads."""
+            kind = request.args.get('kind', 'users')
+            if kind not in TOP_KINDS:
+                return jsonify({'error': f'Unknown kind: {kind}'}), 400
+            window = request.args.get('window', 'all')
+            if window not in ('24h', '7d', '30d', '90d', 'all'):
+                window = 'all'
+            try:
+                limit = int(request.args.get('limit', 15))
+            except (TypeError, ValueError):
+                limit = 15
+            try:
+                with self._with_db_connection() as conn:
+                    payload = self.dashboard_stats.read_top(conn, kind, window, limit)
+                response = jsonify(payload)
+                response.headers['Cache-Control'] = 'private, max-age=30'
+                return response
+            except Exception as e:
+                self.logger.error(f"Error reading dashboard top {kind}: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/dashboard/windows')
+        def api_dashboard_windows():
+            """Selector options derived from retention, so no label overclaims."""
+            try:
+                response = jsonify(self.dashboard_stats.derive_windows())
+                response.headers['Cache-Control'] = 'private, max-age=300'
+                return response
+            except Exception as e:
+                self.logger.error(f"Error deriving dashboard windows: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/dashboard/refresh', methods=['POST'])
+        def api_dashboard_refresh():
+            """Force a snapshot refresh. Used by the health strip's manual control."""
+            try:
+                with closing(self._dashboard_connection()) as conn:
+                    result = self.dashboard_stats.refresh(conn)
+                return jsonify({'success': True, **result})
+            except Exception as e:
+                self.logger.error(f"Error refreshing dashboard snapshot: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/stats/rate_limiters')
         def api_rate_limiter_stats():
@@ -2363,15 +2721,79 @@ class BotDataViewer:
 
         @self.app.route('/api/contacts')
         def api_contacts():
-            """Get contact data. Optional query param: since=24h|7d|30d|90d|all (default 30d)."""
+            """Get filtered contact data, optionally paginated for the interactive list."""
             try:
                 since = request.args.get('since', '30d')
                 if since not in ('24h', '7d', '30d', '90d', 'all'):
                     since = '30d'
-                contacts = self._get_tracking_data(since=since)
+                paginate = 'page' in request.args or 'page_size' in request.args
+                page = None
+                page_size = None
+                if paginate:
+                    try:
+                        page = max(1, int(request.args.get('page', '1')))
+                    except (TypeError, ValueError):
+                        page = 1
+                    try:
+                        page_size = max(1, min(200, int(request.args.get('page_size', '100'))))
+                    except (TypeError, ValueError):
+                        page_size = 100
+                search = request.args.get('search', '').strip()[:100]
+                path_bytes = request.args.get('path_bytes', '').strip()
+                device_role = request.args.get('device_role', '').strip()
+                hop_filter = request.args.get('hop_filter', '').strip()
+                location_filter = request.args.get('location_filter', '').strip()
+                starred = request.args.get('starred', '').strip()
+                sort = request.args.get('sort', 'last_seen')
+                direction = request.args.get('direction', 'desc').lower()
+                contacts = self._get_tracking_data(
+                    since=since,
+                    page=page,
+                    page_size=page_size,
+                    search=search,
+                    path_bytes=path_bytes,
+                    device_role=device_role,
+                    hop_filter=hop_filter,
+                    location_filter=location_filter,
+                    starred=starred,
+                    sort=sort,
+                    direction=direction,
+                )
                 return jsonify(contacts)
             except Exception as e:
                 self.logger.error(f"Error getting contacts: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/contact-detail')
+        def api_contact_detail():
+            """On-demand per-contact detail (recent advert paths + advertisement data) for the
+            contacts UI modals. These are intentionally excluded from the /api/contacts list
+            payload. Query param: user_id (the contact's public key)."""
+            try:
+                public_key = request.args.get('user_id', '').strip()
+                if not public_key:
+                    return jsonify({'error': 'user_id is required'}), 400
+                return jsonify(self._get_contact_detail(public_key))
+            except Exception as e:
+                self.logger.error(f"Error getting contact detail: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/multibyte-rollout')
+        def api_multibyte_rollout():
+            """Multibyte hash rollout analytics. since=24h|7d|30d|90d|all, node_type=all|repeater|roomserver."""
+            if not self.multibyte_monitor_enabled:
+                return abort(404)
+            try:
+                since = request.args.get('since', '30d')
+                if since not in ('24h', '7d', '30d', '90d', 'all'):
+                    since = '30d'
+                node_type = request.args.get('node_type', 'all')
+                if node_type not in ('all', 'repeater', 'roomserver'):
+                    node_type = 'all'
+                data = self._get_multibyte_rollout_data(since=since, node_type=node_type)
+                return jsonify(data)
+            except Exception as e:
+                self.logger.error(f"Error getting multibyte rollout data: {e}")
                 return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/cache')
@@ -2410,6 +2832,7 @@ class BotDataViewer:
             conn = None
             try:
                 prefix_hex_chars = request.args.get('prefix_hex_chars', type=int)
+                days = request.args.get('days', type=int)
                 if prefix_hex_chars not in (2, 4, 6):
                     prefix_hex_chars = self.config.getint('Bot', 'prefix_bytes', fallback=1) * 2
                 if prefix_hex_chars <= 0:
@@ -2434,10 +2857,17 @@ class BotDataViewer:
                     AND longitude IS NOT NULL
                     AND latitude != 0
                     AND longitude != 0
-                    ORDER BY name
                 '''
+                params = []
+                if days is not None:
+                    query += '''
+                    AND COALESCE(NULLIF(last_heard, ''), last_advert_timestamp)
+                        >= datetime("now", "-" || ? || " days")
+                    '''
+                    params.append(days)
+                query += ' ORDER BY name'
 
-                cursor.execute(query)
+                cursor.execute(query, params)
                 rows = cursor.fetchall()
 
                 nodes = []
@@ -2464,7 +2894,16 @@ class BotDataViewer:
 
         @self.app.route('/api/mesh/edges')
         def api_mesh_edges():
-            """Get all graph edges with metadata"""
+            """Get all graph edges with metadata.
+
+            evidence=multibyte derives edges purely from unique multi-byte path
+            observations (observed_paths, bytes_per_hop >= 2), bypassing the
+            mesh_connections merge heuristics that single-byte evidence feeds into.
+
+            evidence=neighbors derives edges purely from confirmed zero-hop
+            discovery (neighbor_links) — full public keys on both ends plus a
+            measured SNR, the strongest evidence class available.
+            """
             conn = None
             try:
                 # Get optional query parameters
@@ -2472,9 +2911,61 @@ class BotDataViewer:
                 days = request.args.get('days', type=int)
                 min_distance = request.args.get('min_distance', type=float)
                 max_distance = request.args.get('max_distance', type=float)
+                evidence = request.args.get('evidence', 'all')
+                force_refresh = request.args.get('refresh') == '1'
+
+                if evidence == 'multibyte':
+                    edges, prefix_hex_chars = self._derive_multibyte_evidence_graph(
+                        days=days,
+                        min_observations=min_observations,
+                        force_refresh=force_refresh,
+                    )
+                    return jsonify({
+                        'edges': edges,
+                        'prefix_hex_chars': prefix_hex_chars,
+                        'evidence': 'multibyte',
+                    })
+
+                if evidence == 'neighbors':
+                    edges, prefix_hex_chars = self._derive_neighbor_evidence_graph(
+                        days=days,
+                        min_observations=min_observations,
+                    )
+                    return jsonify({
+                        'edges': edges,
+                        'prefix_hex_chars': prefix_hex_chars,
+                        'evidence': 'neighbors',
+                    })
+
+                # Combined view: mesh_connections cannot record *why* an edge
+                # exists, so re-derive the strongest label from neighbor_links.
+                # Same window as the edges themselves, so stale evidence cannot
+                # claim a recent edge is a current direct neighbor.
+                neighbor_keys = self._neighbor_evidence_edge_keys(days=days)
 
                 conn = self._get_db_connection()
                 cursor = conn.cursor()
+
+                # Edge windows control visibility, but node identity must retain
+                # the lifetime graph's prefix resolution. Otherwise an older
+                # multi-byte edge disappearing from the window can collapse
+                # distinct nodes onto one shorter prefix in the browser.
+                cursor.execute(
+                    '''
+                    SELECT COALESCE(
+                        MAX(
+                            CASE
+                                WHEN LENGTH(from_prefix) > LENGTH(to_prefix)
+                                THEN LENGTH(from_prefix)
+                                ELSE LENGTH(to_prefix)
+                            END
+                        ),
+                        2
+                    ) AS prefix_hex_chars
+                    FROM mesh_connections
+                    '''
+                )
+                prefix_hex_chars = cursor.fetchone()['prefix_hex_chars']
 
                 query = '''
                     SELECT
@@ -2514,20 +3005,38 @@ class BotDataViewer:
                 rows = cursor.fetchall()
 
                 edges = []
-                prefix_hex_chars = 2  # default 1 byte
                 for row in rows:
                     fp, tp = row['from_prefix'], row['to_prefix']
                     prefix_hex_chars = max(prefix_hex_chars, len(fp) if fp else 0, len(tp) if tp else 0)
+                    # Edges keyed at 4+ hex chars were necessarily created (or promoted)
+                    # by a multi-byte path observation; 2-char keys carry only ambiguous
+                    # single-byte evidence.
+                    is_multibyte = bool(fp) and bool(tp) and len(fp) >= 4 and len(tp) >= 4
+                    from_lower = fp.lower() if fp else ''
+                    to_lower = tp.lower() if tp else ''
+                    from_key = (row['from_public_key'] or '').lower()
+                    to_key = (row['to_public_key'] or '').lower()
+                    if (
+                        (from_lower, to_lower) in neighbor_keys.prefixes
+                        or (from_key and to_key
+                            and (from_key, to_key) in neighbor_keys.public_keys)
+                    ):
+                        edge_evidence = 'neighbors'
+                    elif is_multibyte:
+                        edge_evidence = 'multibyte'
+                    else:
+                        edge_evidence = 'singlebyte'
                     edges.append({
-                        'from_prefix': fp.lower() if fp else '',
-                        'to_prefix': tp.lower() if tp else '',
+                        'from_prefix': from_lower,
+                        'to_prefix': to_lower,
                         'from_public_key': row['from_public_key'],
                         'to_public_key': row['to_public_key'],
                         'observation_count': row['observation_count'],
                         'first_seen': row['first_seen'],
                         'last_seen': row['last_seen'],
                         'avg_hop_position': row['avg_hop_position'],
-                        'geographic_distance': row['geographic_distance']
+                        'geographic_distance': row['geographic_distance'],
+                        'evidence': edge_evidence
                     })
 
                 return jsonify({'edges': edges, 'prefix_hex_chars': prefix_hex_chars or 2})
@@ -2569,7 +3078,9 @@ class BotDataViewer:
                         MAX(geographic_distance) as max_distance,
                         COUNT(CASE WHEN from_public_key IS NOT NULL THEN 1 END) as edges_with_from_key,
                         COUNT(CASE WHEN to_public_key IS NOT NULL THEN 1 END) as edges_with_to_key,
-                        COUNT(CASE WHEN from_public_key IS NOT NULL AND to_public_key IS NOT NULL THEN 1 END) as edges_with_both_keys
+                        COUNT(CASE WHEN from_public_key IS NOT NULL AND to_public_key IS NOT NULL THEN 1 END) as edges_with_both_keys,
+                        COUNT(CASE WHEN LENGTH(from_prefix) >= 4 AND LENGTH(to_prefix) >= 4 THEN 1 END) as multibyte_edges,
+                        COUNT(CASE WHEN last_seen >= datetime("now", "-1 days") THEN 1 END) as recent_edges_24h
                     FROM mesh_connections
                 ''')
                 edge_stats = cursor.fetchone()
@@ -2577,32 +3088,25 @@ class BotDataViewer:
                 # Get most connected nodes
                 cursor.execute('''
                     SELECT
-                        from_prefix as prefix,
-                        COUNT(*) as connection_count
-                    FROM mesh_connections
-                    GROUP BY from_prefix
-                    UNION ALL
-                    SELECT
-                        to_prefix as prefix,
-                        COUNT(*) as connection_count
-                    FROM mesh_connections
-                    GROUP BY to_prefix
+                        LOWER(prefix) AS prefix,
+                        SUM(connection_count) AS connection_count
+                    FROM (
+                        SELECT from_prefix AS prefix, COUNT(*) AS connection_count
+                        FROM mesh_connections
+                        GROUP BY from_prefix
+                        UNION ALL
+                        SELECT to_prefix AS prefix, COUNT(*) AS connection_count
+                        FROM mesh_connections
+                        GROUP BY to_prefix
+                    )
+                    GROUP BY LOWER(prefix)
+                    ORDER BY connection_count DESC, prefix
+                    LIMIT 10
                 ''')
-                connection_counts = {}
-                for row in cursor.fetchall():
-                    prefix = row['prefix'].lower()
-                    connection_counts[prefix] = connection_counts.get(prefix, 0) + row['connection_count']
-
-                # Get top 10 most connected
-                top_connected = sorted(connection_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-
-                # Get recent edges count (last 24 hours)
-                cursor.execute('''
-                    SELECT COUNT(*) as count
-                    FROM mesh_connections
-                    WHERE last_seen >= datetime("now", "-1 days")
-                ''')
-                recent_edges = cursor.fetchone()['count']
+                top_connected = [
+                    (row['prefix'], row['connection_count'])
+                    for row in cursor.fetchall()
+                ]
 
                 stats = {
                     'node_count': node_count,
@@ -2615,9 +3119,17 @@ class BotDataViewer:
                     'edges_with_from_key': edge_stats['edges_with_from_key'] or 0,
                     'edges_with_to_key': edge_stats['edges_with_to_key'] or 0,
                     'edges_with_both_keys': edge_stats['edges_with_both_keys'] or 0,
+                    'multibyte_edges': edge_stats['multibyte_edges'] or 0,
                     'top_connected': [{'prefix': prefix, 'count': count} for prefix, count in top_connected],
-                    'recent_edges_24h': recent_edges
+                    'recent_edges_24h': edge_stats['recent_edges_24h'] or 0
                 }
+
+                # Bot's own position (config [Bot] bot_latitude/bot_longitude), used by
+                # the mesh page to frame the initial map view on the home mesh
+                bot_lat = self.config.getfloat('Bot', 'bot_latitude', fallback=None)
+                bot_lon = self.config.getfloat('Bot', 'bot_longitude', fallback=None)
+                if bot_lat is not None and bot_lon is not None:
+                    stats['bot_location'] = {'latitude': bot_lat, 'longitude': bot_lon}
 
                 return jsonify(stats)
             except Exception as e:
@@ -2737,7 +3249,7 @@ class BotDataViewer:
             if since not in ('24h', '7d', '30d', '90d', 'all'):
                 since = '30d'
             try:
-                result = self._get_tracking_data(since=since)
+                result = self._get_tracking_data(since=since, include_detail=True)
                 contacts = result.get('tracking_data', [])
                 if fmt == 'csv':
                     fields = [
@@ -2782,7 +3294,7 @@ class BotDataViewer:
             try:
                 days_map = {'24h': 1, '7d': 7, '30d': 30, '90d': 90}
                 where = (
-                    f" AND op.last_seen >= datetime('now', '-{days_map[since]} days')"
+                    f" AND op.last_seen >= datetime('now', 'localtime', '-{days_map[since]} days')"
                     if since != 'all' else ''
                 )
                 with closing(sqlite3.connect(self.db_path, timeout=60)) as conn:
@@ -2868,8 +3380,13 @@ class BotDataViewer:
                 current_country = contact['country']
                 self.logger.debug(f"Current location data - city: {current_city}, state: {current_state}, country: {current_country}")
 
+                # Outside the try below: a failure to build the manager is a
+                # setup problem, not a geocoding one, and must not be reported
+                # to the user as "Geocoding exception".
+                repeater_manager = self._get_repeater_manager()
+
                 try:
-                    location_info = self.repeater_manager._get_full_location_from_coordinates(lat, lon)
+                    location_info = repeater_manager._get_full_location_from_coordinates(lat, lon)
                     self.logger.debug(f"Geocoding result for {name}: {location_info}")
                 except Exception as geocode_error:
                     self.logger.error(f"Exception during geocoding for {name} at {lat}, {lon}: {geocode_error}", exc_info=True)
@@ -3094,12 +3611,12 @@ class BotDataViewer:
                 cursor = conn.cursor()
                 cursor.execute('''
                     SELECT COUNT(*) AS cnt FROM complete_contact_tracking
-                    WHERE last_heard < datetime('now', ? || ' days')
+                    WHERE last_heard < datetime('now', 'localtime', ? || ' days')
                 ''', (f'-{days}',))
                 count = cursor.fetchone()['cnt']
                 cursor.execute('''
                     SELECT name, role, last_heard FROM complete_contact_tracking
-                    WHERE last_heard < datetime('now', ? || ' days')
+                    WHERE last_heard < datetime('now', 'localtime', ? || ' days')
                     ORDER BY last_heard ASC
                     LIMIT 5
                 ''', (f'-{days}',))
@@ -3131,7 +3648,7 @@ class BotDataViewer:
                 # Collect public_keys to purge so we can cascade
                 cursor.execute('''
                     SELECT public_key FROM complete_contact_tracking
-                    WHERE last_heard < datetime('now', ?)
+                    WHERE last_heard < datetime('now', 'localtime', ?)
                 ''', (cutoff,))
                 keys = [r['public_key'] for r in cursor.fetchall()]
                 if not keys:
@@ -3624,6 +4141,26 @@ class BotDataViewer:
                 self.logger.error(f"Error getting feed errors: {e}")
                 return jsonify({'error': str(e)}), 500
 
+        @self.app.route('/api/feeds/errors/reset', methods=['POST'])
+        def api_reset_all_feed_errors():
+            """Clear recorded errors for every feed"""
+            try:
+                deleted = self._reset_feed_errors()
+                return jsonify({'success': True, 'deleted': deleted})
+            except Exception as e:
+                self.logger.error(f"Error resetting feed errors: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/feeds/<int:feed_id>/errors/reset', methods=['POST'])
+        def api_reset_feed_errors(feed_id):
+            """Clear recorded errors for a single feed"""
+            try:
+                deleted = self._reset_feed_errors(feed_id)
+                return jsonify({'success': True, 'deleted': deleted})
+            except Exception as e:
+                self.logger.error(f"Error resetting feed errors: {e}")
+                return jsonify({'error': str(e)}), 500
+
         @self.app.route('/api/feeds/<int:feed_id>/refresh', methods=['POST'])
         def api_refresh_feed(feed_id):
             """Manually trigger a feed check"""
@@ -3733,7 +4270,7 @@ class BotDataViewer:
                 conn = self._get_db_connection()
                 cursor = conn.cursor()
                 cursor.execute('''
-                    SELECT status, error_message, result_data, processed_at
+                    SELECT status, error_message, result_data, processed_at, claimed_at
                     FROM channel_operations
                     WHERE id = ?
                 ''', (operation_id,))
@@ -3743,12 +4280,13 @@ class BotDataViewer:
                 if not result:
                     return jsonify({'error': 'Operation not found'}), 404
 
-                status, error_msg, result_data, processed_at = result
+                status, error_msg, result_data, processed_at, claimed_at = result
 
                 return jsonify({
                     'operation_id': operation_id,
                     'status': status,
                     'error_message': error_msg,
+                    'claimed_at': claimed_at,
                     'processed_at': processed_at,
                     'result_data': json.loads(result_data) if result_data else None
                 })
@@ -3864,7 +4402,7 @@ class BotDataViewer:
 
         @self.app.route('/api/radio/firmware/config/read', methods=['POST'])
         def api_firmware_config_read():
-            """Queue a firmware config read (path.hash.mode + custom vars). Poll /api/channel-operations/<id>."""
+            """Queue a firmware config read (path hash mode). Poll /api/channel-operations/<id>."""
             try:
                 with self.db_manager.connection() as conn:
                     cursor = conn.cursor()
@@ -3880,14 +4418,19 @@ class BotDataViewer:
 
         @self.app.route('/api/radio/firmware/config/write', methods=['POST'])
         def api_firmware_config_write():
-            """Queue a firmware config write. Body: {path_hash_mode?: int, loop_detect?: str}.
+            """Queue a firmware config write. Body: {path_hash_mode: int}.
             Poll /api/channel-operations/<id> for result."""
             try:
                 data = request.get_json(silent=True) or {}
-                allowed = {'path_hash_mode', 'loop_detect'}
+                allowed = {'path_hash_mode'}
                 payload = {k: v for k, v in data.items() if k in allowed}
                 if not payload:
-                    return jsonify({'error': 'No valid fields provided (path_hash_mode, loop_detect)'}), 400
+                    return jsonify({'error': 'No valid fields provided (path_hash_mode)'}), 400
+                if 'path_hash_mode' in payload:
+                    mode = int(payload['path_hash_mode'])
+                    if not (0 <= mode <= 2):
+                        return jsonify({'error': 'path_hash_mode must be 0-2 (bytes per hop = mode + 1)'}), 400
+                    payload['path_hash_mode'] = mode
                 with self.db_manager.connection() as conn:
                     cursor = conn.cursor()
                     cursor.execute(
@@ -3919,14 +4462,24 @@ class BotDataViewer:
 
         @self.app.route('/api/radio/params', methods=['POST'])
         def api_radio_params_write():
-            """Queue a radio parameter write. Body: {freq, bw, sf, cr, tx_power}.
+            """Queue a radio/node parameter write. Body may mix: freq/bw/sf/cr
+            (together), tx_power, name, lat/lon (together), adv_loc_policy,
+            multi_acks, telemetry_mode_base/loc/env, and rx_delay/airtime_factor
+            (together). manual_add_contacts is deliberately not writable here —
+            it is owned by [Bot] auto_manage_contacts in config.ini.
             Poll /api/channel-operations/<id> for result."""
             try:
                 data = request.get_json(silent=True) or {}
-                allowed = {'freq', 'bw', 'sf', 'cr', 'tx_power'}
+                allowed = {
+                    'freq', 'bw', 'sf', 'cr', 'tx_power',
+                    'name', 'lat', 'lon', 'adv_loc_policy',
+                    'multi_acks',
+                    'telemetry_mode_base', 'telemetry_mode_loc', 'telemetry_mode_env',
+                    'rx_delay', 'airtime_factor',
+                }
                 payload = {k: v for k, v in data.items() if k in allowed}
                 if not payload:
-                    return jsonify({'error': 'No valid fields (freq, bw, sf, cr, tx_power)'}), 400
+                    return jsonify({'error': f"No valid fields (expected one of: {', '.join(sorted(allowed))})"}), 400
 
                 if 'freq' in payload:
                     freq = float(payload['freq'])
@@ -3953,6 +4506,49 @@ class BotDataViewer:
                     if not (1 <= tx <= 30):
                         return jsonify({'error': 'tx_power must be 1–30 dBm'}), 400
                     payload['tx_power'] = tx
+                if 'name' in payload:
+                    name = str(payload['name']).strip()
+                    if not name or len(name.encode('utf-8')) > 32:
+                        return jsonify({'error': 'name must be 1–32 bytes'}), 400
+                    payload['name'] = name
+                if ('lat' in payload) != ('lon' in payload):
+                    return jsonify({'error': 'lat and lon must be provided together'}), 400
+                if 'lat' in payload:
+                    lat = float(payload['lat'])
+                    lon = float(payload['lon'])
+                    if not (-90.0 <= lat <= 90.0):
+                        return jsonify({'error': 'lat must be -90 to 90'}), 400
+                    if not (-180.0 <= lon <= 180.0):
+                        return jsonify({'error': 'lon must be -180 to 180'}), 400
+                    payload['lat'] = lat
+                    payload['lon'] = lon
+                if 'adv_loc_policy' in payload:
+                    policy = int(payload['adv_loc_policy'])
+                    if policy not in (0, 1):
+                        return jsonify({'error': 'adv_loc_policy must be 0 (private) or 1 (share)'}), 400
+                    payload['adv_loc_policy'] = policy
+                if 'multi_acks' in payload:
+                    acks = int(payload['multi_acks'])
+                    if not (0 <= acks <= 3):
+                        return jsonify({'error': 'multi_acks must be 0–3'}), 400
+                    payload['multi_acks'] = acks
+                for telem_key in ('telemetry_mode_base', 'telemetry_mode_loc', 'telemetry_mode_env'):
+                    if telem_key in payload:
+                        mode = int(payload[telem_key])
+                        if not (0 <= mode <= 2):
+                            return jsonify({'error': f'{telem_key} must be 0 (deny), 1 (per-contact), or 2 (allow all)'}), 400
+                        payload[telem_key] = mode
+                if ('rx_delay' in payload) != ('airtime_factor' in payload):
+                    return jsonify({'error': 'rx_delay and airtime_factor must be provided together'}), 400
+                if 'rx_delay' in payload:
+                    rx_delay = float(payload['rx_delay'])
+                    airtime_factor = float(payload['airtime_factor'])
+                    if not (0.0 <= rx_delay <= 20.0):
+                        return jsonify({'error': 'rx_delay must be 0–20 seconds'}), 400
+                    if not (0.0 <= airtime_factor <= 9.0):
+                        return jsonify({'error': 'airtime_factor must be 0–9'}), 400
+                    payload['rx_delay'] = rx_delay
+                    payload['airtime_factor'] = airtime_factor
 
                 radio_fields = {'freq', 'bw', 'sf', 'cr'}
                 if radio_fields & set(payload) and not radio_fields <= set(payload):
@@ -3969,6 +4565,28 @@ class BotDataViewer:
                 return jsonify({'success': True, 'operation_id': op_id})
             except Exception as e:
                 self.logger.error(f"Error queuing radio params write: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/radio/advert', methods=['POST'])
+        def api_radio_advert():
+            """Queue a self-advertisement. Body: {flood: bool} (default false =
+            zero-hop). Poll /api/channel-operations/<id> for result."""
+            try:
+                data = request.get_json(silent=True) or {}
+                flood = data.get('flood', False)
+                if not isinstance(flood, bool):
+                    return jsonify({'error': 'flood must be true or false'}), 400
+                with self.db_manager.connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "INSERT INTO channel_operations (operation_type, payload_data, status) VALUES ('radio_advert', ?, 'pending')",
+                        (json.dumps({'flood': flood}),)
+                    )
+                    conn.commit()
+                    op_id = cursor.lastrowid
+                return jsonify({'success': True, 'operation_id': op_id})
+            except Exception as e:
+                self.logger.error(f"Error queuing radio advert: {e}")
                 return jsonify({'error': str(e)}), 500
 
     def _setup_socketio_handlers(self):
@@ -4352,6 +4970,21 @@ class BotDataViewer:
                     import sqlite3
                     import time
 
+                    # Subscription handlers replay recent history themselves.
+                    # With no live command/packet/message subscribers there is
+                    # nothing to broadcast, so avoid opening SQLite and decoding
+                    # every packet-stream row merely to discard it.
+                    if not self._has_live_stream_subscribers():
+                        last_timestamp = time.time()
+                        # An idle period is not a failure. Without this, an
+                        # error burst before the last subscriber left would
+                        # still be counted against the first poll after the
+                        # next one arrives, mis-escalating its log level and
+                        # backoff.
+                        consecutive_errors = 0
+                        time.sleep(2.0)
+                        continue
+
                     # Check if database file exists and is accessible
                     db_file = Path(self.db_path)
                     if not db_file.exists():
@@ -4470,6 +5103,170 @@ class BotDataViewer:
         polling_thread.start()
         self.logger.info("Database polling started")
 
+    def _has_live_stream_subscribers(self) -> bool:
+        """Return whether any client consumes a DB-backed live stream."""
+        subscription_keys = (
+            'subscribed_commands',
+            'subscribed_packets',
+            'subscribed_messages',
+        )
+        with self._clients_lock:
+            return any(
+                any(client.get(key, False) for key in subscription_keys)
+                for client in self.connected_clients.values()
+            )
+
+    def _config_int(self, section: str, option: str, fallback: int) -> int:
+        """Read an int config value, falling back on a missing or malformed entry."""
+        try:
+            return self.config.getint(section, option, fallback=fallback)
+        except (configparser.Error, ValueError, TypeError):
+            return fallback
+
+    def _init_dashboard_service(self):
+        """Build the dashboard rollup/snapshot service from config."""
+        try:
+            self.dashboard_snapshot_enabled = self.config.getboolean(
+                'Web_Viewer', 'dashboard_snapshot_enabled', fallback=True
+            )
+        except (configparser.Error, ValueError, TypeError):
+            self.dashboard_snapshot_enabled = True
+
+        self.dashboard_snapshot_interval = max(
+            15, self._config_int('Web_Viewer', 'dashboard_snapshot_interval_seconds', 60)
+        )
+        self.dashboard_stats = DashboardStatsService(
+            self.logger,
+            history_days=self._config_int('Web_Viewer', 'dashboard_snapshot_history_days', 400),
+            packet_backfill_rows=self._config_int('Web_Viewer', 'dashboard_packet_backfill_rows', 2000),
+            interval_seconds=self.dashboard_snapshot_interval,
+            # Retention drives which window labels the UI is allowed to offer,
+            # so read the same keys the cleanup jobs enforce.
+            stats_retention_days=self._config_int('Stats_Command', 'data_retention_days', 7),
+            packet_retention_days=self._config_int('Data_Retention', 'packet_stream_retention_days', 3),
+            adverts_retention_days=self._config_int('Data_Retention', 'daily_stats_retention_days', 90),
+            multibyte_contacts_fn=self._count_contacts_7d_multibyte,
+        )
+
+    def _count_contacts_7d_multibyte(self, cursor) -> tuple[int, int] | None:
+        """(multibyte, total) contacts heard in the last 7 days, or None if unavailable.
+
+        Injected into DashboardStatsService so the snapshot reuses the viewer's
+        memoized hop-prefix evidence instead of rebuilding it.
+        """
+        try:
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM complete_contact_tracking
+                WHERE last_heard > datetime('now', 'localtime', '-7 days')
+                """
+            )
+            total = cursor.fetchone()[0] or 0
+        except sqlite3.Error as e:
+            self.logger.debug(f"Could not count 7d contacts: {e}")
+            return None
+
+        chunk_buckets = self._bucket_hop_chunks(
+            self._get_cached_contact_multibyte_hop_chunks(cursor, recent_days=7)
+        )
+        mb_advert_pks: set[str] = set()
+        try:
+            cursor.execute(
+                """
+                SELECT DISTINCT public_key FROM observed_paths
+                WHERE packet_type = 'advert' AND public_key IS NOT NULL
+                AND bytes_per_hop IN (2, 3)
+                AND date(last_seen) >= date('now', 'localtime', '-7 days')
+                """
+            )
+            mb_advert_pks = {row[0] for row in cursor.fetchall() if row[0]}
+        except sqlite3.Error as e:
+            self.logger.debug(f"Could not load 7d multibyte advert keys: {e}")
+
+        try:
+            cursor.execute(
+                """
+                SELECT public_key, role, out_bytes_per_hop
+                FROM complete_contact_tracking
+                WHERE last_heard > datetime('now', 'localtime', '-7 days')
+                """
+            )
+            multibyte = sum(
+                1
+                for row in cursor.fetchall()
+                if self._contact_has_multibyte_path_evidence(
+                    row[0], row[1], row[2], mb_advert_pks, chunk_buckets
+                )
+            )
+        except sqlite3.Error as e:
+            self.logger.debug(f"Could not compute contacts_7d_multibyte_path: {e}")
+            return None
+        return multibyte, total
+
+    def _dashboard_connection(self):
+        """Connection for the refresher: autocommit, so BEGIN IMMEDIATE is ours.
+
+        The reader connections leave transaction control to pysqlite, but the
+        refresher deliberately brackets its own write phase and must not have an
+        implicit transaction opened underneath it.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=60, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        self._configure_db_connection(conn)
+        return conn
+
+    def _start_dashboard_refresher(self):
+        """Recompute the dashboard snapshot on an interval, in this process.
+
+        The refresher lives in the viewer rather than the bot for two reasons:
+        the viewer may point at a different database ([Web_Viewer] db_path), and
+        it already runs migrations itself, so the rollup tables exist in
+        whichever file this process opens.  A bot-side scheduler job would write
+        to the wrong file in a split-DB install and would not run at all for a
+        standalone viewer.
+        """
+        if not self.dashboard_snapshot_enabled:
+            self.logger.info("Dashboard snapshot refresher disabled by config")
+            return
+
+        def refresher():
+            consecutive_errors = 0
+            # Refresh once at startup so the first page load has a snapshot.
+            delay = 2.0
+            while True:
+                time.sleep(delay)
+                delay = self.dashboard_snapshot_interval
+                try:
+                    with closing(self._dashboard_connection()) as conn:
+                        if not self.dashboard_stats.try_claim_lease(conn):
+                            self.logger.debug(
+                                "Another viewer holds the dashboard snapshot lease; skipping tick"
+                            )
+                            continue
+                        result = self.dashboard_stats.refresh(conn)
+                    consecutive_errors = 0
+                    self.logger.debug(
+                        "Dashboard snapshot refreshed in %sms (%s days, %s packet rows backfilled)",
+                        result['duration_ms'],
+                        result['days'],
+                        result['backfilled_packet_rows'],
+                    )
+                except Exception as e:
+                    consecutive_errors += 1
+                    if consecutive_errors == 1:
+                        self.logger.error(f"Dashboard snapshot refresh failed: {e}", exc_info=True)
+                    else:
+                        self.logger.warning(
+                            f"Dashboard snapshot refresh failed ({consecutive_errors}): {e}"
+                        )
+                    delay = min(600, self.dashboard_snapshot_interval * (2 ** min(consecutive_errors, 5)))
+
+        thread = threading.Thread(target=refresher, name="dashboard-snapshot", daemon=True)
+        thread.start()
+        self.logger.info(
+            f"Dashboard snapshot refresher started (every {self.dashboard_snapshot_interval}s)"
+        )
+
     def _start_cleanup_scheduler(self):
         """Start background thread for periodic database cleanup"""
         import threading
@@ -4521,7 +5318,6 @@ class BotDataViewer:
         Uses [Data_Retention] packet_stream_retention_days when days_to_keep is not provided."""
         try:
             import sqlite3
-            import time
 
             if days_to_keep is None:
                 days_to_keep = 3
@@ -4530,38 +5326,22 @@ class BotDataViewer:
                         days_to_keep = self.config.getint('Data_Retention', 'packet_stream_retention_days')
 
             cutoff_time = time.time() - (days_to_keep * 24 * 60 * 60)
-
-            # Use DEFERRED isolation; longer timeout to wait out bot writes
-            with closing(sqlite3.connect(self.db_path, timeout=60, isolation_level='DEFERRED')) as conn:
-                cursor = conn.cursor()
-
-                # Use WAL mode for better concurrent access (if not already set)
-                try:
-                    cursor.execute('PRAGMA journal_mode=WAL')
-                except sqlite3.OperationalError:
-                    pass  # Ignore if database is locked - WAL may already be set
-
-                # Delete in smaller batches to avoid long locks
-                batch_size = 1000
-                total_deleted = 0
-
-                while True:
-                    cursor.execute(
-                        'DELETE FROM packet_stream WHERE id IN '
-                        '(SELECT id FROM packet_stream WHERE timestamp < ? LIMIT ?)',
-                        (cutoff_time, batch_size)
-                    )
-                    deleted_count = cursor.rowcount
-                    conn.commit()
-
-                    if deleted_count == 0:
-                        break
-                    total_deleted += deleted_count
-                    if deleted_count == batch_size:
-                        time.sleep(0.1)
-
-                if total_deleted > 0:
-                    self.logger.info(f"Cleaned up {total_deleted} old packet stream entries (older than {days_to_keep} days)")
+            batch_size, pause_seconds = retention_delete_settings(self.config)
+            total_deleted = delete_timestamp_rows_in_chunks(
+                self._with_db_connection,
+                'packet_stream',
+                'timestamp',
+                cutoff_time,
+                batch_size=batch_size,
+                pause_seconds=pause_seconds,
+                logger=self.logger,
+                progress_label='packet stream',
+            )
+            if total_deleted > 0:
+                self.logger.info(
+                    f"Cleaned up {total_deleted} old packet stream entries "
+                    f"(older than {days_to_keep} days)"
+                )
 
         except sqlite3.OperationalError as e:
             self.logger.warning(f"Database busy during cleanup (will retry next cycle): {e}")
@@ -4599,13 +5379,13 @@ class BotDataViewer:
 
                 cursor.execute("""
                     SELECT COUNT(*) FROM complete_contact_tracking
-                    WHERE last_heard > datetime('now', '-24 hours')
+                    WHERE last_heard > datetime('now', 'localtime', '-24 hours')
                 """)
                 stats['contacts_24h'] = cursor.fetchone()[0]
 
                 cursor.execute("""
                     SELECT COUNT(*) FROM complete_contact_tracking
-                    WHERE last_heard > datetime('now', '-7 days')
+                    WHERE last_heard > datetime('now', 'localtime', '-7 days')
                 """)
                 stats['contacts_7d'] = cursor.fetchone()[0]
 
@@ -4613,12 +5393,14 @@ class BotDataViewer:
                 # the pie chart matches "last 7 days" (lifetime paths + stale out_bytes_per_hop
                 # otherwise inflated the percentage).
                 stats['contacts_7d_multibyte_path'] = 0
-                multibyte_chunks: set[str] = set()
+                chunk_buckets = self._bucket_hop_chunks(set())
                 mb_advert_pks: set[str] = set()
                 if 'observed_paths' in tables:
                     try:
-                        multibyte_chunks = self._collect_multibyte_hop_chunks(
-                            cursor, recent_days=7
+                        chunk_buckets = self._bucket_hop_chunks(
+                            self._get_cached_contact_multibyte_hop_chunks(
+                                cursor, recent_days=7
+                            )
                         )
                         # Use date() — julianday(iso8601) often returns NULL for Python isoformat() strings
                         cursor.execute(
@@ -4626,7 +5408,7 @@ class BotDataViewer:
                             SELECT DISTINCT public_key FROM observed_paths
                             WHERE packet_type = 'advert' AND public_key IS NOT NULL
                             AND bytes_per_hop IN (2, 3)
-                            AND date(last_seen) >= date('now', '-7 days')
+                            AND date(last_seen) >= date('now', 'localtime', '-7 days')
                             """
                         )
                         mb_advert_pks = {
@@ -4639,7 +5421,7 @@ class BotDataViewer:
                         """
                         SELECT public_key, role, out_bytes_per_hop
                         FROM complete_contact_tracking
-                        WHERE last_heard > datetime('now', '-7 days')
+                        WHERE last_heard > datetime('now', 'localtime', '-7 days')
                         """
                     )
                     mb_7d = 0
@@ -4649,7 +5431,7 @@ class BotDataViewer:
                             row["role"],
                             row["out_bytes_per_hop"],
                             mb_advert_pks,
-                            multibyte_chunks,
+                            chunk_buckets,
                         ):
                             mb_7d += 1
                     stats['contacts_7d_multibyte_path'] = mb_7d
@@ -4687,7 +5469,10 @@ class BotDataViewer:
                 """)
                 stats['unique_device_types'] = cursor.fetchone()[0]
 
-            # Incoming packets (packet_stream): multibyte path share, last 7 days (decoded bytes_per_hop)
+            # Incoming packets: multibyte path share over whatever packet_stream
+            # actually retains.  The key names still say 7d for compatibility,
+            # but the window is reported honestly alongside them —
+            # packet_stream is pruned at 3 days, so the old label was never true.
             stats['incoming_packets_7d'] = 0
             stats['incoming_packets_7d_multibyte_path'] = 0
             if 'packet_stream' in tables:
@@ -4695,28 +5480,23 @@ class BotDataViewer:
                     cutoff_ts = time.time() - 7 * 86400
                     cursor.execute(
                         """
-                        SELECT COUNT(*) FROM packet_stream
-                        WHERE type = ? AND timestamp > ?
+                        SELECT COUNT(*),
+                               SUM(CASE WHEN bytes_per_hop IN (2, 3) THEN 1 ELSE 0 END),
+                               MIN(timestamp)
+                        FROM packet_stream
+                        WHERE type = ? AND timestamp > ? AND route_type_name IS NOT NULL
                         """,
                         ("packet", cutoff_ts),
                     )
-                    stats['incoming_packets_7d'] = cursor.fetchone()[0] or 0
-                    mb_pk = 0
-                    try:
-                        cursor.execute(
-                            """
-                            SELECT COUNT(*) FROM packet_stream
-                            WHERE type = ? AND timestamp > ?
-                            AND CAST(json_extract(data, '$.bytes_per_hop') AS INTEGER) IN (2, 3)
-                            """,
-                            ("packet", cutoff_ts),
-                        )
-                        mb_pk = cursor.fetchone()[0] or 0
-                    except sqlite3.OperationalError:
-                        mb_pk = self._count_multibyte_packets_from_stream_json(cursor, cutoff_ts)
-                    stats['incoming_packets_7d_multibyte_path'] = mb_pk
+                    row = cursor.fetchone()
+                    stats['incoming_packets_7d'] = row[0] or 0
+                    stats['incoming_packets_7d_multibyte_path'] = row[1] or 0
+                    stats['incoming_packets_from'] = row[2]
+                    stats['incoming_packets_window_label'] = humanize_span(
+                        time.time() - row[2] if row[2] else None
+                    )
                 except Exception as e:
-                    self.logger.debug(f"Could not compute incoming_packets_7d multibyte stats: {e}")
+                    self.logger.debug(f"Could not compute incoming packet multibyte stats: {e}")
 
             # Advertisement statistics using daily tracking table
             if 'daily_stats' in tables:
@@ -4730,27 +5510,27 @@ class BotDataViewer:
                 # 24h advertisements
                 cursor.execute("""
                     SELECT SUM(advert_count) FROM daily_stats
-                    WHERE date = date('now')
+                    WHERE date = date('now', 'localtime')
                 """)
                 stats['advertisements_24h'] = cursor.fetchone()[0] or 0
 
                 # 7d advertisements (last 7 days, excluding today)
                 cursor.execute("""
                     SELECT SUM(advert_count) FROM daily_stats
-                    WHERE date >= date('now', '-7 days') AND date < date('now')
+                    WHERE date >= date('now', 'localtime', '-7 days') AND date < date('now', 'localtime')
                 """)
                 stats['advertisements_7d'] = cursor.fetchone()[0] or 0
 
                 # Nodes per day statistics
                 cursor.execute("""
                     SELECT COUNT(DISTINCT public_key) FROM daily_stats
-                    WHERE date = date('now')
+                    WHERE date = date('now', 'localtime')
                 """)
                 stats['nodes_24h'] = cursor.fetchone()[0] or 0
 
                 cursor.execute("""
                     SELECT COUNT(DISTINCT public_key) FROM daily_stats
-                    WHERE date >= date('now', '-6 days')
+                    WHERE date >= date('now', 'localtime', '-6 days')
                 """)
                 stats['nodes_7d'] = cursor.fetchone()[0] or 0
 
@@ -4769,13 +5549,13 @@ class BotDataViewer:
 
                     cursor.execute("""
                         SELECT SUM(advert_count) FROM complete_contact_tracking
-                        WHERE last_heard > datetime('now', '-24 hours')
+                        WHERE last_heard > datetime('now', 'localtime', '-24 hours')
                     """)
                     stats['advertisements_24h'] = cursor.fetchone()[0] or 0
 
                     cursor.execute("""
                         SELECT SUM(advert_count) FROM complete_contact_tracking
-                        WHERE last_heard > datetime('now', '-7 days')
+                        WHERE last_heard > datetime('now', 'localtime', '-7 days')
                     """)
                     stats['advertisements_7d'] = cursor.fetchone()[0] or 0
 
@@ -4854,6 +5634,30 @@ class BotDataViewer:
                 """
                 cursor.execute(query)
                 stats['top_users'] = [{'user': row[0], 'count': row[1]} for row in cursor.fetchall()]
+
+                # Top channels by message count - filter by time window
+                if top_channels_window == '24h':
+                    time_filter = "AND timestamp > strftime('%s', 'now', '-24 hours')"
+                elif top_channels_window == '7d':
+                    time_filter = "AND timestamp > strftime('%s', 'now', '-7 days')"
+                elif top_channels_window == '30d':
+                    time_filter = "AND timestamp > strftime('%s', 'now', '-30 days')"
+                else:  # 'all'
+                    time_filter = ""
+
+                query = f"""
+                    SELECT channel, COUNT(*) as message_count, COUNT(DISTINCT sender_id) as unique_users
+                    FROM message_stats
+                    WHERE channel IS NOT NULL {time_filter}
+                    GROUP BY channel
+                    ORDER BY message_count DESC
+                    LIMIT 10
+                """
+                cursor.execute(query)
+                stats['top_channels'] = [
+                    {'channel': row[0], 'messages': row[1], 'users': row[2]}
+                    for row in cursor.fetchall()
+                ]
 
             if 'command_stats' in tables:
                 cursor.execute("SELECT COUNT(*) FROM command_stats")
@@ -4935,30 +5739,6 @@ class BotDataViewer:
                 else:
                     stats['bot_reply_rate_30d'] = 0
 
-                # Top channels by message count - filter by time window
-                if top_channels_window == '24h':
-                    time_filter = "AND timestamp > strftime('%s', 'now', '-24 hours')"
-                elif top_channels_window == '7d':
-                    time_filter = "AND timestamp > strftime('%s', 'now', '-7 days')"
-                elif top_channels_window == '30d':
-                    time_filter = "AND timestamp > strftime('%s', 'now', '-30 days')"
-                else:  # 'all'
-                    time_filter = ""
-
-                query = f"""
-                    SELECT channel, COUNT(*) as message_count, COUNT(DISTINCT sender_id) as unique_users
-                    FROM message_stats
-                    WHERE channel IS NOT NULL {time_filter}
-                    GROUP BY channel
-                    ORDER BY message_count DESC
-                    LIMIT 10
-                """
-                cursor.execute(query)
-                stats['top_channels'] = [
-                    {'channel': row[0], 'messages': row[1], 'users': row[2]}
-                    for row in cursor.fetchall()
-                ]
-
             # Path statistics (if path_stats table exists)
             if 'path_stats' in tables:
                 cursor.execute("""
@@ -5008,14 +5788,14 @@ class BotDataViewer:
             if 'complete_contact_tracking' in tables:
                 cursor.execute("""
                     SELECT AVG(snr) FROM complete_contact_tracking
-                    WHERE snr IS NOT NULL AND last_heard > datetime('now', '-24 hours')
+                    WHERE snr IS NOT NULL AND last_heard > datetime('now', 'localtime', '-24 hours')
                 """)
                 avg_snr = cursor.fetchone()[0]
                 stats['avg_snr_24h'] = round(avg_snr, 1) if avg_snr else 0
 
                 cursor.execute("""
                     SELECT AVG(signal_strength) FROM complete_contact_tracking
-                    WHERE signal_strength IS NOT NULL AND last_heard > datetime('now', '-24 hours')
+                    WHERE signal_strength IS NOT NULL AND last_heard > datetime('now', 'localtime', '-24 hours')
                 """)
                 avg_signal = cursor.fetchone()[0]
                 stats['avg_signal_strength_24h'] = round(avg_signal, 1) if avg_signal else 0
@@ -5032,7 +5812,7 @@ class BotDataViewer:
                         END
                     ) FROM complete_contact_tracking
                     WHERE country IS NOT NULL AND country != ''
-                    AND last_heard > datetime('now', '-30 days')
+                    AND last_heard > datetime('now', 'localtime', '-30 days')
                     AND is_currently_tracked = 1
                 """)
                 stats['countries'] = cursor.fetchone()[0]
@@ -5040,7 +5820,7 @@ class BotDataViewer:
                 cursor.execute("""
                     SELECT COUNT(DISTINCT state) FROM complete_contact_tracking
                     WHERE state IS NOT NULL AND state != ''
-                    AND last_heard > datetime('now', '-30 days')
+                    AND last_heard > datetime('now', 'localtime', '-30 days')
                     AND is_currently_tracked = 1
                 """)
                 stats['states'] = cursor.fetchone()[0]
@@ -5048,7 +5828,7 @@ class BotDataViewer:
                 cursor.execute("""
                     SELECT COUNT(DISTINCT city) FROM complete_contact_tracking
                     WHERE city IS NOT NULL AND city != ''
-                    AND last_heard > datetime('now', '-30 days')
+                    AND last_heard > datetime('now', 'localtime', '-30 days')
                     AND is_currently_tracked = 1
                 """)
                 stats['cities'] = cursor.fetchone()[0]
@@ -5264,38 +6044,6 @@ class BotDataViewer:
                 out.append(seg.lower())
         return out
 
-    def _count_multibyte_packets_from_stream_json(self, cursor, cutoff_ts: float) -> int:
-        """Count packet_stream rows (type=packet) since cutoff with bytes_per_hop in (2, 3). JSON parse fallback."""
-        import json
-
-        n = 0
-        try:
-            cursor.execute(
-                """
-                SELECT data FROM packet_stream
-                WHERE type = ? AND timestamp > ?
-                """,
-                ("packet", cutoff_ts),
-            )
-            for row in cursor.fetchall():
-                raw = row["data"]
-                if not raw:
-                    continue
-                try:
-                    d = json.loads(raw)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                bph = d.get("bytes_per_hop")
-                try:
-                    bph_i = int(bph) if bph is not None else None
-                except (TypeError, ValueError):
-                    bph_i = None
-                if bph_i in (2, 3):
-                    n += 1
-        except Exception as e:
-            self.logger.debug(f"packet_stream JSON scan for multibyte: {e}")
-        return n
-
     def _collect_multibyte_hop_chunks(
         self, cursor, recent_days: int | None = None
     ) -> set[str]:
@@ -5310,11 +6058,14 @@ class BotDataViewer:
             extra = ""
             if recent_days is not None:
                 d = max(1, min(int(recent_days), 366))
-                extra = f" AND date(last_seen) >= date('now', '-{d} days')"
+                extra = f" AND date(last_seen) >= date('now', 'localtime', '-{d} days')"
+            # DISTINCT collapses the many duplicate (path_hex, bytes_per_hop) advert rows in SQL,
+            # so Python only splits each distinct path once instead of every observation.
             cursor.execute(
                 f"""
-                SELECT path_hex, bytes_per_hop FROM observed_paths
-                WHERE bytes_per_hop IN (2, 3) AND path_hex IS NOT NULL AND length(path_hex) > 0
+                SELECT DISTINCT path_hex, bytes_per_hop FROM observed_paths
+                WHERE bytes_per_hop >= 2 AND bytes_per_hop <= 3
+                AND path_hex IS NOT NULL AND length(path_hex) > 0
                 {extra}
                 """
             )
@@ -5332,13 +6083,73 @@ class BotDataViewer:
             self.logger.debug(f"Could not load multibyte hop chunks: {e}")
         return chunks
 
+    def _get_cached_contact_multibyte_hop_chunks(
+        self, cursor, recent_days: int | None = None
+    ) -> set[str]:
+        """Return contact badge evidence without rebuilding it per page request.
+
+        Memoized per ``recent_days`` window: the contacts list wants all-time
+        evidence (None) while the dashboard wants the 7-day set, and both are
+        rebuilt often enough that sharing one slot would thrash the cache.
+        """
+        try:
+            # last_seen changes when an existing path is observed again; count changes on
+            # inserts and retention deletes.  Together they cheaply invalidate the cache while
+            # using the multibyte covering index rather than the wide observed_paths table.
+            cursor.execute(
+                """
+                SELECT MAX(last_seen), COUNT(*) FROM observed_paths
+                WHERE bytes_per_hop >= 2 AND bytes_per_hop <= 3
+                """
+            )
+            signature_row = cursor.fetchone()
+            signature = tuple(signature_row) if signature_row else (None, 0)
+            if recent_days is not None:
+                # A windowed set also changes when the window itself slides, which
+                # leaves the row fingerprint untouched — pin it to the local date.
+                cursor.execute("SELECT date('now', 'localtime')")
+                signature = (*signature, cursor.fetchone()[0])
+        except Exception as e:
+            self.logger.debug(f"Could not fingerprint multibyte hop chunks: {e}")
+            return self._collect_multibyte_hop_chunks(cursor, recent_days=recent_days)
+
+        lock = getattr(self, '_contacts_badge_cache_lock', None)
+        if lock is None:
+            lock = self._contacts_badge_cache_lock = threading.Lock()
+        with lock:
+            cache = getattr(self, '_contacts_badge_cache', None)
+            if cache is None:
+                cache = self._contacts_badge_cache = {}
+            cached = cache.get(recent_days)
+            if cached is not None and cached[0] == signature:
+                return cached[1]
+            chunks = self._collect_multibyte_hop_chunks(cursor, recent_days=recent_days)
+            cache[recent_days] = (signature, chunks)
+            return chunks
+
+    @staticmethod
+    def _bucket_hop_chunks(multibyte_hop_chunks: set[str]) -> dict[int, set[str]]:
+        """Bucket hop-prefix chunks by length (4 or 6) for O(1) prefix matching.
+
+        Build this once per request and reuse across the per-contact badge loop instead of
+        scanning the whole chunk set for every contact.
+        """
+        return {
+            4: {c for c in multibyte_hop_chunks if len(c) == 4},
+            6: {c for c in multibyte_hop_chunks if len(c) == 6},
+        }
+
     def _compute_path_encoding_badge(
         self,
         row: Any,
         all_paths: list[dict[str, Any]],
-        multibyte_hop_chunks: set[str],
+        chunk_buckets: dict[int, set[str]],
     ) -> str | None:
-        """Return 'multibyte', 'one_byte', or None for contacts path-encoding badge."""
+        """Return 'multibyte', 'one_byte', or None for contacts path-encoding badge.
+
+        ``chunk_buckets`` is the length-bucketed form of the multibyte hop chunks
+        (see _bucket_hop_chunks).
+        """
         pk = row["public_key"] or ""
         role = (row["role"] or "").lower()
         obph_raw = row["out_bytes_per_hop"]
@@ -5377,9 +6188,9 @@ class BotDataViewer:
                 return "multibyte"
         if role in ("repeater", "roomserver") and pk:
             pk_low = pk.lower()
-            for chunk in multibyte_hop_chunks:
-                if pk_low.startswith(chunk):
-                    return "multibyte"
+            # Chunks are fixed-length (4 or 6), so startswith reduces to prefix-equality lookups.
+            if pk_low[:4] in chunk_buckets[4] or pk_low[:6] in chunk_buckets[6]:
+                return "multibyte"
 
         # One-byte: positive signal and no multibyte observation
         has_signal = bool(
@@ -5402,9 +6213,13 @@ class BotDataViewer:
         role: str | None,
         out_bytes_per_hop: Any,
         multibyte_advert_public_keys: set[str],
-        multibyte_hop_chunks: set[str],
+        chunk_buckets: dict[int, set[str]],
     ) -> bool:
-        """Multibyte detection for dashboard 7d stats (observed_paths scoped by date in SQL)."""
+        """Multibyte detection for dashboard 7d stats (observed_paths scoped by date in SQL).
+
+        ``chunk_buckets`` is the length-bucketed form of the multibyte hop chunks
+        (see _bucket_hop_chunks) — build it once per request, not per contact.
+        """
         pk = public_key or ""
         role_l = (role or "").lower()
         obph: int | None
@@ -5420,14 +6235,586 @@ class BotDataViewer:
         if pk and pk in multibyte_advert_public_keys:
             return True
         if role_l in ("repeater", "roomserver") and pk:
+            # Chunks are fixed-length (4 or 6), so startswith reduces to prefix-equality
+            # lookups — O(1) per contact instead of a scan of the whole chunk set.
             pk_low = pk.lower()
-            for chunk in multibyte_hop_chunks:
-                if pk_low.startswith(chunk):
-                    return True
+            if pk_low[:4] in chunk_buckets[4] or pk_low[:6] in chunk_buckets[6]:
+                return True
         return False
 
-    def _get_tracking_data(self, since='30d'):
-        """Get contact tracking data. since: 24h, 7d, 30d, 90d, or all (heard in that window)."""
+    def _compute_single_byte_relay_metrics(
+        self, cursor, path_time_cond: str
+    ) -> dict[str, dict]:
+        """Per-1-byte-prefix relay metrics derived from single-byte advert paths.
+
+        Senders who also appear in multibyte advert paths in the same window are excluded —
+        their single-byte paths are parallel/legacy routes that do not need this relay upgraded.
+
+        Returns: {hex_prefix_2chars: {relay_score, unique_sources, unique_dests}}
+        """
+        try:
+            cursor.execute(
+                f"""
+                SELECT DISTINCT public_key FROM observed_paths
+                WHERE bytes_per_hop IN (2,3) AND packet_type = 'advert'
+                AND public_key IS NOT NULL {path_time_cond}
+                """
+            )
+            mb_senders: set[str] = {r['public_key'] for r in cursor.fetchall()}
+
+            cursor.execute(
+                f"""
+                SELECT path_hex, public_key, to_prefix, observation_count
+                FROM observed_paths
+                WHERE bytes_per_hop = 1 AND packet_type = 'advert'
+                AND public_key IS NOT NULL {path_time_cond}
+                """
+            )
+
+            metrics: dict[str, dict] = {}
+            for row in cursor.fetchall():
+                if row['public_key'] in mb_senders:
+                    continue
+                ph = (row['path_hex'] or '').lower()
+                if not ph:
+                    continue
+                obs = row['observation_count'] or 1
+                for i in range(0, len(ph) - 1, 2):
+                    chunk = ph[i:i + 2]
+                    if len(chunk) != 2:
+                        continue
+                    if chunk not in metrics:
+                        metrics[chunk] = {'relay_score': 0, 'sources': set(), 'to_prefixes': set()}
+                    metrics[chunk]['relay_score'] += obs
+                    metrics[chunk]['sources'].add(row['public_key'])
+                    if row['to_prefix']:
+                        metrics[chunk]['to_prefixes'].add(row['to_prefix'])
+
+            return {
+                pfx: {
+                    'relay_score':    v['relay_score'],
+                    'unique_sources': len(v['sources']),
+                    'unique_dests':   len(v['to_prefixes']),
+                }
+                for pfx, v in metrics.items()
+            }
+        except Exception as e:
+            self.logger.debug(f"Could not compute single-byte relay metrics: {e}")
+            return {}
+
+    def _compute_legacy_degree(
+        self, cursor, unupgraded_pks: set[str], mc_since_cond: str
+    ) -> dict[str, int]:
+        """Count mesh_connections edges where both endpoints are unupgraded (single_byte) nodes.
+
+        Uses from_public_key / to_public_key for precise matching — no 1-byte collision ambiguity.
+        Returns: {public_key: edge_count}
+        """
+        try:
+            cursor.execute(
+                f"""
+                SELECT from_public_key, to_public_key
+                FROM mesh_connections
+                WHERE from_public_key IS NOT NULL AND to_public_key IS NOT NULL
+                {mc_since_cond}
+                """
+            )
+            degree: dict[str, int] = {}
+            for row in cursor.fetchall():
+                fk, tk = row['from_public_key'], row['to_public_key']
+                if fk in unupgraded_pks and tk in unupgraded_pks:
+                    degree[fk] = degree.get(fk, 0) + 1
+                    degree[tk] = degree.get(tk, 0) + 1
+            return degree
+        except Exception as e:
+            self.logger.debug(f"Could not compute legacy degree: {e}")
+            return {}
+
+    def _get_multibyte_rollout_data(self, since: str = '30d', node_type: str = 'all') -> dict:
+        """Return multibyte hash rollout analytics for repeaters and/or room servers.
+
+        since: 24h | 7d | 30d | 90d | all — window applied to last_heard in complete_contact_tracking.
+        node_type: all | repeater | roomserver — filters which relay node types are included.
+        The daily_trend array always covers the last 30 days regardless of ``since``.
+        """
+        conn = None
+        try:
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+
+            # Role filter based on node_type
+            if node_type == 'repeater':
+                role_filter = "c.role = 'repeater'"
+            elif node_type == 'roomserver':
+                role_filter = "c.role = 'roomserver'"
+            else:
+                role_filter = "c.role IN ('repeater', 'roomserver')"
+
+            # last_heard is stored as a Python datetime serialised to ISO text by sqlite3
+            # (e.g. '2026-05-17 10:30:00.123456').  Use SQLite's datetime() so the comparison
+            # is ISO-text vs ISO-text, which sorts correctly lexicographically.
+            datetime_offsets = {
+                '24h': "'-24 hours'",
+                '7d':  "'-7 days'",
+                '30d': "'-30 days'",
+                '90d': "'-90 days'",
+            }
+            if since in datetime_offsets:
+                where_clause = (
+                    f"WHERE {role_filter}"
+                    f" AND c.last_heard >= datetime('now', 'localtime', {datetime_offsets[since]})"
+                )
+            else:
+                where_clause = f"WHERE {role_filter}"
+
+            # Check for observed_paths table
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='observed_paths'"
+            )
+            has_observed_paths = cursor.fetchone() is not None
+
+            # Collect multibyte hop chunks for prefix matching, scoped to the same window as the
+            # contact filter so the rollout numbers are consistent with the dashboard's 7d stats.
+            _since_to_days = {'24h': 1, '7d': 7, '30d': 30, '90d': 90}
+            _chunk_recent_days = _since_to_days.get(since)  # None → all-time for 'all'
+            multibyte_hop_chunks: set[str] = set()
+            if has_observed_paths:
+                multibyte_hop_chunks = self._collect_multibyte_hop_chunks(
+                    cursor, recent_days=_chunk_recent_days
+                )
+            chunk_buckets = self._bucket_hop_chunks(multibyte_hop_chunks)
+
+            # Per-repeater path traffic totals (advert paths only)
+            path_traffic: dict[str, dict] = {}
+            if has_observed_paths:
+                cursor.execute(
+                    """
+                    SELECT public_key,
+                        SUM(observation_count) as total_traffic,
+                        SUM(CASE WHEN bytes_per_hop IN (2,3) THEN observation_count ELSE 0 END) as mb_traffic,
+                        MAX(last_seen) as latest_path_seen
+                    FROM observed_paths
+                    WHERE public_key IS NOT NULL AND packet_type = 'advert'
+                    GROUP BY public_key
+                    """
+                )
+                for pt_row in cursor.fetchall():
+                    path_traffic[pt_row['public_key']] = {
+                        'total_traffic': pt_row['total_traffic'] or 0,
+                        'mb_traffic':    pt_row['mb_traffic'] or 0,
+                        'latest_path_seen': pt_row['latest_path_seen'],
+                    }
+
+            # Scope the path history to the same window so badge evidence matches the since filter.
+            path_time_cond = ""
+            if since in datetime_offsets:
+                path_time_cond = f"AND last_seen >= datetime('now', 'localtime', {datetime_offsets[since]})"
+
+            # Fetch the relay contacts directly (no join/group-by); their recent advert paths are
+            # loaded separately below and assembled in Python. This mirrors _get_tracking_data and
+            # keeps the planner on the idx_observed_paths_advert_pk_seen covering index for the path
+            # scan instead of building a runtime automatic index for a LEFT JOIN + GROUP_CONCAT.
+            cursor.execute(
+                f"""
+                SELECT
+                    c.public_key, c.name, c.role, c.device_type,
+                    c.latitude, c.longitude, c.city, c.state, c.country,
+                    c.first_heard, c.last_heard,
+                    c.advert_count, c.out_bytes_per_hop, c.out_path_len
+                FROM complete_contact_tracking c
+                {where_clause}
+                ORDER BY c.last_heard DESC
+                """
+            )
+            main_rows = cursor.fetchall()
+
+            # Recent advert paths per contact (most-recent 50), grouped in Python by public_key.
+            # With idx_observed_paths_advert_pk_seen this runs as an ordered covering index scan.
+            # We don't filter to the relay keys here: the loop only looks up paths for contacts in
+            # main_rows, and joining the key set pushes the planner off the covering index.
+            paths_by_key: dict[str, list[dict]] = {}
+            if has_observed_paths:
+                cursor.execute(
+                    f"""
+                    WITH recent_paths AS (
+                        SELECT public_key, path_hex, bytes_per_hop, observation_count, last_seen,
+                               ROW_NUMBER() OVER (PARTITION BY public_key ORDER BY last_seen DESC) as rn
+                        FROM observed_paths
+                        WHERE packet_type = 'advert' AND public_key IS NOT NULL
+                        {path_time_cond}
+                    )
+                    SELECT public_key, path_hex, bytes_per_hop, observation_count, last_seen
+                    FROM recent_paths WHERE rn <= 50
+                    ORDER BY public_key, last_seen DESC
+                    """
+                )
+                for prow in cursor.fetchall():
+                    ph = prow['path_hex']
+                    if not ph:
+                        continue
+                    bph = 1
+                    if prow['bytes_per_hop'] is not None:
+                        try:
+                            bph = int(prow['bytes_per_hop'])
+                            if bph not in (1, 2, 3):
+                                bph = 1
+                        except (TypeError, ValueError):
+                            bph = 1
+                    paths_by_key.setdefault(prow['public_key'], []).append({
+                        'path_hex': ph,
+                        'bytes_per_hop': bph,
+                        'observation_count': int(prow['observation_count']) if prow['observation_count'] is not None else 1,
+                        'last_seen': prow['last_seen'] if prow['last_seen'] is not None else None,
+                    })
+
+            # Classify each repeater
+            status_counts: dict[str, int] = {
+                'multibyte_direct': 0,
+                'multibyte_relayed': 0,
+                'single_byte': 0,
+                'unknown': 0,
+            }
+            all_repeaters: list[dict] = []
+
+            for row in main_rows:
+                pk = row['public_key']
+
+                # Recent advert paths for this contact (grouped from the path query above)
+                all_paths = paths_by_key.get(pk, [])
+
+                badge = self._compute_path_encoding_badge(row, all_paths, chunk_buckets)
+
+                obph_raw = row['out_bytes_per_hop']
+                try:
+                    obph: int | None = int(obph_raw) if obph_raw is not None else None
+                except (TypeError, ValueError):
+                    obph = None
+
+                if badge == 'multibyte':
+                    status = 'multibyte_direct' if obph in (2, 3) else 'multibyte_relayed'
+                elif badge == 'one_byte':
+                    status = 'single_byte'
+                else:
+                    status = 'unknown'
+
+                status_counts[status] += 1
+
+                loc_parts = [p for p in [row['city'], row['state'], row['country']] if p]
+
+                pt = path_traffic.get(pk or '', {})
+                all_repeaters.append({
+                    'public_key':      pk,
+                    'name':            row['name'],
+                    'role':            row['role'],
+                    'device_type':     row['device_type'],
+                    'status':          status,
+                    'out_bytes_per_hop': obph,
+                    'advert_count':    row['advert_count'] or 0,
+                    'total_traffic':   pt.get('total_traffic', 0),
+                    'last_seen':       row['last_heard'],
+                    'first_heard':     row['first_heard'],
+                    'location':        ', '.join(loc_parts),
+                    'latitude':        row['latitude'],
+                    'longitude':       row['longitude'],
+                })
+
+            # ── Priority scoring ──────────────────────────────────────────────────
+            unupgraded_pks: set[str] = set()
+            # Build prefix → all nodes (any status) for complete prefix_peers reporting.
+            # Confirmed-multibyte nodes sharing a 1-byte prefix may be the actual relay
+            # in those paths, so surfacing them in the tooltip is important.
+            all_by_prefix: dict[str, list[dict]] = {}
+            for r in all_repeaters:
+                if r['public_key']:
+                    pfx = r['public_key'][:2].lower()
+                    all_by_prefix.setdefault(pfx, []).append(r)
+                if r['status'] == 'single_byte' and r['public_key']:
+                    unupgraded_pks.add(r['public_key'])
+
+            sb_metrics: dict[str, dict] = {}
+            if has_observed_paths and unupgraded_pks:
+                sb_metrics = self._compute_single_byte_relay_metrics(cursor, path_time_cond)
+
+            legacy_degree: dict[str, int] = {}
+            try:
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='mesh_connections'"
+                )
+                if cursor.fetchone() is not None and unupgraded_pks:
+                    mc_since_cond = ""
+                    if since in datetime_offsets:
+                        mc_since_cond = (
+                            f"AND last_seen >= datetime('now', 'localtime', {datetime_offsets[since]})"
+                        )
+                    legacy_degree = self._compute_legacy_degree(
+                        cursor, unupgraded_pks, mc_since_cond
+                    )
+            except Exception as e:
+                self.logger.debug(f"Legacy degree skipped: {e}")
+
+            for r in all_repeaters:
+                if r['status'] == 'single_byte' and r['public_key']:
+                    pfx = r['public_key'][:2].lower()
+                    m = sb_metrics.get(pfx, {})
+                    r['relay_score']    = m.get('relay_score', 0)
+                    r['unique_sources'] = m.get('unique_sources', 0)
+                    r['unique_dests']   = m.get('unique_dests', 0)
+                    r['legacy_degree']  = legacy_degree.get(r['public_key'], 0)
+                    # prefix_peers: ALL other nodes (any status) sharing this 1-byte prefix.
+                    # Confirmed-multibyte peers explain inflated scores on low-traffic nodes.
+                    r['prefix_peers']   = [
+                        {'public_key': r2['public_key'], 'name': r2['name'], 'status': r2['status']}
+                        for r2 in all_by_prefix.get(pfx, [])
+                        if r2['public_key'] != r['public_key']
+                    ]
+                else:
+                    r['relay_score']    = 0
+                    r['unique_sources'] = 0
+                    r['unique_dests']   = 0
+                    r['legacy_degree']  = 0
+                    r['prefix_peers']   = []
+
+            # ── Name-based suppression ────────────────────────────────────────────
+            # A single_byte record that shares a name with a confirmed-multibyte
+            # record is almost certainly the same physical device — the single_byte
+            # entry reflects stale traffic from before the firmware upgrade.
+            # Suppress it so it doesn't appear as an upgrade target or inflate counts.
+            multibyte_names: set[str] = {
+                r['name'].strip().lower()
+                for r in all_repeaters
+                if r['status'] in ('multibyte_direct', 'multibyte_relayed') and r['name']
+            }
+            if multibyte_names:
+                kept: list[dict] = []
+                for r in all_repeaters:
+                    if (r['status'] == 'single_byte'
+                            and r['name']
+                            and r['name'].strip().lower() in multibyte_names):
+                        status_counts['single_byte'] -= 1
+                    else:
+                        kept.append(r)
+                all_repeaters = kept
+
+            # Priority list: single_byte nodes ranked by relay_score desc
+            priority_list = sorted(
+                [r for r in all_repeaters if r['status'] == 'single_byte'],
+                key=lambda r: (-(r['relay_score'] or 0), -(r['unique_sources'] or 0)),
+            )
+
+            # Summary
+            total = len(all_repeaters)
+            mb_total = status_counts['multibyte_direct'] + status_counts['multibyte_relayed']
+            adoption_pct = round(mb_total / total * 100, 1) if total > 0 else 0.0
+
+            # Overall path observation traffic breakdown (advert paths, within the since window,
+            # for nodes matching the node_type filter)
+            total_path_obs = multibyte_path_obs = single_byte_path_obs = 0
+            traffic_mb_pct = 0.0
+            if has_observed_paths:
+                # observed_paths.last_seen is an ISO timestamp → use datetime() comparison
+                if node_type == 'repeater':
+                    obs_role_filter = "c.role = 'repeater'"
+                elif node_type == 'roomserver':
+                    obs_role_filter = "c.role = 'roomserver'"
+                else:
+                    obs_role_filter = "c.role IN ('repeater', 'roomserver')"
+
+                obs_time_cond = ""
+                if since in datetime_offsets:
+                    obs_time_cond = f" AND op.last_seen >= datetime('now', 'localtime', {datetime_offsets[since]})"
+
+                cursor.execute(
+                    f"""
+                    SELECT op.bytes_per_hop, SUM(op.observation_count) as n
+                    FROM observed_paths op
+                    JOIN complete_contact_tracking c ON c.public_key = op.public_key
+                    WHERE op.packet_type = 'advert' AND {obs_role_filter}{obs_time_cond}
+                    GROUP BY op.bytes_per_hop
+                    """
+                )
+                for tr in cursor.fetchall():
+                    n = tr['n'] or 0
+                    total_path_obs += n
+                    bph = tr['bytes_per_hop'] or 1
+                    try:
+                        bph = int(bph)
+                    except (TypeError, ValueError):
+                        bph = 1
+                    if bph in (2, 3):
+                        multibyte_path_obs += n
+                    else:
+                        single_byte_path_obs += n
+
+                if total_path_obs > 0:
+                    traffic_mb_pct = round(multibyte_path_obs / total_path_obs * 100, 1)
+
+            # Daily trend: last 30 days, filtered by node_type
+            daily_trend: list[dict] = []
+            if has_observed_paths:
+                if node_type == 'repeater':
+                    trend_role_filter = "c.role = 'repeater'"
+                elif node_type == 'roomserver':
+                    trend_role_filter = "c.role = 'roomserver'"
+                else:
+                    trend_role_filter = "c.role IN ('repeater', 'roomserver')"
+
+                cursor.execute(
+                    f"""
+                    SELECT date(op.last_seen) as obs_date,
+                        SUM(CASE WHEN op.bytes_per_hop IN (2,3)
+                                 THEN op.observation_count ELSE 0 END) as mb_obs,
+                        SUM(CASE WHEN op.bytes_per_hop = 1 OR op.bytes_per_hop IS NULL
+                                 THEN op.observation_count ELSE 0 END) as sb_obs
+                    FROM observed_paths op
+                    JOIN complete_contact_tracking c ON c.public_key = op.public_key
+                    WHERE {trend_role_filter}
+                      AND op.last_seen >= datetime('now', 'localtime', '-30 days')
+                      AND op.packet_type = 'advert'
+                    GROUP BY date(op.last_seen)
+                    ORDER BY obs_date
+                    """
+                )
+                for tr in cursor.fetchall():
+                    daily_trend.append({
+                        'date':        tr['obs_date'],
+                        'multibyte':   tr['mb_obs'] or 0,
+                        'single_byte': tr['sb_obs'] or 0,
+                    })
+
+            return {
+                'since': since,
+                'node_type': node_type,
+                'summary': {
+                    'total_repeaters':      total,
+                    'multibyte_direct':     status_counts['multibyte_direct'],
+                    'multibyte_relayed':    status_counts['multibyte_relayed'],
+                    'single_byte':          status_counts['single_byte'],
+                    'unknown':              status_counts['unknown'],
+                    'adoption_pct':         adoption_pct,
+                    'total_path_obs':       total_path_obs,
+                    'multibyte_path_obs':   multibyte_path_obs,
+                    'single_byte_path_obs': single_byte_path_obs,
+                    'traffic_multibyte_pct': traffic_mb_pct,
+                },
+                'priority_list': priority_list,
+                'all_repeaters': all_repeaters,
+                'daily_trend':   daily_trend,
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error getting multibyte rollout data: {e}")
+            return {
+                'since': since,
+                'error': str(e),
+                'summary': {
+                    'total_repeaters': 0, 'multibyte_direct': 0,
+                    'multibyte_relayed': 0, 'single_byte': 0, 'unknown': 0,
+                    'adoption_pct': 0.0, 'total_path_obs': 0,
+                    'multibyte_path_obs': 0, 'single_byte_path_obs': 0,
+                    'traffic_multibyte_pct': 0.0,
+                },
+                'priority_list': [],
+                'all_repeaters': [],
+                'daily_trend': [],
+            }
+        finally:
+            if conn:
+                conn.close()
+
+    def _get_contact_detail(self, public_key: str) -> dict:
+        """Per-contact detail loaded on demand by the contacts UI modals.
+
+        Returns the recent advert paths (same shape as the old list ``all_paths``) and the raw
+        advertisement data. Both are excluded from the /api/contacts list payload — they were
+        ~85% of its size and are only needed when a single contact is opened.
+        """
+        conn = None
+        try:
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+
+            # Recent advert paths (most-recent 50). The idx_observed_paths_advert_pk_seen covering
+            # index serves WHERE public_key=? AND packet_type='advert' ORDER BY last_seen DESC directly.
+            all_paths: list[dict[str, Any]] = []
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='observed_paths'")
+            if cursor.fetchone():
+                cursor.execute("""
+                    SELECT path_hex, path_length, bytes_per_hop, observation_count, last_seen
+                    FROM observed_paths
+                    WHERE packet_type = 'advert' AND public_key = ?
+                    ORDER BY last_seen DESC
+                    LIMIT 50
+                """, (public_key,))
+                for prow in cursor.fetchall():
+                    if not prow['path_hex']:
+                        continue
+                    bph = None
+                    if prow['bytes_per_hop'] is not None:
+                        try:
+                            bph = int(prow['bytes_per_hop'])
+                            if bph not in (1, 2, 3):
+                                bph = 1
+                        except (TypeError, ValueError):
+                            bph = 1
+                    all_paths.append({
+                        'path_hex': prow['path_hex'],
+                        'path_length': int(prow['path_length']) if prow['path_length'] is not None else 0,
+                        'bytes_per_hop': bph,
+                        'observation_count': int(prow['observation_count']) if prow['observation_count'] is not None else 1,
+                        'last_seen': prow['last_seen'] if prow['last_seen'] is not None else None,
+                    })
+
+            # Raw advertisement data for the "Advertisement Data" modal.
+            raw_advert_data = None
+            raw_advert_data_parsed = None
+            cursor.execute("""
+                SELECT raw_advert_data FROM complete_contact_tracking
+                WHERE public_key = ? ORDER BY last_heard DESC LIMIT 1
+            """, (public_key,))
+            rad_row = cursor.fetchone()
+            if rad_row and rad_row['raw_advert_data']:
+                raw_advert_data = rad_row['raw_advert_data']
+                try:
+                    import json
+                    raw_advert_data_parsed = json.loads(raw_advert_data)
+                except Exception:
+                    raw_advert_data_parsed = None
+
+            return {
+                'all_paths': all_paths,
+                'raw_advert_data': raw_advert_data,
+                'raw_advert_data_parsed': raw_advert_data_parsed,
+            }
+        except Exception as e:
+            self.logger.error(f"Error getting contact detail: {e}")
+            return {'error': str(e)}
+        finally:
+            if conn:
+                conn.close()
+
+    def _get_tracking_data(
+        self,
+        since='30d',
+        include_detail=False,
+        page: int | None = None,
+        page_size: int | None = None,
+        search: str = '',
+        path_bytes: str = '',
+        device_role: str = '',
+        hop_filter: str = '',
+        location_filter: str = '',
+        starred: str = '',
+        sort: str = 'last_seen',
+        direction: str = 'desc',
+    ):
+        """Get contact tracking data. since: 24h, 7d, 30d, 90d, or all (heard in that window).
+
+        include_detail=False (the interactive /api/contacts list) omits per-contact ``all_paths``
+        and ``raw_advert_data`` to keep the payload small; the UI fetches those on demand via
+        /api/contact-detail.  The interactive route supplies ``page`` and ``page_size`` so path
+        enrichment is limited to visible contacts. include_detail=True (the export endpoint)
+        keeps the legacy full-result behavior and full fields.
+        """
         conn = None
         try:
             conn = self._get_db_connection()
@@ -5437,112 +6824,290 @@ class BotDataViewer:
             bot_lat = self.config.getfloat('Bot', 'bot_latitude', fallback=None)
             bot_lon = self.config.getfloat('Bot', 'bot_longitude', fallback=None)
 
-            # Filter by last_heard for performance (default: last 30 days)
-            # Note: last_heard is stored as Unix timestamp (float), so use strftime('%s', ...) for comparison
-            if since == 'all':
-                where_clause = ''
-                params = ()
-            else:
-                if since == '24h':
-                    where_clause = " WHERE c.last_heard >= strftime('%s', 'now', '-24 hours')"
-                elif since == '7d':
-                    where_clause = " WHERE c.last_heard >= strftime('%s', 'now', '-7 days')"
-                elif since == '30d':
-                    where_clause = " WHERE c.last_heard >= strftime('%s', 'now', '-30 days')"
-                else:  # 90d
-                    where_clause = " WHERE c.last_heard >= strftime('%s', 'now', '-90 days')"
-                params = ()
-
-            # Query with LEFT JOIN to a limited set of paths per contact (max 50 most recent per contact)
-            # to keep GROUP_CONCAT and load time bounded when observed_paths is large.
-            cursor.execute("""
-                WITH recent_paths AS (
-                    SELECT public_key, path_hex, path_length, bytes_per_hop, observation_count, last_seen,
-                           ROW_NUMBER() OVER (PARTITION BY public_key ORDER BY last_seen DESC) as rn
-                    FROM observed_paths
-                    WHERE packet_type = 'advert' AND public_key IS NOT NULL
+            # Filter by last_heard (default: last 30 days). last_heard is stored as ISO-text
+            # datetime in LOCAL time (e.g. '2026-06-16 09:03:49.606966', written by datetime.now()),
+            # so the cutoff must also be local: datetime('now', 'localtime', ...). Using bare
+            # datetime('now', ...) computes the cutoff in UTC and shaves the local UTC offset off
+            # the window (e.g. a "24h" filter only returns ~17h of data in US/Pacific).
+            datetime_offsets = {
+                '24h': "'-24 hours'",
+                '7d':  "'-7 days'",
+                '30d': "'-30 days'",
+                '90d': "'-90 days'",
+            }
+            where_parts = []
+            where_params: list[Any] = []
+            # A node can have more than one observed advert path.  Treat its byte class as
+            # the widest path encoding seen for it, with the contact's current out-path as a
+            # fallback for databases that have not retained an observed path yet.  This gives
+            # the list one stable, sortable value instead of placing the same node in several
+            # byte buckets.  Only count rows with a known 1/2/3 encoding so NULL/invalid
+            # observations do not collapse to "1-byte" and block the out-path fallback.
+            path_bytes_expression = """COALESCE((
+                SELECT MAX(op.bytes_per_hop)
+                FROM observed_paths op
+                WHERE op.public_key = c.public_key
+                  AND op.packet_type = 'advert'
+                  AND op.path_hex IS NOT NULL AND op.path_hex != ''
+                  AND op.bytes_per_hop IN (1, 2, 3)
+            ), CASE WHEN c.out_bytes_per_hop IN (1, 2, 3)
+                     THEN c.out_bytes_per_hop ELSE 0 END)"""
+            if since in datetime_offsets:
+                where_parts.append(
+                    f"c.last_heard >= datetime('now', 'localtime', {datetime_offsets[since]})"
                 )
+
+            search = (search or '').strip().lower()[:100]
+            if search and not include_detail:
+                # Match the former client-side behavior: public keys are prefix-only,
+                # while names, roles, device types, and locations match anywhere.
+                escaped = search.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+                where_parts.append(
+                    "("
+                    "LOWER(COALESCE(c.public_key, '')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(c.name, '')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(c.role, '')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(c.device_type, '')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(c.city, '')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(c.state, '')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(c.country, '')) LIKE ? ESCAPE '\\'"
+                    ")"
+                )
+                where_params.extend([f'{escaped}%'] + [f'%{escaped}%'] * 6)
+
+            path_bytes = str(path_bytes or '').strip()
+            if path_bytes in ('1', '2', '3'):
+                where_parts.append(f'{path_bytes_expression} = ?')
+                where_params.append(int(path_bytes))
+            elif path_bytes == 'unknown':
+                where_parts.append(f'{path_bytes_expression} = 0')
+
+            device_role = str(device_role or '').strip().lower()
+            if device_role in ('companion', 'repeater', 'roomserver', 'sensor'):
+                where_parts.append("LOWER(COALESCE(c.role, '')) = ?")
+                where_params.append(device_role)
+            elif device_role == 'other':
+                where_parts.append("LOWER(COALESCE(c.role, '')) NOT IN ('companion', 'repeater', 'roomserver', 'sensor')")
+
+            if hop_filter in ('0', '1', '2', '3'):
+                where_parts.append(
+                    'COALESCE(c.hop_count, 0) = ?' if hop_filter == '0'
+                    else 'COALESCE(c.hop_count, 0) >= ?'
+                )
+                where_params.append(int(hop_filter))
+
+            has_location_expression = (
+                "((c.city IS NOT NULL AND c.city != '') OR "
+                "(c.state IS NOT NULL AND c.state != '') OR "
+                "(c.country IS NOT NULL AND c.country != '') OR "
+                "(c.latitude IS NOT NULL AND c.longitude IS NOT NULL "
+                "AND c.latitude != 0 AND c.longitude != 0))"
+            )
+            if location_filter == 'known':
+                where_parts.append(has_location_expression)
+            elif location_filter == 'unknown':
+                where_parts.append(f'NOT {has_location_expression}')
+
+            if starred == 'yes':
+                where_parts.append('COALESCE(c.is_starred, 0) = 1')
+            elif starred == 'no':
+                where_parts.append('COALESCE(c.is_starred, 0) = 0')
+
+            where_clause = (' WHERE ' + ' AND '.join(where_parts)) if where_parts else ''
+
+            pagination = None
+            filtered_stats = None
+            if page is not None and page_size is not None and not include_detail:
+                page_size = max(1, min(200, int(page_size)))
+                page = max(1, int(page))
+                cursor.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total_items,
+                        SUM(CASE WHEN c.last_heard >= datetime('now', 'localtime', '-24 hours') THEN 1 ELSE 0 END) AS contacts_24h,
+                        SUM(CASE WHEN c.last_heard >= datetime('now', 'localtime', '-7 days') THEN 1 ELSE 0 END) AS contacts_7d,
+                        SUM(CASE WHEN c.first_heard >= datetime('now', 'localtime', '-7 days')
+                                  AND LOWER(COALESCE(c.device_type, '')) LIKE '%companion%' THEN 1 ELSE 0 END) AS new_companions,
+                        SUM(CASE WHEN c.first_heard >= datetime('now', 'localtime', '-7 days')
+                                  AND LOWER(COALESCE(c.device_type, '')) LIKE '%repeater%' THEN 1 ELSE 0 END) AS new_repeaters,
+                        SUM(CASE WHEN c.first_heard >= datetime('now', 'localtime', '-7 days')
+                                  AND (LOWER(COALESCE(c.device_type, '')) LIKE '%room%'
+                                       OR LOWER(COALESCE(c.device_type, '')) LIKE '%server%') THEN 1 ELSE 0 END) AS new_room_servers
+                    FROM complete_contact_tracking c
+                    """ + where_clause,
+                    tuple(where_params),
+                )
+                aggregate = cursor.fetchone()
+                total_items = int(aggregate['total_items'] or 0)
+                total_pages = max(1, (total_items + page_size - 1) // page_size)
+                page = min(page, total_pages)
+                pagination = {
+                    'page': page,
+                    'page_size': page_size,
+                    'total_items': total_items,
+                    'total_pages': total_pages,
+                    'has_previous': page > 1,
+                    'has_next': page < total_pages,
+                }
+                filtered_stats = {
+                    'contacts_24h': int(aggregate['contacts_24h'] or 0),
+                    'contacts_7d': int(aggregate['contacts_7d'] or 0),
+                    'contacts_total': total_items,
+                    'new_companions': int(aggregate['new_companions'] or 0),
+                    'new_repeaters': int(aggregate['new_repeaters'] or 0),
+                    'new_room_servers': int(aggregate['new_room_servers'] or 0),
+                }
+
+            # Fetch contacts directly (no join/group-by). The recent paths per contact are
+            # loaded in a second query below and assembled in Python. This avoids materializing
+            # a window-function CTE over all of observed_paths and grouping by every contact
+            # column (incl. the raw_advert_data blob) on every request. last_advert_timestamp is
+            # the per-contact value, so it matches the old MAX(...) over a single contact's rows.
+            detail_cols = "c.raw_advert_data," if include_detail else ""
+            sort_expressions = {
+                'username': "LOWER(COALESCE(c.name, ''))",
+                'device_type': "LOWER(COALESCE(c.device_type, ''))",
+                'location': (
+                    "LOWER(CASE "
+                    "WHEN c.city IS NOT NULL AND c.city != '' AND c.state IS NOT NULL AND c.state != '' "
+                    "THEN c.city || ', ' || c.state "
+                    "WHEN c.city IS NOT NULL AND c.city != '' THEN c.city "
+                    "WHEN c.latitude IS NOT NULL AND c.longitude IS NOT NULL "
+                    "AND c.latitude != 0 AND c.longitude != 0 THEN printf('%s, %s', c.latitude, c.longitude) "
+                    "ELSE '' END)"
+                ),
+                'snr': 'COALESCE(c.snr, 0)',
+                'hop_count': 'COALESCE(c.hop_count, 0)',
+                'path_bytes': path_bytes_expression,
+                'first_heard': "COALESCE(c.first_heard, '')",
+                'last_seen': "COALESCE(c.last_heard, '')",
+                'advert_count': 'COALESCE(c.advert_count, 0)',
+            }
+            sort = sort if sort in (*sort_expressions.keys(), 'distance') else 'last_seen'
+            direction = 'asc' if direction == 'asc' else 'desc'
+            if sort == 'distance':
+                if bot_lat is None or bot_lon is None:
+                    sort_expression = '0'
+                else:
+                    conn.create_function('contacts_distance_km', 2, lambda lat, lon: (
+                        self._calculate_distance(bot_lat, bot_lon, lat, lon)
+                        if lat is not None and lon is not None else 0
+                    ))
+                    sort_expression = 'contacts_distance_km(c.latitude, c.longitude)'
+            else:
+                sort_expression = sort_expressions[sort]
+
+            query_params = list(where_params)
+            limit_clause = ''
+            if pagination is not None:
+                limit_clause = ' LIMIT ? OFFSET ?'
+                query_params.extend([page_size, (page - 1) * page_size])
+
+            cursor.execute("""
                 SELECT
                     c.public_key, c.name, c.role, c.device_type,
                     c.latitude, c.longitude, c.city, c.state, c.country,
                     c.snr, c.hop_count, c.first_heard, c.last_heard,
                     c.advert_count, c.is_currently_tracked,
-                    c.raw_advert_data, c.signal_strength,
+                    """ + detail_cols + """
+                    c.signal_strength,
                     c.is_starred, c.out_path, c.out_path_len, c.out_bytes_per_hop,
-                    COUNT(*) as total_messages,
-                    MAX(c.last_advert_timestamp) as last_message,
-                    GROUP_CONCAT(op.path_hex, '|||') as all_paths_hex,
-                    GROUP_CONCAT(op.path_length, '|||') as all_paths_length,
-                    GROUP_CONCAT(COALESCE(op.bytes_per_hop, 1), '|||') as all_paths_bytes_per_hop,
-                    GROUP_CONCAT(op.observation_count, '|||') as all_paths_observations,
-                    GROUP_CONCAT(op.last_seen, '|||') as all_paths_last_seen
+                    """ + path_bytes_expression + """ AS path_bytes_per_hop,
+                    c.last_advert_timestamp as last_message
                 FROM complete_contact_tracking c
-                LEFT JOIN (
-                    SELECT public_key, path_hex, path_length, bytes_per_hop, observation_count, last_seen
-                    FROM recent_paths WHERE rn <= 50
-                ) op ON c.public_key = op.public_key
                 """ + where_clause + """
-                GROUP BY c.public_key, c.name, c.role, c.device_type,
-                         c.latitude, c.longitude, c.city, c.state, c.country,
-                         c.snr, c.hop_count, c.first_heard, c.last_heard,
-                         c.advert_count, c.is_currently_tracked,
-                         c.raw_advert_data, c.signal_strength, c.is_starred,
-                         c.out_path, c.out_path_len, c.out_bytes_per_hop
-                ORDER BY c.last_heard DESC
-            """, params)
+                ORDER BY """ + sort_expression + f" {direction.upper()}, c.public_key ASC" + limit_clause,
+                tuple(query_params),
+            )
 
             main_rows = cursor.fetchall()
-            multibyte_hop_chunks = self._collect_multibyte_hop_chunks(cursor)
+
+            paths_by_key = {}
+            path_rows = []
+            if main_rows:
+                path_params: list[Any] = []
+                page_key_clause = ''
+                if pagination is not None:
+                    # The interactive list enriches only the visible page.  At most 200 keys are
+                    # supplied, staying comfortably below SQLite's parameter limit and turning
+                    # the former all-history window scan into targeted index lookups.
+                    page_keys = [row['public_key'] for row in main_rows]
+                    placeholders = ','.join('?' for _ in page_keys)
+                    page_key_clause = f' AND public_key IN ({placeholders})'
+                    path_params.extend(page_keys)
+                cursor.execute("""
+                    WITH recent_paths AS (
+                        SELECT public_key, path_hex, path_length, bytes_per_hop,
+                               observation_count, last_seen,
+                               ROW_NUMBER() OVER (PARTITION BY public_key ORDER BY last_seen DESC) as rn
+                        FROM observed_paths
+                        WHERE packet_type = 'advert' AND public_key IS NOT NULL
+                    """ + page_key_clause + """
+                    )
+                    SELECT public_key, path_hex, path_length, bytes_per_hop, observation_count, last_seen
+                    FROM recent_paths WHERE rn <= 50
+                    ORDER BY public_key, last_seen DESC
+                """, tuple(path_params))
+                path_rows = cursor.fetchall()
+
+            for prow in path_rows:
+                if not prow['path_hex']:  # Skip empty paths
+                    continue
+                bph = None
+                if prow['bytes_per_hop'] is not None:
+                    try:
+                        bph = int(prow['bytes_per_hop'])
+                        if bph not in (1, 2, 3):
+                            bph = 1
+                    except (TypeError, ValueError):
+                        bph = 1
+                paths_by_key.setdefault(prow['public_key'], []).append({
+                    'path_hex': prow['path_hex'],
+                    'path_length': int(prow['path_length']) if prow['path_length'] is not None else 0,
+                    'bytes_per_hop': bph,
+                    'observation_count': int(prow['observation_count']) if prow['observation_count'] is not None else 1,
+                    'last_seen': prow['last_seen'] if prow['last_seen'] is not None else None
+                })
+
+            multibyte_hop_chunks = self._get_cached_contact_multibyte_hop_chunks(cursor)
+            chunk_buckets = self._bucket_hop_chunks(multibyte_hop_chunks)
 
             tracking = []
             for row in main_rows:
-                # Parse raw advertisement data if available
-                raw_advert_data_parsed = None
-                if row['raw_advert_data']:
-                    try:
-                        import json
-                        raw_advert_data_parsed = json.loads(row['raw_advert_data'])
-                    except:
-                        raw_advert_data_parsed = None
-
                 # Calculate distance if both bot and contact have coordinates
                 distance = None
                 if (bot_lat is not None and bot_lon is not None and
                     row['latitude'] is not None and row['longitude'] is not None):
                     distance = self._calculate_distance(bot_lat, bot_lon, row['latitude'], row['longitude'])
 
-                # Parse all_paths from concatenated strings
-                all_paths = []
-                if row['all_paths_hex']:
-                    paths_hex = row['all_paths_hex'].split('|||')
-                    paths_length = row['all_paths_length'].split('|||') if row['all_paths_length'] else []
-                    paths_bph = row['all_paths_bytes_per_hop'].split('|||') if row['all_paths_bytes_per_hop'] else []
-                    paths_observations = row['all_paths_observations'].split('|||') if row['all_paths_observations'] else []
-                    paths_last_seen = row['all_paths_last_seen'].split('|||') if row['all_paths_last_seen'] else []
+                # Recent paths for this contact (grouped from the second query above). The full
+                # path objects are NOT sent in the list payload (they were ~70% of its size and
+                # are only used in the per-contact modal); the UI fetches them on demand via
+                # /api/contact-detail. The list only needs the count and the badge.
+                all_paths = paths_by_key.get(row['public_key'], [])
+                paths_count = len(all_paths)
 
-                    for i, path_hex in enumerate(paths_hex):
-                        if path_hex:  # Skip empty strings
-                            bph = None
-                            if i < len(paths_bph) and paths_bph[i]:
-                                try:
-                                    bph = int(paths_bph[i])
-                                    if bph not in (1, 2, 3):
-                                        bph = 1
-                                except (TypeError, ValueError):
-                                    bph = 1
-                            all_paths.append({
-                                'path_hex': path_hex,
-                                'path_length': int(paths_length[i]) if i < len(paths_length) and paths_length[i] else 0,
-                                'bytes_per_hop': bph,
-                                'observation_count': int(paths_observations[i]) if i < len(paths_observations) and paths_observations[i] else 1,
-                                'last_seen': paths_last_seen[i] if i < len(paths_last_seen) and paths_last_seen[i] else None
-                            })
+                # Preserve the legacy total_messages value: it was COUNT(*) over the LEFT-JOINed
+                # path rows, i.e. the number of paths, or 1 when a contact had no paths.
+                total_messages = max(1, paths_count)
 
                 path_encoding_badge = self._compute_path_encoding_badge(
-                    row, all_paths, multibyte_hop_chunks
+                    row, all_paths, chunk_buckets
                 )
 
-                tracking.append({
+                # The badge/tooltip decodes out_path (the "primary" path) using out_bytes_per_hop.
+                # The contact column can be stale (e.g. left at 1 while the primary path is a 3-byte
+                # path), which makes a multi-byte path render as twice/three-times as many 1-byte
+                # hops. Index the encoding on the primary observed path itself, which carries the
+                # authoritative bytes_per_hop, falling back to the contact column when unmatched.
+                out_path_val = row['out_path'] if row['out_path'] is not None else ''
+                out_bytes_per_hop_val = row['out_bytes_per_hop'] if row['out_bytes_per_hop'] is not None else None
+                if out_path_val:
+                    primary_path = next((p for p in all_paths if p['path_hex'] == out_path_val), None)
+                    if primary_path and primary_path.get('bytes_per_hop') in (1, 2, 3):
+                        out_bytes_per_hop_val = primary_path['bytes_per_hop']
+
+                entry = {
                     'user_id': row['public_key'],
                     'username': row['name'],
                     'role': row['role'],
@@ -5558,19 +7123,32 @@ class BotDataViewer:
                     'last_seen': row['last_heard'],
                     'advert_count': row['advert_count'],
                     'is_currently_tracked': row['is_currently_tracked'],
-                    'raw_advert_data': row['raw_advert_data'],
-                    'raw_advert_data_parsed': raw_advert_data_parsed,
                     'signal_strength': row['signal_strength'],
-                    'total_messages': row['total_messages'],
+                    'total_messages': total_messages,
                     'last_message': row['last_message'],
                     'distance': distance,
                     'is_starred': bool(row['is_starred'] if row['is_starred'] is not None else 0),
-                    'out_path': row['out_path'] if row['out_path'] is not None else '',
+                    'out_path': out_path_val,
                     'out_path_len': row['out_path_len'] if row['out_path_len'] is not None else -1,
-                    'out_bytes_per_hop': row['out_bytes_per_hop'] if row['out_bytes_per_hop'] is not None else None,
-                    'all_paths': all_paths,
+                    'out_bytes_per_hop': out_bytes_per_hop_val,
+                    'path_bytes_per_hop': int(row['path_bytes_per_hop'] or 0),
+                    'paths_count': paths_count,
                     'path_encoding_badge': path_encoding_badge,
-                })
+                }
+                if include_detail:
+                    # Full fidelity for the export endpoint (size-tolerant, infrequent download).
+                    raw_advert_data = row['raw_advert_data']
+                    raw_advert_data_parsed = None
+                    if raw_advert_data:
+                        try:
+                            import json
+                            raw_advert_data_parsed = json.loads(raw_advert_data)
+                        except Exception:
+                            raw_advert_data_parsed = None
+                    entry['all_paths'] = all_paths
+                    entry['raw_advert_data'] = raw_advert_data
+                    entry['raw_advert_data_parsed'] = raw_advert_data_parsed
+                tracking.append(entry)
 
             # Get server statistics for daily tracking using direct database queries
             server_stats = {}
@@ -5581,14 +7159,14 @@ class BotDataViewer:
                     # 24h: Last 24 hours of advertisements
                     cursor.execute("""
                         SELECT SUM(advert_count) FROM daily_stats
-                        WHERE date >= date('now', '-1 day')
+                        WHERE date >= date('now', 'localtime', '-1 day')
                     """)
                     server_stats['advertisements_24h'] = cursor.fetchone()[0] or 0
 
                     # 7d: Previous 6 days (excluding today)
                     cursor.execute("""
                         SELECT SUM(advert_count) FROM daily_stats
-                        WHERE date >= date('now', '-7 days') AND date < date('now')
+                        WHERE date >= date('now', 'localtime', '-7 days') AND date < date('now', 'localtime')
                     """)
                     server_stats['advertisements_7d'] = cursor.fetchone()[0] or 0
 
@@ -5603,7 +7181,7 @@ class BotDataViewer:
                     # (last_heard in last 24 hours) since daily_stats might not have today's data yet
                     cursor.execute("""
                         SELECT COUNT(DISTINCT public_key) FROM complete_contact_tracking
-                        WHERE last_heard >= datetime('now', '-24 hours')
+                        WHERE last_heard >= datetime('now', 'localtime', '-24 hours')
                     """)
                     server_stats['nodes_24h'] = cursor.fetchone()[0] or 0
 
@@ -5611,7 +7189,7 @@ class BotDataViewer:
                     cursor.execute("""
                         SELECT role, COUNT(DISTINCT public_key) as count
                         FROM complete_contact_tracking
-                        WHERE last_heard >= datetime('now', '-24 hours')
+                        WHERE last_heard >= datetime('now', 'localtime', '-24 hours')
                         AND role IS NOT NULL AND role != ''
                         GROUP BY role
                     """)
@@ -5631,7 +7209,7 @@ class BotDataViewer:
 
                     cursor.execute("""
                         SELECT COUNT(DISTINCT public_key) FROM daily_stats
-                        WHERE date >= date('now', '-7 days') AND date < date('now')
+                        WHERE date >= date('now', 'localtime', '-7 days') AND date < date('now', 'localtime')
                     """)
                     server_stats['nodes_7d'] = cursor.fetchone()[0] or 0
 
@@ -5639,7 +7217,7 @@ class BotDataViewer:
                     # Today vs 7 days ago (single day comparison)
                     cursor.execute("""
                         SELECT COUNT(DISTINCT public_key) FROM daily_stats
-                        WHERE date = date('now', '-7 days')
+                        WHERE date = date('now', 'localtime', '-7 days')
                     """)
                     result = cursor.fetchone()
                     server_stats['nodes_7d_ago'] = result[0] if result and result[0] else 0
@@ -5647,7 +7225,7 @@ class BotDataViewer:
                     # Last 7 days vs previous 7 days (days 8-14 ago)
                     cursor.execute("""
                         SELECT COUNT(DISTINCT public_key) FROM daily_stats
-                        WHERE date >= date('now', '-14 days') AND date < date('now', '-7 days')
+                        WHERE date >= date('now', 'localtime', '-14 days') AND date < date('now', 'localtime', '-7 days')
                     """)
                     result = cursor.fetchone()
                     server_stats['nodes_prev_7d'] = result[0] if result and result[0] else 0
@@ -5655,7 +7233,7 @@ class BotDataViewer:
                     # Last 30 days vs previous 30 days (days 31-60 ago)
                     cursor.execute("""
                         SELECT COUNT(DISTINCT public_key) FROM daily_stats
-                        WHERE date >= date('now', '-60 days') AND date < date('now', '-30 days')
+                        WHERE date >= date('now', 'localtime', '-60 days') AND date < date('now', 'localtime', '-30 days')
                     """)
                     result = cursor.fetchone()
                     server_stats['nodes_prev_30d'] = result[0] if result and result[0] else 0
@@ -5663,13 +7241,13 @@ class BotDataViewer:
                     # Also get current period totals for comparison
                     cursor.execute("""
                         SELECT COUNT(DISTINCT public_key) FROM daily_stats
-                        WHERE date >= date('now', '-7 days')
+                        WHERE date >= date('now', 'localtime', '-7 days')
                     """)
                     server_stats['nodes_7d'] = cursor.fetchone()[0] or 0
 
                     cursor.execute("""
                         SELECT COUNT(DISTINCT public_key) FROM daily_stats
-                        WHERE date >= date('now', '-30 days')
+                        WHERE date >= date('now', 'localtime', '-30 days')
                     """)
                     server_stats['nodes_30d'] = cursor.fetchone()[0] or 0
 
@@ -5685,7 +7263,7 @@ class BotDataViewer:
                         SELECT ds.date, c.role, COUNT(DISTINCT ds.public_key) as daily_count
                         FROM daily_stats ds
                         LEFT JOIN complete_contact_tracking c ON ds.public_key = c.public_key
-                        WHERE ds.date >= date('now', '-30 days') AND ds.date <= date('now')
+                        WHERE ds.date >= date('now', 'localtime', '-30 days') AND ds.date <= date('now', 'localtime')
                         AND (c.role IS NOT NULL AND c.role != '')
                         GROUP BY ds.date, c.role
                         ORDER BY ds.date ASC, c.role ASC
@@ -5720,7 +7298,7 @@ class BotDataViewer:
                     cursor.execute("""
                         SELECT date, COUNT(DISTINCT public_key) as daily_count
                         FROM daily_stats
-                        WHERE date >= date('now', '-30 days') AND date <= date('now')
+                        WHERE date >= date('now', 'localtime', '-30 days') AND date <= date('now', 'localtime')
                         GROUP BY date
                         ORDER BY date ASC
                     """)
@@ -5733,10 +7311,14 @@ class BotDataViewer:
             except Exception as e:
                 self.logger.debug(f"Could not get server stats: {e}")
 
-            return {
+            result = {
                 'tracking_data': tracking,
                 'server_stats': server_stats
             }
+            if pagination is not None:
+                result['pagination'] = pagination
+                result['filtered_stats'] = filtered_stats
+            return result
         except Exception as e:
             self.logger.error(f"Error getting tracking data: {e}")
             return {'error': str(e)}
@@ -5875,7 +7457,7 @@ class BotDataViewer:
             feed_url = data.get('feed_url')
             channel_name = data.get('channel_name')
             feed_name = data.get('feed_name')
-            check_interval = data.get('check_interval_seconds', 300)
+            check_interval = _validate_feed_interval(data.get('check_interval_seconds', 300))
             api_config = data.get('api_config')
             output_format = data.get('output_format')
             message_send_interval = data.get('message_send_interval_seconds')
@@ -5932,7 +7514,7 @@ class BotDataViewer:
 
             if 'check_interval_seconds' in data:
                 updates.append('check_interval_seconds = ?')
-                params.append(data['check_interval_seconds'])
+                params.append(_validate_feed_interval(data['check_interval_seconds']))
 
             if 'enabled' in data:
                 updates.append('enabled = ?')
@@ -5986,6 +7568,29 @@ class BotDataViewer:
             cursor.execute('DELETE FROM feed_subscriptions WHERE id = ?', (feed_id,))
             conn.commit()
             return cursor.rowcount > 0
+        except Exception:
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                conn.close()
+
+    def _reset_feed_errors(self, feed_id=None):
+        """Clear recorded feed errors. Pass a feed_id to clear one feed, or None for all.
+
+        Returns the number of error rows deleted.
+        """
+        conn = None
+        try:
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+            if feed_id is None:
+                cursor.execute('DELETE FROM feed_errors')
+            else:
+                cursor.execute('DELETE FROM feed_errors WHERE feed_id = ?', (feed_id,))
+            conn.commit()
+            return cursor.rowcount
         except Exception:
             if conn:
                 conn.rollback()
@@ -6261,7 +7866,6 @@ class BotDataViewer:
         from datetime import datetime
 
         import feedparser
-        import requests
 
         try:
             items = []
@@ -6285,17 +7889,53 @@ class BotDataViewer:
                 if self.config.has_section('Feed_Manager')
                 else feed_command_allow_private
             )
-            if not validate_external_url(feed_url, allow_private=allow_private_feeds):
+            url_policy = SafeUrlPolicy(allow_private=allow_private_feeds)
+            if not url_policy.validate(feed_url):
                 raise ValueError("Invalid or unsafe feed URL")
+            max_response_bytes = max(
+                1024,
+                self.config.getint(
+                    'Feed_Manager',
+                    'max_response_bytes',
+                    fallback=DEFAULT_MAX_FEED_RESPONSE_BYTES,
+                )
+                if self.config.has_section('Feed_Manager')
+                else DEFAULT_MAX_FEED_RESPONSE_BYTES,
+            )
+            max_parsed_items = max(
+                1,
+                self.config.getint(
+                    'Feed_Manager',
+                    'max_parsed_items',
+                    fallback=DEFAULT_MAX_PARSED_FEED_ITEMS,
+                )
+                if self.config.has_section('Feed_Manager')
+                else DEFAULT_MAX_PARSED_FEED_ITEMS,
+            )
+            preview_parse_limit = min(20, max_parsed_items)
 
             if feed_type == 'rss':
                 # Fetch RSS feed
-                response = requests.get(feed_url, timeout=30, headers={'User-Agent': 'MeshCoreBot/1.0 FeedManager'})
-                response.raise_for_status()
-                parsed = feedparser.parse(response.text)
+                with create_safe_requests_session(url_policy) as http_session:
+                    response = safe_requests_request(
+                        http_session,
+                        'GET',
+                        feed_url,
+                        policy=url_policy,
+                        timeout=30,
+                        headers={'User-Agent': 'MeshCoreBot/1.0 FeedManager'},
+                        stream=True,
+                    )
+                    with closing(response):
+                        content = _read_limited_requests_response(
+                            response,
+                            max_bytes=max_response_bytes,
+                            feed_type='rss',
+                        )
+                parsed = feedparser.parse(content)
 
                 # Get items (we'll filter and limit later)
-                for entry in parsed.entries[:20]:  # Fetch more items to account for filtering
+                for entry in parsed.entries[:preview_parse_limit]:
                     # Parse published date
                     published = None
                     if hasattr(entry, 'published_parsed') and entry.published_parsed:
@@ -6320,19 +7960,32 @@ class BotDataViewer:
                 body = api_config.get('body')
                 parser_config = api_config.get('response_parser', {})
 
-                if method == 'POST':
-                    response = requests.post(feed_url, headers=headers, params=params, json=body, timeout=30)
-                else:
-                    response = requests.get(feed_url, headers=headers, params=params, timeout=30)
-                response.raise_for_status()
+                with create_safe_requests_session(url_policy) as http_session:
+                    response = safe_requests_request(
+                        http_session,
+                        method,
+                        feed_url,
+                        policy=url_policy,
+                        headers=headers,
+                        params=params,
+                        json=body if method == 'POST' else None,
+                        timeout=30,
+                        stream=True,
+                    )
+                    with closing(response):
+                        content = _read_limited_requests_response(
+                            response,
+                            max_bytes=max_response_bytes,
+                            feed_type='api',
+                        )
 
                 # Try to parse JSON, handle cases where response might be a string
                 try:
-                    data = response.json()
-                except ValueError:
+                    data = json.loads(content)
+                except (UnicodeDecodeError, json.JSONDecodeError):
                     # If JSON parsing fails, try to get text and see if it's an error message
-                    text = response.text
-                    raise Exception(f"API returned non-JSON response: {text[:200]}")
+                    text_snippet = content[:200].decode('utf-8', errors='replace')
+                    raise Exception(f"API returned non-JSON response: {text_snippet[:200]}")
 
                 # Check if response is an error message (string)
                 if isinstance(data, str):
@@ -6373,32 +8026,9 @@ class BotDataViewer:
                 title_field = parser_config.get('title_field', 'title')
                 description_field = parser_config.get('description_field', 'description')
                 timestamp_field = parser_config.get('timestamp_field', 'created_at')
+                emoji_field = parser_config.get('emoji_field', 'emoji')
 
-                # Helper function to get nested values
-                def get_nested_value(data, path, default=''):
-                    if not path or not data:
-                        return default
-                    parts = path.split('.')
-                    value = data
-                    for part in parts:
-                        if isinstance(value, dict):
-                            value = value.get(part)
-                        elif isinstance(value, list):
-                            try:
-                                idx = int(part)
-                                if 0 <= idx < len(value):
-                                    value = value[idx]
-                                else:
-                                    return default
-                            except (ValueError, TypeError):
-                                return default
-                        else:
-                            return default
-                        if value is None:
-                            return default
-                    return value if value is not None else default
-
-                for item_data in items_data[:20]:  # Fetch more items to account for filtering
+                for item_data in items_data[:preview_parse_limit]:
                     # Ensure item_data is a dict
                     if not isinstance(item_data, dict):
                         # If it's not a dict, try to convert or skip
@@ -6420,7 +8050,7 @@ class BotDataViewer:
                                 elif isinstance(ts_value, str):
                                     # Try Microsoft date format first
                                     if ts_value.startswith('/Date('):
-                                        published = self._parse_microsoft_date(ts_value)
+                                        published = parse_microsoft_date(ts_value)
                                     else:
                                         # Try ISO format
                                         try:
@@ -6447,6 +8077,7 @@ class BotDataViewer:
 
                     items.append({
                         'title': get_nested_value(item_data, title_field, 'Untitled'),
+                        'emoji': get_nested_value(item_data, emoji_field, ''),
                         'description': description,
                         'link': item_data.get('link', '') if isinstance(item_data, dict) else '',
                         'published': published,
@@ -6455,16 +8086,16 @@ class BotDataViewer:
 
             # Apply sorting if configured
             if sort_config:
-                items = self._sort_items_preview(items, sort_config)
+                items = sort_feed_items(items, sort_config, log_warning=self.logger.warning)
 
             # Apply filter if configured
             if filter_config:
-                items = [item for item in items if self._should_include_item(item, filter_config)]
+                items = [item for item in items if item_passes_filter_config(item, filter_config)]
 
             # Limit to first 3 items after filtering
             items = items[:3]
 
-            # Format items using output format
+            # Format items using output format (shared with FeedManager)
             formatted_items = []
             for item in items:
                 formatted = self._format_feed_item(item, output_format, feed_name='')
@@ -6479,507 +8110,32 @@ class BotDataViewer:
             self.logger.error(f"Error previewing feed: {e}")
             raise
 
-    def _should_include_item(self, item: dict[str, Any], filter_config: dict) -> bool:
-        """Check if an item should be included based on filter configuration (preview; same rules as FeedManager)."""
-        from modules.feed_filter_eval import item_passes_filter_config
-
-        return item_passes_filter_config(item, filter_config)
-
-    def _parse_microsoft_date(self, date_str: str) -> datetime | None:
-        """Parse Microsoft JSON date format: /Date(timestamp-offset)/"""
-        import re
-
-        if not date_str or not isinstance(date_str, str):
-            return None
-
-        # Match /Date(timestamp-offset)/ format
-        match = re.match(r'/Date\((\d+)([+-]\d+)?\)/', date_str)
-        if match:
-            timestamp_ms = int(match.group(1))
-            offset_str = match.group(2) if match.group(2) else '+0000'
-
-            # Convert milliseconds to seconds
-            timestamp = timestamp_ms / 1000.0
-
-            # Parse offset (format: +0800 or -0800)
-            try:
-                offset_hours = int(offset_str[:3])
-                offset_mins = int(offset_str[3:5])
-                offset_seconds = (offset_hours * 3600) + (offset_mins * 60)
-                if offset_str[0] == '-':
-                    offset_seconds = -offset_seconds
-
-                # Create timezone-aware datetime
-                tz = timezone.utc
-                if offset_seconds != 0:
-                    from datetime import timedelta
-                    tz = timezone(timedelta(seconds=offset_seconds))
-
-                return datetime.fromtimestamp(timestamp, tz=tz)
-            except (ValueError, IndexError):
-                # Fallback to UTC if offset parsing fails
-                return datetime.fromtimestamp(timestamp, tz=timezone.utc)
-
-        return None
-
-    def _sort_items_preview(self, items: list[dict[str, Any]], sort_config: dict) -> list[dict[str, Any]]:
-        """Sort items based on sort configuration (standalone version for preview)"""
-        if not sort_config or not items:
-            return items
-
-        field_path = sort_config.get('field')
-        order = sort_config.get('order', 'desc').lower()
-
-        if not field_path:
-            return items
-
-        # Helper to get nested values
-        def get_nested_value(data, path, default=''):
-            if not path or not data:
-                return default
-            parts = path.split('.')
-            value = data
-            for part in parts:
-                if isinstance(value, dict):
-                    value = value.get(part)
-                elif isinstance(value, list):
-                    try:
-                        idx = int(part)
-                        if 0 <= idx < len(value):
-                            value = value[idx]
-                        else:
-                            return default
-                    except (ValueError, TypeError):
-                        return default
-                else:
-                    return default
-                if value is None:
-                    return default
-            return value if value is not None else default
-
-        def get_sort_value(item):
-            """Get the sort value for an item"""
-            # Try raw data first
-            raw_data = item.get('raw', {})
-            value = get_nested_value(raw_data, field_path, '')
-
-            if not value and field_path.startswith('raw.'):
-                value = get_nested_value(raw_data, field_path[4:], '')
-
-            if not value:
-                value = get_nested_value(item, field_path, '')
-
-            # Handle Microsoft date format
-            if isinstance(value, str) and value.startswith('/Date('):
-                dt = self._parse_microsoft_date(value)
-                if dt:
-                    return dt.timestamp()
-
-            # Handle datetime objects
-            if isinstance(value, datetime):
-                return value.timestamp()
-
-            # Handle numeric values
-            if isinstance(value, (int, float)):
-                return float(value)
-
-            # Handle string timestamps
-            if isinstance(value, str):
-                # Try to parse as ISO format
-                try:
-                    dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
-                    return dt.timestamp()
-                except ValueError:
-                    pass
-
-                # Try common date formats
-                for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d']:
-                    try:
-                        dt = datetime.strptime(value, fmt)
-                        return dt.timestamp()
-                    except ValueError:
-                        continue
-
-            # For strings, use lexicographic comparison
-            return str(value)
-
-        # Sort items
-        try:
-            sorted_items = sorted(items, key=get_sort_value, reverse=(order == 'desc'))
-            return sorted_items
-        except Exception as e:
-            self.logger.warning(f"Error sorting items in preview: {e}")
-            return items
-
     def _format_feed_item(self, item: dict[str, Any], format_str: str, feed_name: str = '') -> str:
-        """Format a feed item using the output format (standalone version)"""
-        import html
-        import re
-        from datetime import datetime
-
-        # Extract field values (NULL/missing fields must not become None for str ops)
-        title = item.get('title') or 'Untitled'
-        body = item.get('description', '') or item.get('body', '')
-
-        # Clean HTML from body if present
-        if body:
-            body = html.unescape(body)
-            # Convert line break tags to newlines before stripping other HTML
-            # Handle <br>, <br/>, <br />, <BR>, etc.
-            body = re.sub(r'<br\s*/?>', '\n', body, flags=re.IGNORECASE)
-            # Convert paragraph tags to newlines (with spacing)
-            body = re.sub(r'</p>', '\n\n', body, flags=re.IGNORECASE)
-            body = re.sub(r'<p[^>]*>', '', body, flags=re.IGNORECASE)
-            # Remove remaining HTML tags
-            body = re.sub(r'<[^>]+>', '', body)
-            # Clean up whitespace (preserve intentional line breaks)
-            # Replace multiple newlines with double newline, then normalize spaces within lines
-            body = re.sub(r'\n\s*\n\s*\n+', '\n\n', body)  # Multiple newlines -> double newline
-            lines = body.split('\n')
-            body = '\n'.join(' '.join(line.split()) for line in lines)  # Normalize spaces per line
-            body = body.strip()
-
-        link_original = _coerce_url_string(item.get('link', ''))
-        published = item.get('published')
-
-        # Format timestamp
-        date_str = ""
-        if published:
-            try:
-                now = datetime.now(timezone.utc) if published.tzinfo else datetime.now()
-
-                diff = now - published
-                minutes = int(diff.total_seconds() / 60)
-
-                if minutes < 1:
-                    date_str = "now"
-                elif minutes < 60:
-                    date_str = f"{minutes}m ago"
-                elif minutes < 1440:
-                    hours = minutes // 60
-                    mins = minutes % 60
-                    date_str = f"{hours}h {mins}m ago"
-                else:
-                    days = minutes // 1440
-                    date_str = f"{days}d ago"
-            except Exception:
-                pass
-
-        # Choose emoji
-        emoji = "📢"
-        feed_name_lower = (feed_name or '').lower()
-        if 'emergency' in feed_name_lower or 'alert' in feed_name_lower:
-            emoji = "🚨"
-        elif 'warning' in feed_name_lower:
-            emoji = "⚠️"
-        elif 'info' in feed_name_lower or 'news' in feed_name_lower:
-            emoji = "ℹ️"
-
-        # Build replacements
-        replacements = {
-            'title': title,
-            'body': body,
-            'date': date_str,
-            'link': link_original,
-            'emoji': emoji
-        }
-
-        # Get raw API data if available (for preview, we don't have raw data, so this will be empty)
-        raw_data = item.get('raw', {})
-
-        # Helper to get nested values
-        def get_nested_value(data, path, default=''):
-            if not path or not data:
-                return default
-            parts = path.split('.')
-            value = data
-            for part in parts:
-                if isinstance(value, dict):
-                    value = value.get(part)
-                elif isinstance(value, list):
-                    try:
-                        idx = int(part)
-                        if 0 <= idx < len(value):
-                            value = value[idx]
-                        else:
-                            return default
-                    except (ValueError, TypeError):
-                        return default
-                else:
-                    return default
-                if value is None:
-                    return default
-            return value if value is not None else default
-
-        # Apply shortening, parsing, and conditional functions
-        def apply_shortening(text: str, function: str) -> str:
-            fn = (function or "").strip()
-            if fn == 'shorten' or fn.startswith('shorten|'):
-                from modules.url_shortener import shorten_url_sync
-                if not (text or "").strip():
-                    return ""
-                if fn == 'shorten':
-                    out = shorten_url_sync(
-                        text, config=self.config, logger=self.logger
-                    )
-                    return out if out else text
-                rest = fn.split('|', 1)[1].strip()
-                out = shorten_url_sync(
-                    text, config=self.config, logger=self.logger
-                )
-                base = out if out else text
-                return apply_shortening(base, rest)
-
-            if not text:
-                return ""
-
-            if function.startswith('truncate:'):
-                try:
-                    max_len = int(function.split(':', 1)[1])
-                    if len(text) <= max_len:
-                        return text
-                    return text[:max_len] + "..."
-                except (ValueError, IndexError):
-                    return text
-            elif function.startswith('word_wrap:'):
-                try:
-                    max_len = int(function.split(':', 1)[1])
-                    if len(text) <= max_len:
-                        return text
-                    truncated = text[:max_len]
-                    last_space = truncated.rfind(' ')
-                    if last_space > max_len * 0.7:
-                        return truncated[:last_space] + "..."
-                    return truncated + "..."
-                except (ValueError, IndexError):
-                    return text
-            elif function.startswith('first_words:'):
-                try:
-                    num_words = int(function.split(':', 1)[1])
-                    words = text.split()
-                    if len(words) <= num_words:
-                        return text
-                    return ' '.join(words[:num_words]) + "..."
-                except (ValueError, IndexError):
-                    return text
-            elif function.startswith('regex:'):
-                try:
-                    # Parse regex pattern and optional group number
-                    # Format: regex:pattern:group or regex:pattern
-                    # Need to handle patterns that contain colons, so split from the right
-                    remaining = function[6:]  # Skip 'regex:' prefix
-
-                    # Try to find the last colon that's followed by a number (the group number)
-                    # Look for pattern like :N at the end
-                    last_colon_idx = remaining.rfind(':')
-                    pattern = remaining
-                    group_num = None
-
-                    if last_colon_idx > 0:
-                        # Check if what's after the last colon is a number
-                        potential_group = remaining[last_colon_idx + 1:]
-                        if potential_group.isdigit():
-                            pattern = remaining[:last_colon_idx]
-                            group_num = int(potential_group)
-
-                    if not pattern:
-                        return text
-
-                    # Apply regex
-                    match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-                    if match:
-                        if group_num is not None:
-                            # Use specified group (0 = whole match, 1 = first group, etc.)
-                            if 0 <= group_num <= len(match.groups()):
-                                return match.group(group_num) if group_num > 0 else match.group(0)
-                        else:
-                            # Use first capture group if available, otherwise whole match
-                            if match.groups():
-                                return match.group(1)
-                            else:
-                                return match.group(0)
-                    return ""  # No match found
-                except (ValueError, IndexError, re.error):
-                    # Silently fail on regex errors in preview
-                    return text
-            elif function.startswith('if_regex:'):
-                try:
-                    # Parse: if_regex:pattern:then:else
-                    # Split by ':' but need to handle regex patterns that contain ':'
-                    parts = function[9:].split(':', 2)  # Skip 'if_regex:' prefix, split into [pattern, then, else]
-                    if len(parts) < 3:
-                        return text
-
-                    pattern = parts[0]
-                    then_value = parts[1]
-                    else_value = parts[2]
-
-                    if not pattern:
-                        return text
-
-                    # Check if pattern matches
-                    match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-                    if match:
-                        return then_value
-                    else:
-                        return else_value
-                except (ValueError, IndexError, re.error):
-                    # Silently fail on regex errors in preview
-                    return text
-            elif function.startswith('switch:'):
-                try:
-                    # Parse: switch:value1:result1:value2:result2:...:default
-                    # Example: switch:highest:🔴:high:🟠:medium:🟡:low:⚪:⚪
-                    parts = function[7:].split(':')  # Skip 'switch:' prefix
-                    if len(parts) < 2:
-                        return text
-
-                    # Pairs of value:result, last one is default
-                    text_lower = text.lower().strip()
-                    for i in range(0, len(parts) - 1, 2):
-                        if i + 1 < len(parts):
-                            value = parts[i].lower()
-                            result = parts[i + 1]
-                            if text_lower == value:
-                                return result
-
-                    # Return last part as default if no match
-                    return parts[-1] if parts else text
-                except (ValueError, IndexError):
-                    # Silently fail on switch errors in preview
-                    return text
-            elif function.startswith('regex_cond:'):
-                try:
-                    # Parse: regex_cond:extract_pattern:check_pattern:then:group
-                    parts = function[11:].split(':', 3)  # Skip 'regex_cond:' prefix
-                    if len(parts) < 4:
-                        return text
-
-                    extract_pattern = parts[0]
-                    check_pattern = parts[1]
-                    then_value = parts[2]
-                    else_group = int(parts[3]) if parts[3].isdigit() else 1
-
-                    if not extract_pattern:
-                        return text
-
-                    # Extract using extract_pattern
-                    match = re.search(extract_pattern, text, re.IGNORECASE | re.DOTALL)
-                    if match:
-                        # Get the captured group
-                        if match.groups():
-                            extracted = match.group(else_group) if else_group <= len(match.groups()) else match.group(1)
-                            # Strip whitespace from extracted text
-                            extracted = extracted.strip()
-                        else:
-                            extracted = match.group(0).strip()
-
-                        # Check if extracted text matches check_pattern (exact match or contains)
-                        if check_pattern:
-                            # Try exact match first, then substring match
-                            if extracted.lower() == check_pattern.lower() or re.search(check_pattern, extracted, re.IGNORECASE):
-                                return then_value
-
-                        return extracted
-                    return ""  # No match found
-                except (ValueError, IndexError, re.error):
-                    # Silently fail on regex errors in preview
-                    return text
-            return text
-
-        def _preview_auto_base_value(field_name: str) -> str:
-            if field_name.startswith('raw.'):
-                value = get_nested_value(raw_data, field_name[4:], '')
-                if value is None:
-                    return ''
-                if isinstance(value, (dict, list)):
-                    try:
-                        return json.dumps(value)
-                    except Exception:
-                        return str(value)
-                return str(value)
-            if field_name == 'link':
-                return link_original or ''
-            return str(replacements.get(field_name, '') or '')
-
-        # Process format string
-        def replace_placeholder(match):
-            content = match.group(1)
-            if '|' in content:
-                field_name, function = content.split('|', 1)
-                field_name = field_name.strip()
-                function = function.strip()
-                if function == 'auto':
-                    return ''
-
-                # Check if it's a raw field access
-                if field_name.startswith('raw.'):
-                    value = str(get_nested_value(raw_data, field_name[4:], ''))
-                else:
-                    value = replacements.get(field_name, '')
-
-                return apply_shortening(value, function)
-            else:
-                field_name = content.strip()
-
-                # Check if it's a raw field access
-                if field_name.startswith('raw.'):
-                    value = get_nested_value(raw_data, field_name[4:], '')
-                    if value is None:
-                        return ''
-                    elif isinstance(value, (dict, list)):
-                        try:
-                            import json
-                            return json.dumps(value)
-                        except Exception:
-                            return str(value)
-                    else:
-                        return str(value)
-                else:
-                    return replacements.get(field_name, '')
-
+        """Format a feed item using the shared feed formatter (parity with FeedManager)."""
         try:
             max_length = self.config.getint(
                 'Feed_Manager', 'max_message_length', fallback=130
             )
         except Exception:
             max_length = 130
-
-        auto_slots = FeedManager._feed_format_auto_slots(format_str)
-        if len(auto_slots) > 1:
-            self.logger.warning(
-                'Multiple {field|auto} placeholders in feed output format; '
-                'only the first expands. Others render empty.'
+        try:
+            shorten_feed_urls = (
+                self.config.getboolean('Feed_Manager', 'shorten_urls', fallback=False)
+                if self.config.has_section('Feed_Manager')
+                else False
             )
+        except ValueError:
+            shorten_feed_urls = False
 
-        if len(auto_slots) >= 1:
-            start, end, auto_field = auto_slots[0]
-            prefix = format_str[:start]
-            suffix = format_str[end:]
-            prefix_r = re.sub(r'\{([^}]+)\}', replace_placeholder, prefix)
-            suffix_r = re.sub(r'\{([^}]+)\}', replace_placeholder, suffix)
-            budget = max_length - len(prefix_r) - len(suffix_r)
-            raw_auto = _preview_auto_base_value(auto_field)
-            auto_text = FeedManager._truncate_to_budget(raw_auto, budget)
-            message = prefix_r + auto_text + suffix_r
-        else:
-            message = re.sub(r'\{([^}]+)\}', replace_placeholder, format_str)
-
-        # Final truncation (mesh limit)
-        if len(message) > max_length:
-            lines = message.split('\n')
-            if len(lines) > 1:
-                total_length = sum(len(line) + 1 for line in lines[:-1])
-                remaining = max_length - total_length - 3
-                if remaining > 20:
-                    lines[-1] = lines[-1][:remaining] + "..."
-                    message = '\n'.join(lines)
-                else:
-                    message = message[:max_length - 3] + "..."
-            else:
-                message = message[:max_length - 3] + "..."
-
-        return message
+        return format_feed_message(
+            item,
+            format_str,
+            feed_name=feed_name or '',
+            max_message_length=max_length,
+            shorten_feed_urls=shorten_feed_urls,
+            config=self.config,
+            logger=self.logger,
+        )
 
     def _get_bot_uptime(self):
         """Get bot uptime in seconds from database"""
@@ -7094,618 +8250,20 @@ class BotDataViewer:
             }
 
     def _decode_path_hex(self, path_hex: str, bytes_per_hop: int | None = None) -> list[dict[str, Any]]:
+        """Decode a hex path string to repeater nodes.
+
+        Thin wrapper over the shared engine (modules.path_inference.decode_path_nodes); the
+        bot `path` command and /api/mesh/resolve-path use the same implementation.
         """
-        Decode hex path string to repeater names using the same sophisticated logic as path command.
-        Returns a list of dictionaries with node_id and repeater info.
-
-        When the path came from a packet with 2-byte or 3-byte hops, pass bytes_per_hop (2 or 3)
-        so node IDs and graph selection use the correct prefix length.
-        """
-        import math
-        import re
-        from datetime import datetime
-
-        # Parse the path input - use bytes_per_hop when provided (e.g. from packet/contact)
-        if bytes_per_hop is not None and bytes_per_hop in (1, 2, 3):
-            prefix_hex_chars = bytes_per_hop * 2
-        else:
-            prefix_hex_chars = self.config.getint('Bot', 'prefix_bytes', fallback=1) * 2
-        if prefix_hex_chars <= 0:
-            prefix_hex_chars = 2
-        path_input_clean = path_hex.replace(' ', '').replace(',', '').replace(':', '')
-        if re.match(r'^[0-9a-fA-F]{4,}$', path_input_clean):
-            # Continuous hex string - split using configured prefix length
-            hex_matches = [path_input_clean[i:i+prefix_hex_chars] for i in range(0, len(path_input_clean), prefix_hex_chars)]
-            if (len(path_input_clean) % prefix_hex_chars) != 0 and prefix_hex_chars > 2:
-                hex_matches = [path_input_clean[i:i+2] for i in range(0, len(path_input_clean), 2)]
-        else:
-            # Space/comma-separated format
-            path_input = path_hex.replace(',', ' ').replace(':', ' ')
-            hex_pattern = rf'[0-9a-fA-F]{{{prefix_hex_chars}}}'
-            hex_matches = re.findall(hex_pattern, path_input)
-            if not hex_matches and prefix_hex_chars > 2:
-                hex_pattern = r'[0-9a-fA-F]{2}'
-                hex_matches = re.findall(hex_pattern, path_input)
-
-        if not hex_matches:
-            return []
-
-        # Convert to uppercase for consistency
-        node_ids = [match.upper() for match in hex_matches]
-
-        # Load Path_Command config values (same as path command)
-        geographic_guessing_enabled = False
-        bot_latitude = None
-        bot_longitude = None
-
-        try:
-            if self.config.has_section('Bot'):
-                lat = self.config.getfloat('Bot', 'bot_latitude', fallback=None)
-                lon = self.config.getfloat('Bot', 'bot_longitude', fallback=None)
-                if lat is not None and lon is not None and -90 <= lat <= 90 and -180 <= lon <= 180:
-                    bot_latitude = lat
-                    bot_longitude = lon
-                    geographic_guessing_enabled = True
-        except (ValueError, configparser.Error):  # malformed float or missing section
-            pass
-
-        self.config.get('Path_Command', 'proximity_method', fallback='simple')
-        max_proximity_range = self.config.getfloat('Path_Command', 'max_proximity_range', fallback=200.0)
-        max_repeater_age_days = self.config.getint('Path_Command', 'max_repeater_age_days', fallback=14)
-        recency_weight = self.config.getfloat('Path_Command', 'recency_weight', fallback=0.4)
-        recency_weight = max(0.0, min(1.0, recency_weight))
-        proximity_weight = 1.0 - recency_weight
-        recency_decay_half_life_hours = self.config.getfloat('Path_Command', 'recency_decay_half_life_hours', fallback=12.0)
-
-        # Check for preset first, then apply individual settings (preset can be overridden)
-        preset = self.config.get('Path_Command', 'path_selection_preset', fallback='balanced').lower()
-
-        # Apply preset defaults, then individual settings override
-        if preset == 'geographic':
-            preset_graph_confidence_threshold = 0.5
-            preset_distance_threshold = 30.0
-            preset_distance_penalty = 0.5
-            preset_final_hop_weight = 0.4
-        elif preset == 'graph':
-            preset_graph_confidence_threshold = 0.9
-            preset_distance_threshold = 50.0
-            preset_distance_penalty = 0.2
-            preset_final_hop_weight = 0.15
-        else:  # 'balanced' (default)
-            preset_graph_confidence_threshold = 0.7
-            preset_distance_threshold = 30.0
-            preset_distance_penalty = 0.3
-            preset_final_hop_weight = 0.25
-
-        graph_based_validation = self.config.getboolean('Path_Command', 'graph_based_validation', fallback=True)
-        min_edge_observations = self.config.getint('Path_Command', 'min_edge_observations', fallback=3)
-        graph_use_bidirectional = self.config.getboolean('Path_Command', 'graph_use_bidirectional', fallback=True)
-        graph_use_hop_position = self.config.getboolean('Path_Command', 'graph_use_hop_position', fallback=True)
-        graph_multi_hop_enabled = self.config.getboolean('Path_Command', 'graph_multi_hop_enabled', fallback=True)
-        graph_multi_hop_max_hops = self.config.getint('Path_Command', 'graph_multi_hop_max_hops', fallback=2)
-        graph_geographic_combined = self.config.getboolean('Path_Command', 'graph_geographic_combined', fallback=False)
-        graph_geographic_weight = self.config.getfloat('Path_Command', 'graph_geographic_weight', fallback=0.7)
-        graph_geographic_weight = max(0.0, min(1.0, graph_geographic_weight))
-        graph_confidence_override_threshold = self.config.getfloat('Path_Command', 'graph_confidence_override_threshold', fallback=preset_graph_confidence_threshold)
-        graph_confidence_override_threshold = max(0.0, min(1.0, graph_confidence_override_threshold))
-        graph_distance_penalty_enabled = self.config.getboolean('Path_Command', 'graph_distance_penalty_enabled', fallback=True)
-        graph_max_reasonable_hop_distance_km = self.config.getfloat('Path_Command', 'graph_max_reasonable_hop_distance_km', fallback=preset_distance_threshold)
-        graph_distance_penalty_strength = self.config.getfloat('Path_Command', 'graph_distance_penalty_strength', fallback=preset_distance_penalty)
-        graph_distance_penalty_strength = max(0.0, min(1.0, graph_distance_penalty_strength))
-        graph_zero_hop_bonus = self.config.getfloat('Path_Command', 'graph_zero_hop_bonus', fallback=0.4)
-        graph_zero_hop_bonus = max(0.0, min(1.0, graph_zero_hop_bonus))
-        graph_prefer_stored_keys = self.config.getboolean('Path_Command', 'graph_prefer_stored_keys', fallback=True)
-        graph_final_hop_proximity_enabled = self.config.getboolean('Path_Command', 'graph_final_hop_proximity_enabled', fallback=True)
-        graph_final_hop_proximity_weight = self.config.getfloat('Path_Command', 'graph_final_hop_proximity_weight', fallback=preset_final_hop_weight)
-        graph_final_hop_proximity_weight = max(0.0, min(1.0, graph_final_hop_proximity_weight))
-        graph_final_hop_max_distance = self.config.getfloat('Path_Command', 'graph_final_hop_max_distance', fallback=0.0)
-        graph_final_hop_proximity_normalization_km = self.config.getfloat('Path_Command', 'graph_final_hop_proximity_normalization_km', fallback=200.0)  # Long LoRa range
-        graph_final_hop_very_close_threshold_km = self.config.getfloat('Path_Command', 'graph_final_hop_very_close_threshold_km', fallback=10.0)
-        graph_final_hop_close_threshold_km = self.config.getfloat('Path_Command', 'graph_final_hop_close_threshold_km', fallback=30.0)  # Typical LoRa range
-        graph_final_hop_max_proximity_weight = self.config.getfloat('Path_Command', 'graph_final_hop_max_proximity_weight', fallback=0.6)
-        graph_final_hop_max_proximity_weight = max(0.0, min(1.0, graph_final_hop_max_proximity_weight))
-        graph_path_validation_max_bonus = self.config.getfloat('Path_Command', 'graph_path_validation_max_bonus', fallback=0.3)
-        graph_path_validation_max_bonus = max(0.0, min(1.0, graph_path_validation_max_bonus))
-        graph_path_validation_obs_divisor = self.config.getfloat('Path_Command', 'graph_path_validation_obs_divisor', fallback=50.0)
-        star_bias_multiplier = self.config.getfloat('Path_Command', 'star_bias_multiplier', fallback=2.5)
-        star_bias_multiplier = max(1.0, star_bias_multiplier)
-
-        # Use calculate_distance from utils (already imported)
-
-        # Helper: calculate recency scores
-        def calculate_recency_weighted_scores(repeaters):
-            scored_repeaters = []
-            now = datetime.now()
-
-            for repeater in repeaters:
-                most_recent_time = None
-                for field in ['last_heard', 'last_advert_timestamp', 'last_seen']:
-                    value = repeater.get(field)
-                    if value:
-                        try:
-                            if isinstance(value, str):
-                                dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
-                            else:
-                                dt = value
-                            if most_recent_time is None or dt > most_recent_time:
-                                most_recent_time = dt
-                        except:
-                            pass
-
-                if most_recent_time is None:
-                    recency_score = 0.1
-                else:
-                    hours_ago = (now - most_recent_time).total_seconds() / 3600.0
-                    recency_score = math.exp(-hours_ago / recency_decay_half_life_hours)
-                    recency_score = max(0.0, min(1.0, recency_score))
-
-                scored_repeaters.append((repeater, recency_score))
-
-            scored_repeaters.sort(key=lambda x: x[1], reverse=True)
-            return scored_repeaters
-
-        # Helper: graph-based selection with final hop proximity and path validation
-        # When path was decoded with 2-byte or 3-byte hops, node_id/path_context have 4 or 6 hex chars;
-        # use path_prefix_hex_chars for candidate matching and normalize to graph_n for edge lookups.
-        def select_repeater_by_graph(repeaters, node_id, path_context):
-            if not graph_based_validation or not hasattr(self, 'mesh_graph') or not self.mesh_graph:
-                return None, 0.0, None
-
-            mesh_graph = self.mesh_graph
-            graph_n = prefix_hex_chars
-            path_prefix_hex_chars = len(node_id) if node_id else graph_n
-            prefix_n = path_prefix_hex_chars if path_prefix_hex_chars >= 2 else graph_n
-
-            try:
-                current_index = path_context.index(node_id) if node_id in path_context else -1
-            except Exception:
-                current_index = -1
-
-            if current_index == -1:
-                return None, 0.0, None
-
-            prev_node_id = path_context[current_index - 1] if current_index > 0 else None
-            next_node_id = path_context[current_index + 1] if current_index < len(path_context) - 1 else None
-            prev_norm = (prev_node_id[:graph_n].lower() if prev_node_id and len(prev_node_id) > graph_n else (prev_node_id.lower() if prev_node_id else None))
-            next_norm = (next_node_id[:graph_n].lower() if next_node_id and len(next_node_id) > graph_n else (next_node_id.lower() if next_node_id else None))
-
-            best_repeater = None
-            best_score = 0.0
-            best_method = None
-
-            for repeater in repeaters:
-                candidate_prefix = repeater.get('public_key', '')[:prefix_n].lower() if repeater.get('public_key') else None
-                candidate_public_key = repeater.get('public_key', '').lower() if repeater.get('public_key') else None
-                if not candidate_prefix:
-                    continue
-                candidate_norm = candidate_prefix[:graph_n].lower() if len(candidate_prefix) > graph_n else candidate_prefix
-
-                graph_score = mesh_graph.get_candidate_score(
-                    candidate_norm, prev_norm, next_norm, min_edge_observations,
-                    hop_position=current_index if graph_use_hop_position else None,
-                    use_bidirectional=graph_use_bidirectional,
-                    use_hop_position=graph_use_hop_position
-                )
-
-                stored_key_bonus = 0.0
-                if graph_prefer_stored_keys and candidate_public_key:
-                    if prev_norm:
-                        prev_to_candidate_edge = mesh_graph.get_edge(prev_norm, candidate_norm)
-                        if prev_to_candidate_edge:
-                            stored_to_key = prev_to_candidate_edge.get('to_public_key', '').lower() if prev_to_candidate_edge.get('to_public_key') else None
-                            if stored_to_key and stored_to_key == candidate_public_key:
-                                stored_key_bonus = max(stored_key_bonus, 0.4)
-
-                    if next_norm:
-                        candidate_to_next_edge = mesh_graph.get_edge(candidate_norm, next_norm)
-                        if candidate_to_next_edge:
-                            stored_from_key = candidate_to_next_edge.get('from_public_key', '').lower() if candidate_to_next_edge.get('from_public_key') else None
-                            if stored_from_key and stored_from_key == candidate_public_key:
-                                stored_key_bonus = max(stored_key_bonus, 0.4)
-
-                # Zero-hop bonus: If this repeater has been heard directly by the bot (zero-hop advert),
-                # it's strong evidence it's close and should be preferred, even for intermediate hops
-                zero_hop_bonus = 0.0
-                hop_count = repeater.get('hop_count')
-                if hop_count is not None and hop_count == 0:
-                    # This repeater has been heard directly - strong evidence it's close to bot
-                    zero_hop_bonus = graph_zero_hop_bonus
-
-                graph_score_with_bonus = min(1.0, graph_score + stored_key_bonus + zero_hop_bonus)
-
-                multi_hop_score = 0.0
-                if graph_multi_hop_enabled and graph_score_with_bonus < 0.6 and prev_norm and next_norm:
-                    intermediate_candidates = mesh_graph.find_intermediate_nodes(
-                        prev_norm, next_norm, min_edge_observations,
-                        max_hops=graph_multi_hop_max_hops
-                    )
-                    for intermediate_prefix, intermediate_score in intermediate_candidates:
-                        if intermediate_prefix == candidate_norm:
-                            multi_hop_score = intermediate_score
-                            break
-
-                candidate_score = max(graph_score_with_bonus, multi_hop_score)
-                method = 'graph_multihop' if multi_hop_score > graph_score_with_bonus else 'graph'
-
-                # Apply distance penalty for intermediate hops (prevents selecting very distant repeaters)
-                # This is especially important when graph has strong evidence for long-distance links
-                if graph_distance_penalty_enabled and next_norm is not None:  # Not final hop
-                    repeater_lat = repeater.get('latitude')
-                    repeater_lon = repeater.get('longitude')
-
-                    if repeater_lat is not None and repeater_lon is not None:
-                        max_distance = 0.0
-
-                        # Check distance from previous node to candidate (use stored edge distance if available)
-                        if prev_norm:
-                            prev_to_candidate_edge = mesh_graph.get_edge(prev_norm, candidate_norm)
-                            if prev_to_candidate_edge and prev_to_candidate_edge.get('geographic_distance'):
-                                distance = prev_to_candidate_edge.get('geographic_distance')
-                                max_distance = max(max_distance, distance)
-
-                        # Check distance from candidate to next node (use stored edge distance if available)
-                        if next_norm:
-                            candidate_to_next_edge = mesh_graph.get_edge(candidate_norm, next_norm)
-                            if candidate_to_next_edge and candidate_to_next_edge.get('geographic_distance'):
-                                distance = candidate_to_next_edge.get('geographic_distance')
-                                max_distance = max(max_distance, distance)
-
-                        # Apply penalty if distance exceeds reasonable hop distance
-                        if max_distance > graph_max_reasonable_hop_distance_km:
-                            excess_distance = max_distance - graph_max_reasonable_hop_distance_km
-                            normalized_excess = min(excess_distance / graph_max_reasonable_hop_distance_km, 1.0)
-                            penalty = normalized_excess * graph_distance_penalty_strength
-                            candidate_score = candidate_score * (1.0 - penalty)
-                        elif max_distance > 0:
-                            # Even if under threshold, very long hops should get a small penalty
-                            if max_distance > graph_max_reasonable_hop_distance_km * 0.8:
-                                small_penalty = (max_distance - graph_max_reasonable_hop_distance_km * 0.8) / (graph_max_reasonable_hop_distance_km * 0.2) * graph_distance_penalty_strength * 0.5
-                                candidate_score = candidate_score * (1.0 - small_penalty)
-
-                # For final hop (next_norm is None), add bot location proximity bonus
-                # This is critical for final hop selection - the last repeater before the bot should be close
-                if next_norm is None and graph_final_hop_proximity_enabled:
-                    if bot_latitude is not None and bot_longitude is not None:
-                        repeater_lat = repeater.get('latitude')
-                        repeater_lon = repeater.get('longitude')
-
-                        if repeater_lat is not None and repeater_lon is not None:
-                            distance = calculate_distance(bot_latitude, bot_longitude, repeater_lat, repeater_lon)
-
-                            if graph_final_hop_max_distance > 0 and distance > graph_final_hop_max_distance:
-                                # Beyond max distance - significantly penalize this candidate for final hop
-                                candidate_score *= 0.3  # Heavy penalty for distant final hop
-                            else:
-                                # Normalize distance to 0-1 score (inverse: closer = higher score)
-                                # Use configurable normalization distance (default 500km for more aggressive scoring)
-                                normalized_distance = min(distance / graph_final_hop_proximity_normalization_km, 1.0)
-                                proximity_score = 1.0 - normalized_distance
-
-                                # For final hop, use a higher effective weight to ensure proximity matters more
-                                # The configured weight is a minimum; we boost it for very close repeaters
-                                effective_weight = graph_final_hop_proximity_weight
-                                if distance < graph_final_hop_very_close_threshold_km:
-                                    # Very close - boost weight up to max
-                                    effective_weight = min(graph_final_hop_max_proximity_weight, graph_final_hop_proximity_weight * 2.0)
-                                elif distance < graph_final_hop_close_threshold_km:
-                                    # Close - moderate boost
-                                    effective_weight = min(0.5, graph_final_hop_proximity_weight * 1.5)
-
-                                # Combine with graph score using effective weight
-                                candidate_score = candidate_score * (1.0 - effective_weight) + proximity_score * effective_weight
-
-                # Path validation bonus: Check if candidate's stored paths match the current path context
-                # This is especially important for prefix collision resolution
-                path_validation_bonus = 0.0
-                if candidate_public_key and len(path_context) > 1:
-                    try:
-                        query = '''
-                            SELECT path_hex, observation_count, last_seen, from_prefix, to_prefix, bytes_per_hop
-                            FROM observed_paths
-                            WHERE public_key = ? AND packet_type = 'advert'
-                            ORDER BY observation_count DESC, last_seen DESC
-                            LIMIT 10
-                        '''
-                        stored_paths = self.db_manager.execute_query(query, (candidate_public_key,))
-
-                        if stored_paths:
-                            decoded_path_hex = ''.join([node.lower() for node in path_context])
-                            # Build the path prefix up to (but not including) the current node
-                            # This helps match paths where the candidate appears at the same position
-                            path_prefix_up_to_current = ''.join([node.lower() for node in path_context[:current_index]])
-
-                            for stored_path in stored_paths:
-                                stored_hex = stored_path.get('path_hex', '').lower()
-                                obs_count = stored_path.get('observation_count', 1)
-
-                                if stored_hex:
-                                    n = (stored_path.get('bytes_per_hop') or 1) * 2
-                                    if n <= 0:
-                                        n = 2
-                                    stored_nodes = [stored_hex[i:i+n] for i in range(0, len(stored_hex), n)]
-                                    if (len(stored_hex) % n) != 0:
-                                        stored_nodes = [stored_hex[i:i+2] for i in range(0, len(stored_hex), 2)]
-                                    decoded_nodes = path_context if path_context else [decoded_path_hex[i:i+n] for i in range(0, len(decoded_path_hex), n)]
-
-                                    # Check for exact path match (full path)
-                                    common_segments = 0
-                                    min_len = min(len(stored_nodes), len(decoded_nodes))
-                                    for i in range(min_len):
-                                        if stored_nodes[i] == decoded_nodes[i]:
-                                            common_segments += 1
-                                        else:
-                                            break
-
-                                    # Also check if stored path starts with the same prefix as the decoded path up to current position
-                                    # This is important for matching paths where the candidate appears at the same position
-                                    prefix_match = False
-                                    if path_prefix_up_to_current and len(stored_hex) >= len(path_prefix_up_to_current):
-                                        if stored_hex.startswith(path_prefix_up_to_current):
-                                            # The stored path has the same prefix, and the candidate appears at the same position
-                                            # This is a strong indicator of a match
-                                            prefix_match = True
-
-                                    if common_segments >= 2 or prefix_match:
-                                        # Stronger bonus for prefix matches (indicates same path structure)
-                                        if prefix_match and common_segments >= current_index:
-                                            segment_bonus = min(graph_path_validation_max_bonus, 0.1 * (current_index + 1))
-                                        else:
-                                            segment_bonus = min(0.2, 0.05 * common_segments)
-                                        obs_bonus = min(0.15, obs_count / graph_path_validation_obs_divisor)
-                                        path_validation_bonus = max(path_validation_bonus, segment_bonus + obs_bonus)
-                                        # Cap at max bonus
-                                        path_validation_bonus = min(graph_path_validation_max_bonus, path_validation_bonus)
-                                        if path_validation_bonus >= graph_path_validation_max_bonus * 0.9:
-                                            break  # Strong match found, no need to check more
-                    except (sqlite3.Error, OSError, KeyError, ValueError) as _score_err:
-                        self.logger.debug("Path-scoring graph query failed: %s", _score_err)
-
-                candidate_score = min(1.0, candidate_score + path_validation_bonus)
-
-                if repeater.get('is_starred', False):
-                    candidate_score *= star_bias_multiplier
-
-                if candidate_score > best_score:
-                    best_score = candidate_score
-                    best_repeater = repeater
-                    best_method = method
-
-            if best_repeater and best_score > 0.0:
-                confidence = min(1.0, best_score) if best_score <= 1.0 else 0.95 + (min(0.05, (best_score - 1.0) / star_bias_multiplier))
-                return best_repeater, confidence, best_method or 'graph'
-
-            return None, 0.0, None
-
-        # Helper: simple proximity selection
-        def select_by_simple_proximity(repeaters_with_location):
-            scored_repeaters = calculate_recency_weighted_scores(repeaters_with_location)
-            min_recency_threshold = 0.01
-            scored_repeaters = [(r, score) for r, score in scored_repeaters if score >= min_recency_threshold]
-
-            if not scored_repeaters:
-                return None, 0.0
-
-            if len(scored_repeaters) == 1:
-                repeater, recency_score = scored_repeaters[0]
-                distance = calculate_distance(bot_latitude, bot_longitude, repeater['latitude'], repeater['longitude'])
-                if max_proximity_range > 0 and distance > max_proximity_range:
-                    return None, 0.0
-                base_confidence = 0.4 + (recency_score * 0.5)
-                return repeater, base_confidence
-
-            combined_scores = []
-            for repeater, recency_score in scored_repeaters:
-                distance = calculate_distance(bot_latitude, bot_longitude, repeater['latitude'], repeater['longitude'])
-                if max_proximity_range > 0 and distance > max_proximity_range:
-                    continue
-
-                normalized_distance = min(distance / 1000.0, 1.0)
-                proximity_score = 1.0 - normalized_distance
-                combined_score = (recency_score * recency_weight) + (proximity_score * proximity_weight)
-
-                if repeater.get('is_starred', False):
-                    combined_score *= star_bias_multiplier
-
-                combined_scores.append((combined_score, distance, repeater))
-
-            if not combined_scores:
-                return None, 0.0
-
-            combined_scores.sort(key=lambda x: x[0], reverse=True)
-            best_score, best_distance, best_repeater = combined_scores[0]
-
-            if len(combined_scores) == 1:
-                confidence = 0.4 + (best_score * 0.5)
-            else:
-                second_best_score = combined_scores[1][0]
-                score_ratio = best_score / second_best_score if second_best_score > 0 else 1.0
-                if score_ratio > 1.5:
-                    confidence = 0.9
-                elif score_ratio > 1.2:
-                    confidence = 0.8
-                elif score_ratio > 1.1:
-                    confidence = 0.7
-                else:
-                    confidence = 0.5
-
-            return best_repeater, confidence
-
-        # Main decoding logic (same as path command)
-        decoded_path = []
-
-        try:
-            for node_id in node_ids:
-                # Query database for matching repeaters
-                if max_repeater_age_days > 0:
-                    query = f'''
-                        SELECT name, public_key, device_type, last_heard, last_heard as last_seen,
-                               last_advert_timestamp, latitude, longitude, city, state, country,
-                               advert_count, signal_strength, hop_count, role, is_starred
-                        FROM complete_contact_tracking
-                        WHERE public_key LIKE ? AND role IN ('repeater', 'roomserver')
-                        AND (
-                            (last_advert_timestamp IS NOT NULL AND last_advert_timestamp >= datetime('now', '-{max_repeater_age_days} days'))
-                            OR (last_advert_timestamp IS NULL AND last_heard >= datetime('now', '-{max_repeater_age_days} days'))
-                        )
-                        ORDER BY COALESCE(last_advert_timestamp, last_heard) DESC
-                    '''
-                else:
-                    query = '''
-                        SELECT name, public_key, device_type, last_heard, last_heard as last_seen,
-                               last_advert_timestamp, latitude, longitude, city, state, country,
-                               advert_count, signal_strength, hop_count, role, is_starred
-                        FROM complete_contact_tracking
-                        WHERE public_key LIKE ? AND role IN ('repeater', 'roomserver')
-                        ORDER BY COALESCE(last_advert_timestamp, last_heard) DESC
-                    '''
-
-                results = self.db_manager.execute_query(query, (f"{node_id}%",))
-
-                if results:
-                    repeaters_data = [
-                        {
-                            'name': row['name'],
-                            'public_key': row['public_key'],
-                            'device_type': row['device_type'],
-                            'last_seen': row['last_seen'],
-                            'last_heard': row.get('last_heard', row['last_seen']),
-                            'last_advert_timestamp': row.get('last_advert_timestamp'),
-                            'is_active': True,
-                            'latitude': row['latitude'],
-                            'longitude': row['longitude'],
-                            'city': row['city'],
-                            'state': row['state'],
-                            'country': row['country'],
-                            'hop_count': row.get('hop_count'),  # Include hop_count for zero-hop bonus
-                            'is_starred': bool(row.get('is_starred', 0))
-                        } for row in results
-                    ]
-
-                    scored_repeaters = calculate_recency_weighted_scores(repeaters_data)
-                    min_recency_threshold = 0.01
-                    recent_repeaters = [r for r, score in scored_repeaters if score >= min_recency_threshold]
-
-                    if len(recent_repeaters) > 1:
-                        # Multiple matches - use graph and geographic selection
-                        graph_repeater = None
-                        graph_confidence = 0.0
-                        selection_method = None
-                        geo_repeater = None
-                        geo_confidence = 0.0
-
-                        if graph_based_validation and hasattr(self, 'mesh_graph') and self.mesh_graph:
-                            graph_repeater, graph_confidence, selection_method = select_repeater_by_graph(
-                                recent_repeaters, node_id, node_ids
-                            )
-
-                        if geographic_guessing_enabled:
-                            repeaters_with_location = [r for r in recent_repeaters if r.get('latitude') and r.get('longitude')]
-                            if repeaters_with_location:
-                                geo_repeater, geo_confidence = select_by_simple_proximity(repeaters_with_location)
-
-                        # Combine or choose
-                        selected_repeater = None
-                        confidence = 0.0
-
-                        if graph_geographic_combined and graph_repeater and geo_repeater:
-                            graph_pubkey = graph_repeater.get('public_key', '')
-                            geo_pubkey = geo_repeater.get('public_key', '')
-
-                            if graph_pubkey and geo_pubkey and graph_pubkey == geo_pubkey:
-                                combined_confidence = (
-                                    graph_confidence * graph_geographic_weight +
-                                    geo_confidence * (1.0 - graph_geographic_weight)
-                                )
-                                selected_repeater = graph_repeater
-                                confidence = combined_confidence
-                            else:
-                                if graph_confidence > geo_confidence:
-                                    selected_repeater = graph_repeater
-                                    confidence = graph_confidence
-                                else:
-                                    selected_repeater = geo_repeater
-                                    confidence = geo_confidence
-                        else:
-                            # For final hop, prefer geographic selection if available and reasonable
-                            # The final hop should be close to the bot, so geographic proximity is very important
-                            is_final_hop = (node_id == node_ids[-1] if node_ids else False)
-
-                            if is_final_hop and geo_repeater and geo_confidence >= 0.6:
-                                # For final hop, prefer geographic if it has decent confidence
-                                # This ensures we pick the closest repeater for the last hop
-                                if not graph_repeater or geo_confidence >= graph_confidence * 0.9:
-                                    selected_repeater = geo_repeater
-                                    confidence = geo_confidence
-                                elif graph_repeater:
-                                    selected_repeater = graph_repeater
-                                    confidence = graph_confidence
-                            elif graph_repeater and graph_confidence >= graph_confidence_override_threshold:
-                                selected_repeater = graph_repeater
-                                confidence = graph_confidence
-                            elif not graph_repeater or graph_confidence < graph_confidence_override_threshold:
-                                if geo_repeater and (not graph_repeater or geo_confidence > graph_confidence):
-                                    selected_repeater = geo_repeater
-                                    confidence = geo_confidence
-                                elif graph_repeater:
-                                    selected_repeater = graph_repeater
-                                    confidence = graph_confidence
-
-                        if selected_repeater and confidence >= 0.5:
-                            decoded_path.append({
-                                'node_id': node_id,
-                                'name': selected_repeater['name'],
-                                'public_key': selected_repeater['public_key'],
-                                'device_type': selected_repeater['device_type'],
-                                'role': selected_repeater.get('role', 'repeater'),
-                                'found': True,
-                                'geographic_guess': confidence < 0.8,  # Mark as guess if confidence is lower
-                                'collision': True,
-                                'matches': len(recent_repeaters)
-                            })
-                        else:
-                            # Fallback to first repeater if selection failed
-                            decoded_path.append({
-                                'node_id': node_id,
-                                'name': recent_repeaters[0]['name'],
-                                'public_key': recent_repeaters[0]['public_key'],
-                                'device_type': recent_repeaters[0]['device_type'],
-                                'role': recent_repeaters[0].get('role', 'repeater'),
-                                'found': True,
-                                'geographic_guess': True,
-                                'collision': True,
-                                'matches': len(recent_repeaters)
-                            })
-                    elif len(recent_repeaters) == 1:
-                        # Single match - high confidence
-                        repeater = recent_repeaters[0]
-                        decoded_path.append({
-                            'node_id': node_id,
-                            'name': repeater['name'],
-                            'public_key': repeater['public_key'],
-                            'device_type': repeater['device_type'],
-                            'role': repeater.get('role', 'repeater'),
-                            'found': True,
-                            'geographic_guess': False,
-                            'collision': False,
-                            'matches': 1
-                        })
-                    else:
-                        decoded_path.append({
-                            'node_id': node_id,
-                            'name': None,
-                            'found': False
-                        })
-                else:
-                    decoded_path.append({
-                        'node_id': node_id,
-                        'name': None,
-                        'found': False
-                    })
-        except Exception as e:
-            self.logger.error(f"Error decoding path: {e}", exc_info=True)
-            return []
-
-        return decoded_path
+        from modules.path_inference import decode_path_nodes
+        return decode_path_nodes(
+            path_hex,
+            bytes_per_hop,
+            config=self.config,
+            db_manager=self.db_manager,
+            logger=self.logger,
+            mesh_graph=self._get_mesh_graph(),
+        )
 
     def run(self, host='127.0.0.1', port=8080, debug=False):
         """Run the modern web viewer"""

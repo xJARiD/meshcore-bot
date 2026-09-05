@@ -25,13 +25,17 @@ _read_config_value() {
     local key="$1" default="$2"
     local value=""
     if [ -f "$CONFIG" ]; then
-        value=$(grep -A20 '^\[Admin\]' "$CONFIG" \
+        value="$(grep -A20 '^\[Admin\]' "$CONFIG" \
             | grep -m1 "^${key}[[:space:]]*=" \
             | sed 's/^[^=]*=[[:space:]]*//' \
             | tr -d '[:space:]' \
-            || true)
+            || true)"
     fi
-    printf '%s\n' "${value:-$default}"
+    if [ -n "$value" ]; then
+        printf '%s\n' "$value"
+    else
+        printf '%s\n' "$default"
+    fi
 }
 
 ADMIN_PORT="${ADMIN_PORT:-$(_read_config_value port 5001)}"

@@ -60,17 +60,14 @@ class StatusCommand(BaseCommand):
 
         paused = not bool(getattr(self.bot, "channel_responses_enabled", True))
 
-        def yn(value: bool) -> str:
-            return "yes" if value else "no"
-
+        # Keep under DM budget (158 UTF-8 bytes); long labels caused ERR_CODE_TABLE_FULL.
         status_text = (
-            "Bot Status\n"
-            f"- time: {now}\n"
-            f"- connected: {yn(connected)}\n"
-            f"- zombie: {yn(radio_zombie)}\n"
-            f"- offline: {yn(radio_offline)}\n"
-            f"- paused: {yn(paused)}\n"
-            f"- web: {yn(web_running)}"
+            f"Status {now}\n"
+            f"connected: {connected}\n"
+            f"radio_zombie: {radio_zombie}\n"
+            f"radio_offline: {radio_offline}\n"
+            f"ch_paused: {paused}\n"
+            f"web: {web_running}"
         )
         await self.send_response(message, status_text)
         return True

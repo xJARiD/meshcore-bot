@@ -113,6 +113,58 @@ def main():
                 print(f"Info: {message}", file=sys.stderr)
         sys.exit(1 if has_error else 0)
 
+    # Always sanity-check the config on normal startup too — misspelled
+    # sections/keys otherwise fail silently and are the most common source of
+    # "why doesn't my setting work" confusion. Non-fatal: warn and continue.
+    try:
+        from modules.config_validation import (
+            SEVERITY_ERROR as _SEV_ERR,
+        )
+        from modules.config_validation import (
+            SEVERITY_WARNING as _SEV_WARN,
+        )
+        from modules.config_validation import (
+            validate_config as _startup_validate,
+        )
+        _issues = [
+            (sev, msg) for sev, msg in _startup_validate(args.config)
+            if sev in (_SEV_ERR, _SEV_WARN)
+        ]
+        _MAX_SHOWN = 15
+        for sev, msg in _issues[:_MAX_SHOWN]:
+            print(f"Config {sev}: {msg}", file=sys.stderr)
+        if len(_issues) > _MAX_SHOWN:
+            print(
+                f"Config: ... and {len(_issues) - _MAX_SHOWN} more issue(s); "
+                "run with --validate-config for the full report",
+                file=sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001 - never block startup on the linter itself
+        print(f"Config validation skipped: {exc}", file=sys.stderr)
+
+    # A restore requested by the viewer is applied only here, before importing
+    # and constructing MeshCoreBot (which opens the DB and launches writers).
+    # The service manager must restart the bot and viewer as one unit.
+    from modules.database_restore import (
+        DatabaseRestoreError,
+        apply_pending_restores_from_config,
+    )
+
+    try:
+        restore_results = apply_pending_restores_from_config(args.config)
+    except DatabaseRestoreError as exc:
+        print(f"Error: pending database restore was not applied: {exc}", file=sys.stderr)
+        print(
+            "The active database was left unchanged. Correct or remove the pending restore "
+            "file before restarting.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    for restore_result in restore_results:
+        recovery = restore_result.recovery_backup_path
+        recovery_note = f"; recovery backup: {recovery}" if recovery else ""
+        print(f"Applied pending database restore: {restore_result.database_path}{recovery_note}")
+
     from modules.core import MeshCoreBot
     bot = MeshCoreBot(config_file=args.config)
 
@@ -207,6 +259,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 

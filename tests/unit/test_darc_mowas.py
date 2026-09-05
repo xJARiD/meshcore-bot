@@ -3,12 +3,16 @@
 Unit tests for DARC MoWaS CAP alert parsing
 """
 
+import asyncio
+import configparser
 import xml.dom.minidom
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from modules.service_plugins.darc_mowas_service import (
+    DARC_MoWaS_Service,
     TRDECapAlert,
     TRDECapAlertArea,
     TRDECapAlertInfo,
@@ -113,3 +117,70 @@ class TestMoWaSAlertParsing:
         assert isinstance(area, TRDECapAlertArea)
         assert area.areaDesc == "Deutschland"
         assert ("SHN", "100000000000") in area.geocode
+
+
+def _mowas_service_bot():
+    bot = MagicMock()
+    bot.logger = MagicMock()
+    cfg = configparser.ConfigParser()
+    cfg.add_section("DARC_MoWaS_Service")
+    bot.config = cfg
+    return bot
+
+
+@pytest.mark.unit
+class TestScopeByRegion:
+    def test_hierarchical_lookup(self):
+        bot = _mowas_service_bot()
+        bot.config.set("DARC_MoWaS_Service", "flood_scope.090000000000", "#de-by")
+        bot.config.set("DARC_MoWaS_Service", "flood_scope.091840000000", "#de-by-muc")
+        svc = DARC_MoWaS_Service(bot)
+        # City Haar within LK Munich
+        area = TRDECapAlertArea(areaDesc="Stadt Haar", geocode=[("SHN", "091841230000")])
+        info = TRDECapAlertInfo(language="de", category=None, event=None, urgency=None,
+            severity=None, certainty=None, description="", parameter=[], headline=None, area=[area])
+        # most specific wins
+        assert svc.scope_by_region(info) == "#de-by-muc"
+        # broader prefix
+        area.geocode = [("SHN", "091000000000")]
+        assert svc.scope_by_region(info) == "#de-by"
+        # no match
+        area.geocode = [("SHN", "050000000000")]
+        assert svc.scope_by_region(info) is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_send_chunks_assigns_ascending_timestamps_per_index():
+    """Each chunk gets ts_now + i seconds so clients can order and dedupe."""
+    svc = DARC_MoWaS_Service(_mowas_service_bot())
+    captured: list[tuple[int, datetime]] = []
+
+    async def capture(channel, chunk, index, total, timestamp, scope):
+        captured.append((index, timestamp))
+
+    svc._send_chunk_with_retry = capture  # type: ignore[method-assign]
+
+    pending: list[asyncio.Task] = []
+    real_create_task = asyncio.create_task
+
+    def schedule(coro):
+        task = real_create_task(coro)
+        pending.append(task)
+        return task
+
+    with patch(
+        "modules.service_plugins.darc_mowas_service.asyncio.create_task",
+        side_effect=schedule,
+    ):
+        await svc._send_chunks("mowas", ["a", "b", "c"])
+
+    await asyncio.gather(*pending)
+
+    assert len(captured) == 3
+    captured.sort(key=lambda x: x[0])
+    timestamps = [ts for _, ts in captured]
+    assert timestamps == sorted(timestamps)
+    assert len(set(timestamps)) == 3
+    for i in range(1, len(timestamps)):
+        assert timestamps[i] - timestamps[i - 1] == timedelta(seconds=1)
