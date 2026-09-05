@@ -7,7 +7,7 @@ Returns the currently running bot version string.
 from typing import Any
 
 from ..models import MeshMessage
-from ..version_info import resolve_runtime_version
+from ..version_info import resolve_application_version
 from .base_command import BaseCommand
 
 
@@ -43,9 +43,7 @@ class VersionCommand(BaseCommand):
     async def execute(self, message: MeshMessage) -> bool:
         version_value = getattr(self.bot, "bot_version", None)
         if not version_value:
-            bot_root = getattr(self.bot, "bot_root", ".")
-            version_value = resolve_runtime_version(bot_root).get("display", "unknown")
+            version_value = resolve_application_version().get("display", "unknown")
         sender = message.sender_id or "Unknown"
         response = f"@[{sender}] Bot version: {version_value}"
         return await self.send_response(message, response)
-

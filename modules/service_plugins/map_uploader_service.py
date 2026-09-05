@@ -55,6 +55,21 @@ class MapUploaderService(BaseServicePlugin):
     config_section = 'MapUploader'  # Explicit config section
     description = "Uploads node adverts to map.meshcore.dev"
 
+    # Web-viewer settings schema (see modules/settings_schema.py)
+    settings_schema = [
+        {"key": "api_url", "label": "API URL", "type": "str",
+         "default": "https://map.meshcore.dev/api/v1/uploader/node",
+         "help": "map.meshcore.dev upload endpoint."},
+        {"key": "private_key_path", "label": "Private key path", "type": "str", "default": "",
+         "help": "Optional file with the device private key for signing uploads. "
+                 "If unset, the service tries to fetch it from the device."},
+        {"key": "min_reupload_interval", "label": "Min re-upload interval", "type": "int",
+         "min": 0, "default": 3600, "unit": "s",
+         "help": "Minimum seconds between re-uploads of the same node."},
+        {"key": "verbose", "label": "Verbose logging", "type": "bool", "default": False,
+         "help": "Detailed debug logging of upload data and signatures."},
+    ]
+
     def __init__(self, bot: Any):
         """Initialize map uploader service.
 
@@ -249,6 +264,14 @@ class MapUploaderService(BaseServicePlugin):
         self.connected = True
         self._running = True
         self.logger.info("Map uploader service started")
+
+    async def on_transport_reconnected(self) -> None:
+        """Re-register RX_LOG_DATA handler on the new meshcore instance."""
+        if not self._running or not self.meshcore:
+            return
+        self._cleanup_event_subscriptions()
+        await self._setup_event_handlers()
+        self.logger.info("Map uploader event handlers re-registered after transport reconnect")
 
     async def stop(self) -> None:
         """Stop the map uploader service.
@@ -629,7 +652,10 @@ class MapUploaderService(BaseServicePlugin):
                 return None
 
             flags_byte = app_data[0]
-            flags = AdvertFlags(flags_byte)
+            has_latlon = (flags_byte & AdvertFlags.ADV_LATLON_MASK.value) != 0
+            has_feat1 = (flags_byte & AdvertFlags.ADV_FEAT1_MASK.value) != 0
+            has_feat2 = (flags_byte & AdvertFlags.ADV_FEAT2_MASK.value) != 0
+            has_name = (flags_byte & AdvertFlags.ADV_NAME_MASK.value) != 0
 
             # Extract type
             adv_type = flags_byte & 0x0F
@@ -651,7 +677,7 @@ class MapUploaderService(BaseServicePlugin):
 
             # Parse location data if present
             i = 1
-            if AdvertFlags.ADV_LATLON_MASK in flags and len(app_data) >= i + 8:
+            if has_latlon and len(app_data) >= i + 8:
                 lat = int.from_bytes(app_data[i:i+4], 'little', signed=True)
                 lon = int.from_bytes(app_data[i+4:i+8], 'little', signed=True)
                 advert['lat'] = round(lat / 1000000.0, 6)
@@ -659,15 +685,15 @@ class MapUploaderService(BaseServicePlugin):
                 i += 8
 
             # Parse feat1 data if present
-            if AdvertFlags.ADV_FEAT1_MASK in flags:
+            if has_feat1:
                 i += 2
 
             # Parse feat2 data if present
-            if AdvertFlags.ADV_FEAT2_MASK in flags:
+            if has_feat2:
                 i += 2
 
             # Parse name if present
-            if AdvertFlags.ADV_NAME_MASK in flags and len(app_data) >= i:
+            if has_name and len(app_data) >= i:
                 try:
                     name = app_data[i:].decode('utf-8', errors='ignore').rstrip('\x00')
                     advert['name'] = name
@@ -677,7 +703,7 @@ class MapUploaderService(BaseServicePlugin):
             return advert
 
         except Exception as e:
-            self.logger.error(f"Error parsing advert: {e}")
+            self.logger.warning(f"Error parsing advert: {e}")
             return None
 
     async def _verify_advert_signature(self, advert: dict[str, Any], payload: bytes) -> bool:

@@ -8,11 +8,21 @@ import asyncio
 import random
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from hashlib import sha256
+from importlib import resources
+from pathlib import Path
 from typing import Any
 
 from meshcore import EventType
 
+from .command_prefix import (
+    load_command_prefix_settings,
+    parse_command_prefixes,
+)
+from .command_prefix import (
+    normalize_command_content as normalize_command_content_text,
+)
 from .commands.base_command import BaseCommand
 from .config_validation import (
     PUBLIC_CHANNEL_KEY_HEX,  # noqa: F401 — re-exported; used by core.py
@@ -91,7 +101,12 @@ class CommandManager:
         self.banned_users = self.load_banned_users()
         self.monitor_channels = self.load_monitor_channels()
         self.channel_keywords = self.load_channel_keywords()
-        self.command_prefix = self.load_command_prefix()
+        self.command_prefixes, self.require_command_prefix = load_command_prefix_settings(
+            self.bot.config
+        )
+        self._command_prefix_default = (
+            self.command_prefixes[0] if self.command_prefixes else ''
+        )
 
         # Initialize plugin loader and load all plugins
         local_commands_dir = (
@@ -124,6 +139,23 @@ class CommandManager:
 
         self.logger.info(f"CommandManager initialized with {len(self.commands)} plugins")
 
+    def _flood_scopes_config_raw(self) -> str:
+        """Raw flood_scopes value; [Channels] is canonical, [Bot] accepted with a warning."""
+        for section in ("Channels", "Bot"):
+            if self.bot.config.has_section(section) and self.bot.config.has_option(
+                section, "flood_scopes"
+            ):
+                raw = (self.bot.config.get(section, "flood_scopes") or "").strip()
+                if not raw:
+                    continue
+                if section != "Channels":
+                    self.logger.warning(
+                        "flood_scopes is set in [Bot]; move it to [Channels] "
+                        "(still loaded for this run)"
+                    )
+                return raw
+        return ""
+
     def _load_flood_scope_keys(self) -> dict[str, bytes]:
         """Load flood_scopes config into a name→16-byte-key dict for HMAC matching.
 
@@ -132,10 +164,9 @@ class CommandManager:
         FLOOD messages are still permitted through the allowlist check.
         """
         scope_keys: dict[str, bytes] = {}
-        if not (self.bot.config.has_section("Channels") and
-                self.bot.config.has_option("Channels", "flood_scopes")):
+        raw = self._flood_scopes_config_raw()
+        if not raw:
             return scope_keys
-        raw = (self.bot.config.get("Channels", "flood_scopes") or "").strip()
         for entry in (s.strip() for s in raw.split(",") if s.strip()):
             normalized = self._normalize_scope_name(entry)
             if normalized in ("", "*", "0", "None"):
@@ -152,11 +183,67 @@ class CommandManager:
     @staticmethod
     def _normalize_scope_name(scope: str) -> str:
         """Return scope with '#' prepended if it is a non-global named region without one."""
-        if scope in ("", "*", "0", "None"):
+        if scope in ("", "*", "0", "None") or scope.lower() == "none":
+            if scope.lower() == "none":
+                return "None"
             return scope
         if not scope.startswith("#"):
             return "#" + scope
         return scope
+
+    @staticmethod
+    def _normalize_channel_name_for_scope_config(channel: str) -> str:
+        """Normalize channel names for [Channels] flood_scope.<channel> lookups."""
+        return channel.strip().removeprefix("#").lower()
+
+    def _outgoing_flood_scope_override(self) -> str:
+        """[Channels] outgoing_flood_scope_override when set, else empty string."""
+        if self.bot.config.has_section("Channels") and self.bot.config.has_option(
+            "Channels", "outgoing_flood_scope_override"
+        ):
+            return (self.bot.config.get("Channels", "outgoing_flood_scope_override") or "").strip()
+        return ""
+
+    def _channel_flood_scope(self, channel: str | None) -> str | None:
+        """Return [Channels] flood_scope.<channel> when configured, including global markers."""
+        if not channel or not self.bot.config.has_section("Channels"):
+            return None
+        channel_key = self._normalize_channel_name_for_scope_config(channel)
+        for key, value in self.bot.config.items("Channels"):
+            if not key.startswith("flood_scope."):
+                continue
+            configured_channel = key[len("flood_scope."):]
+            if self._normalize_channel_name_for_scope_config(configured_channel) == channel_key:
+                return self._normalize_scope_name((value or "").strip())
+        return None
+
+    def resolve_channel_send_scope(
+        self,
+        *,
+        scope: str | None = None,
+        message: MeshMessage | None = None,
+        config_section: str | None = None,
+        channel: str | None = None,
+    ) -> str | None:
+        """Resolve explicit regional scope before send_channel_message applies override.
+
+        Precedence: explicit ``scope`` arg → ``message.reply_scope`` (mirror incoming) →
+        ``flood_scope`` in ``config_section`` → per-channel ``flood_scope.<channel>``.
+        Returns ``None`` when unset so ``send_channel_message`` falls back to
+        ``outgoing_flood_scope_override``.
+        """
+        if scope is not None:
+            return scope
+        if message is not None and message.reply_scope is not None:
+            return message.reply_scope
+        if config_section and self.bot.config.has_section(config_section):
+            raw = (self.bot.config.get(config_section, "flood_scope", fallback="") or "").strip()
+            if raw:
+                return self._normalize_scope_name(raw)
+        channel_scope = self._channel_flood_scope(channel or (message.channel if message else None))
+        if channel_scope is not None:
+            return channel_scope
+        return None
 
     def _should_queue_command(self, command: BaseCommand, message: MeshMessage) -> tuple[bool, float]:
         """Check if command should be queued instead of rejected.
@@ -577,14 +664,30 @@ class CommandManager:
             return True
         return trigger.lower() in self.channel_keywords
 
-    def load_command_prefix(self) -> str:
-        """Load command prefix from config.
+    @property
+    def command_prefix(self) -> str:
+        """Default command prefix (first configured prefix) for backward compatibility."""
+        return self._command_prefix_default
+
+    @command_prefix.setter
+    def command_prefix(self, value: str) -> None:
+        """Update prefix list when tests or callers assign ``command_prefix`` directly."""
+        self.command_prefixes = parse_command_prefixes(value.strip() if value else '')
+        self._command_prefix_default = (
+            self.command_prefixes[0] if self.command_prefixes else ''
+        )
+
+    def normalize_command_content(self, raw: str) -> str | None:
+        """Strip configured prefix(es) from raw message text.
 
         Returns:
-            str: The command prefix, or empty string if not configured.
+            Normalized content, or ``None`` if the message should be ignored.
         """
-        prefix = self.bot.config.get('Bot', 'command_prefix', fallback='')
-        return prefix.strip() if prefix else ''
+        return normalize_command_content_text(
+            raw,
+            self.command_prefixes,
+            require_prefix=self.require_command_prefix,
+        )
 
     def format_keyword_response(
         self,
@@ -652,60 +755,74 @@ class CommandManager:
             List[tuple]: List of (trigger, response) tuples for matched keywords.
         """
         matches: list[tuple[str, str | None]] = []
-        content = message.content.strip()
-
-        # Check for command prefix if configured
-        if self.command_prefix:
-            # If prefix is configured, message must start with it
-            if not content.startswith(self.command_prefix):
-                return matches  # No prefix, no match
-            # Strip the prefix
-            content = content[len(self.command_prefix):].strip()
-        else:
-            # If no prefix configured, strip legacy "!" prefix for backward compatibility
-            if content.startswith('!'):
-                content = content[1:].strip()
-
+        normalized = self.normalize_command_content(message.content)
+        if normalized is None:
+            return matches
+        content = normalized
         content_lower = content.lower()
 
-        # Check for help requests first (special handling)
-        # Check both English "help" and translated help keywords
-        help_keywords = ['help']
-        if 'help' in self.commands:
-            help_command = self.commands['help']
-            if hasattr(help_command, 'keywords'):
+        # Persist the normalized (prefix-stripped) content to the shared message once,
+        # before iterating commands. Each command's cleanup_message_for_matching would
+        # otherwise re-strip/re-reject the prefix off this same object; the first
+        # keyword command would consume the prefix and break matching for every command
+        # after it. The flag tells per-command cleanup the prefix is already handled.
+        message.content = content
+        message.content_lower = content_lower
+        message.prefix_normalized = True
+
+        # Check for help requests first (special handling).
+        # Check both English "help" and translated help keywords.
+        #
+        # Respect the [Help_Command] enabled flag: this special path bypasses the
+        # plugin loop (where can_execute() normally enforces enablement), so without
+        # this guard it would respond to "help" even when the command is disabled.
+        # When no help command is loaded we keep the legacy default of responding to
+        # the literal "help" keyword (help defaults to enabled).
+        help_command = self.commands.get('help')
+        help_enabled = getattr(help_command, 'help_enabled', True) if help_command is not None else True
+        if help_enabled:
+            help_keywords = ['help']
+            if help_command is not None and hasattr(help_command, 'keywords'):
                 help_keywords = [k.lower() for k in help_command.keywords]
 
-        # Check if message starts with any help keyword
-        for help_keyword in help_keywords:
-            if content_lower.startswith(help_keyword + ' ') or content_lower == help_keyword:
-                # Check channel restrictions for help keyword (same as other keywords/commands)
-                # DMs are allowed if respond_to_dms is enabled
-                if message.is_dm:
-                    if not self.bot.config.getboolean('Channels', 'respond_to_dms', fallback=True):
-                        break  # DMs disabled, skip help keyword
-                else:
-                    # For channel messages, check if channel is in monitor_channels
-                    if message.channel not in self.monitor_channels:
-                        break  # Channel not monitored, skip help keyword
-                    # When channel_keywords is set, only allow listed triggers in channel
-                    if not self._is_channel_trigger_allowed('help', message):
-                        break
+            # Check if message starts with any help keyword
+            for help_keyword in help_keywords:
+                if content_lower.startswith(help_keyword + ' ') or content_lower == help_keyword:
+                    # Check channel restrictions for help keyword (same as other keywords/commands)
+                    # DMs are allowed if respond_to_dms is enabled
+                    if message.is_dm:
+                        if not self.bot.config.getboolean('Channels', 'respond_to_dms', fallback=True):
+                            break  # DMs disabled, skip help keyword
+                    else:
+                        # For channel messages, honor the help command's channel access:
+                        # its per-command `channels` override when set, otherwise the
+                        # global monitor_channels. Without this the special path would
+                        # ignore [Help_Command] channels = ... (it bypasses the plugin
+                        # loop where is_channel_allowed is normally enforced). Fall back
+                        # to a bare monitor_channels check when no help command is loaded.
+                        if help_command is not None and hasattr(help_command, 'is_channel_allowed'):
+                            if not help_command.is_channel_allowed(message):
+                                break  # Not allowed in this channel, skip help keyword
+                        elif message.channel not in self.monitor_channels:
+                            break  # Channel not monitored, skip help keyword
+                        # When channel_keywords is set, only allow listed triggers in channel
+                        if not self._is_channel_trigger_allowed('help', message):
+                            break
 
-                # Channel check passed, process help request
-                if content_lower.startswith(help_keyword + ' '):
-                    command_name = content_lower[len(help_keyword):].strip()  # Remove help keyword prefix
-                    help_text = self.get_help_for_command(command_name, message)
-                    # Format the help response with message data (same as other keywords)
-                    help_text = self.format_keyword_response(help_text, message)
-                    matches.append(('help', help_text))
-                    return matches
-                elif content_lower == help_keyword:
-                    help_text = self.get_general_help(message)
-                    # Format the help response with message data (same as other keywords)
-                    help_text = self.format_keyword_response(help_text, message)
-                    matches.append(('help', help_text))
-                    return matches
+                    # Channel check passed, process help request
+                    if content_lower.startswith(help_keyword + ' '):
+                        command_name = content_lower[len(help_keyword):].strip()  # Remove help keyword prefix
+                        help_text = self.get_help_for_command(command_name, message)
+                        # Format the help response with message data (same as other keywords)
+                        help_text = self.format_keyword_response(help_text, message)
+                        matches.append(('help', help_text))
+                        return matches
+                    elif content_lower == help_keyword:
+                        help_text = self.get_general_help(message)
+                        # Format the help response with message data (same as other keywords)
+                        help_text = self.format_keyword_response(help_text, message)
+                        matches.append(('help', help_text))
+                        return matches
 
         # Check all loaded plugins for matches
         for command_name, command in self.commands.items():
@@ -799,20 +916,12 @@ class CommandManager:
         """
         if raw is None:
             return ""
-        text = raw.strip()
-
-        # Mirror check_keywords() prefix handling
-        if self.command_prefix:
-            if not text.startswith(self.command_prefix):
-                return ""  # No prefix -> treat as non-matchable
-            text = text[len(self.command_prefix):].strip()
-        else:
-            # Backward compatibility
-            if text.startswith('!'):
-                text = text[1:].strip()
+        normalized = self.normalize_command_content(raw)
+        if normalized is None:
+            return ""
 
         # case-insensitive + ignore extra spaces
-        return " ".join(text.lower().split())
+        return " ".join(normalized.lower().split())
 
     def match_randomline(self, message: MeshMessage) -> tuple[str, str] | None:
         """
@@ -823,18 +932,13 @@ class CommandManager:
         if not self.bot.config.has_section('RandomLine'):
             return None
 
-        # Start with the same content + prefix stripping logic as check_keywords()
-        content = (message.content or "").strip()
-
-        # Check for command prefix if configured
-        if self.command_prefix:
-            if not content.startswith(self.command_prefix):
-                return None
-            content = content[len(self.command_prefix):].strip()
+        if getattr(message, 'prefix_normalized', False):
+            content = (message.content or "").strip()
         else:
-            # Legacy "!" prefix compatibility
-            if content.startswith('!'):
-                content = content[1:].strip()
+            normalized = self.normalize_command_content(message.content or "")
+            if normalized is None:
+                return None
+            content = normalized
 
         # Normalize: lowercase + collapse whitespace
         content_norm = " ".join(content.lower().split())
@@ -889,24 +993,43 @@ class CommandManager:
             if not self._is_channel_trigger_allowed(key, message):
                 return None
 
-        file_path = self.bot.config.get('RandomLine', f'file.{key}', fallback='').strip()
-        if not file_path:
+        configured_file_path = self.bot.config.get('RandomLine', f'file.{key}', fallback='').strip()
+        if not configured_file_path:
             self.logger.warning(f"RandomLine matched '{key}' but missing config file.{key}")
             return None
 
         try:
-            validated_path = validate_safe_path(file_path, allow_absolute=True)
+            validated_path = validate_safe_path(configured_file_path, allow_absolute=True)
         except ValueError:
             validated_path = None
         if validated_path is None:
-            self.logger.warning(f"RandomLine: unsafe or restricted path rejected for '{key}': {file_path}")
+            self.logger.warning(
+                f"RandomLine: unsafe or restricted path rejected for '{key}': {configured_file_path}"
+            )
             return None
         file_path = str(validated_path)
 
         # Read usable lines
         try:
-            with open(file_path, encoding="utf-8") as f:
-                lines = [ln.strip() for ln in f.readlines()]
+            if Path(file_path).is_file():
+                with open(file_path, encoding="utf-8") as f:
+                    lines = [ln.strip() for ln in f.readlines()]
+            else:
+                # Shipped RandomLine defaults live in package data in wheels.
+                # Only map the documented data/randomlines path; arbitrary
+                # missing custom files must still fail instead of silently
+                # selecting a same-named bundled file.
+                normalized = configured_file_path.replace("\\", "/").lstrip("./")
+                marker = "data/randomlines/"
+                if not normalized.startswith(marker):
+                    raise FileNotFoundError(file_path)
+                resource_name = normalized.removeprefix(marker)
+                if not resource_name or "/" in resource_name:
+                    raise FileNotFoundError(file_path)
+                bundled = resources.files("data.randomlines").joinpath(resource_name)
+                if not bundled.is_file():
+                    raise FileNotFoundError(file_path)
+                lines = [ln.strip() for ln in bundled.read_text(encoding="utf-8").splitlines()]
             lines = [ln for ln in lines if ln]  # drop blank lines
         except Exception as e:
             self.logger.error(f"RandomLine error reading {file_path} for '{key}': {e}", exc_info=True)
@@ -1045,6 +1168,63 @@ class CommandManager:
                 self.logger.debug(f"Error recording transmission for repeat tracking: {e}")
                 # Don't fail the send if transmission tracking fails
 
+            # Central DM length guard: firmware MAX_TEXT_LEN is 160; bot budget is 158.
+            dm_max_bytes = 158
+            content_bytes = len(content.encode("utf-8"))
+            if content_bytes > dm_max_bytes:
+                chunks = self.split_text_into_utf8_chunks(content, dm_max_bytes)
+                self.logger.warning(
+                    "DM to %s exceeds %d UTF-8 bytes (%d); auto-splitting into %d chunk(s)",
+                    sanitize_name(contact_name),
+                    dm_max_bytes,
+                    content_bytes,
+                    len(chunks),
+                )
+                rate_limit_seconds = self.bot.config.getfloat(
+                    "Bot", "bot_tx_rate_limit_seconds", fallback=1.0
+                )
+                sleep_time = max(rate_limit_seconds + 0.5, 1.0)
+                for i, chunk in enumerate(chunks):
+                    if i > 0:
+                        await self.bot.bot_tx_rate_limiter.wait_for_tx()
+                        await asyncio.sleep(sleep_time)
+                        can_send_chunk, reason = await self._check_rate_limits(
+                            skip_user_rate_limit=True, rate_limit_key=rate_limit_key
+                        )
+                        if not can_send_chunk:
+                            if reason:
+                                self.logger.warning(reason)
+                            return False
+                    if not await self._send_dm_payload(
+                        contact, contact_name, chunk, rate_limit_key=rate_limit_key
+                    ):
+                        self.logger.warning(
+                            "Auto-split DM failed at chunk %d of %d to %s",
+                            i + 1,
+                            len(chunks),
+                            sanitize_name(contact_name),
+                        )
+                        return False
+                return True
+
+            return await self._send_dm_payload(
+                contact, contact_name, content, rate_limit_key=rate_limit_key
+            )
+
+        except Exception as e:
+            self.logger.error(f"Failed to send DM: {e}")
+            return False
+
+    async def _send_dm_payload(
+        self,
+        contact: Any,
+        contact_name: str,
+        content: str,
+        *,
+        rate_limit_key: str | None = None,
+    ) -> bool:
+        """Send a single DM payload that is already within the RF byte budget."""
+        try:
             # Try to use send_msg_with_retry if available (meshcore-2.1.6+)
             used_retry_method = False
             try:
@@ -1090,9 +1270,8 @@ class CommandManager:
             return self._handle_send_result(
                 result, "DM", contact_name, used_retry_method, rate_limit_key=rate_limit_key
             )
-
         except Exception as e:
-            self.logger.error(f"Failed to send DM: {e}")
+            self.logger.error(f"Failed to send DM payload: {e}")
             return False
 
     async def send_channel_message(
@@ -1103,6 +1282,7 @@ class CommandManager:
         skip_user_rate_limit: bool = False,
         rate_limit_key: str | None = None,
         scope: str | None = None,
+        timestamp: datetime | None = None,
     ) -> bool:
         """Send a channel message using meshcore_py (optional flood scope).
 
@@ -1159,37 +1339,68 @@ class CommandManager:
                 self.logger.debug(f"Error recording transmission for repeat tracking: {e}")
                 # Don't fail the send if transmission tracking fails
 
-            # Flood scope. CRITICAL firmware behavior, verified on-air 2026-06-22:
-            # calling set_flood_scope with ANY value — including the zero-key "*" —
-            # makes the radio emit TC_FLOOD (route 0) with a transport code, and it
-            # stays in route 0 until the next reconnect. "*" does NOT restore classic
-            # flood (proven: a "*" send still came out route 0). The only way to emit
-            # classic FLOOD (route 1) — which every repeater forwards, including the
-            # regional ones that also relay unscoped — is to never call set_flood_scope.
-            #
-            # So we do NOT auto-match the incoming region on outbound: doing so flips
-            # the radio to route 0 and strands every subsequent global reply. The
-            # passed-in `scope` (matched incoming region) is intentionally ignored
-            # here. Outbound scoping is opt-in only, via [Channels]
-            # outgoing_flood_scope_override, for a deliberate single-region deployment
-            # that doesn't rely on classic flood. (The companion app can scope per
-            # message via a path the meshcore python library doesn't expose.)
-            scope_cfg = ""
-            if self.bot.config.has_section("Channels") and self.bot.config.has_option("Channels", "outgoing_flood_scope_override"):
-                scope_cfg = (self.bot.config.get("Channels", "outgoing_flood_scope_override") or "").strip()
-            override_is_global = scope_cfg in ("", "*", "0", "None")
-            has_set_flood_scope = hasattr(self.bot.meshcore.commands, "set_flood_scope")
-            if not override_is_global:
-                desired_scope = self._normalize_scope_name(scope_cfg)
-                if has_set_flood_scope and self._active_flood_scope != desired_scope:
-                    await self.bot.meshcore.commands.set_flood_scope(desired_scope)
-                    self._active_flood_scope = desired_scope
+            # Optional flood scope (region): set before send, restore after
+            resolved = self.resolve_channel_send_scope(scope=scope, channel=channel)
+            scope_to_use = (
+                resolved if resolved is not None else self._outgoing_flood_scope_override()
+            ) or ""
+            scope_is_global = scope_to_use in ("", "*", "0", "None")
+            if not scope_is_global:
+                scope_to_use = self._normalize_scope_name(scope_to_use)
+            override_cfg = self._outgoing_flood_scope_override()
+            if scope_is_global:
+                if override_cfg:
+                    self.logger.warning(
+                        "Outbound channel flood scope: global (no set_flood_scope); "
+                        "outgoing_flood_scope_override=%r was not applied "
+                        "(explicit scope=%r)",
+                        override_cfg,
+                        scope,
+                    )
+                else:
+                    self.logger.debug("Outbound channel flood scope: global (no set_flood_scope)")
+            else:
+                scope_source = "explicit argument" if scope is not None else (
+                    "outgoing_flood_scope_override"
+                    if resolved is None and override_cfg
+                    else "reply_scope or config"
+                )
+                self.logger.info(
+                    "Outbound channel flood scope: %s (%s; set_flood_scope)",
+                    scope_to_use,
+                    scope_source,
+                )
+            if not scope_is_global and not hasattr(self.bot.meshcore.commands, "set_flood_scope"):
+                self.logger.warning(
+                    "Regional flood scope %r requested but meshcore.commands.set_flood_scope "
+                    "is unavailable; channel message will use device default (often global flood)",
+                    scope_to_use,
+                )
+            elif not scope_is_global:
+                _scope_result = await self.bot.meshcore.commands.set_flood_scope(scope_to_use)
+                if _scope_result is None or getattr(_scope_result, "type", None) == "ERROR":
+                    self.logger.warning(
+                        "set_flood_scope(%s) failed (result=%s); "
+                        "message will be sent with current firmware scope",
+                        scope_to_use, _scope_result,
+                    )
 
             target = f"{channel} (channel {channel_num})"
             # Retry on no_event_received: max 2 extra attempts, 2s apart
             _max_retries = 2
             for _attempt in range(_max_retries + 1):
-                result = await self.bot.meshcore.commands.send_chan_msg(channel_num, content)
+                try:
+                    result = await self.bot.meshcore.commands.send_chan_msg(
+                        channel_num, content,
+                        timestamp=int(timestamp.timestamp()) if timestamp else None,
+                    )
+                finally:
+                    if not scope_is_global and hasattr(self.bot.meshcore.commands, "set_flood_scope"):
+                        _restore_result = await self.bot.meshcore.commands.set_flood_scope("*")
+                        if _restore_result is None or getattr(_restore_result, "type", None) == "ERROR":
+                            self.logger.warning(
+                                "set_flood_scope('*') restore failed (result=%s)", _restore_result
+                            )
 
                 if self._is_no_event_received(result) and _attempt < _max_retries:
                     self.logger.warning(
@@ -1197,6 +1408,14 @@ class CommandManager:
                         f"(attempt {_attempt + 1}/{_max_retries + 1}), retrying in 2s"
                     )
                     await asyncio.sleep(2)
+                    # Re-apply scope for next attempt
+                    if not scope_is_global and hasattr(self.bot.meshcore.commands, "set_flood_scope"):
+                        _scope_result = await self.bot.meshcore.commands.set_flood_scope(scope_to_use)
+                        if _scope_result is None or getattr(_scope_result, "type", None) == "ERROR":
+                            self.logger.warning(
+                                "set_flood_scope(%s) failed on retry re-apply (result=%s)",
+                                scope_to_use, _scope_result,
+                            )
                     continue
                 break
 
@@ -1507,7 +1726,14 @@ class CommandManager:
 
         return commands_list
 
-    async def send_response(self, message: MeshMessage, content: str, skip_user_rate_limit: bool = False) -> bool:
+    async def send_response(
+        self,
+        message: MeshMessage,
+        content: str,
+        skip_user_rate_limit: bool = False,
+        *,
+        command_id: str | None = None,
+    ) -> bool:
         """Unified method for sending responses to users.
 
         Automatically determines whether to send a DM or channel message based
@@ -1517,6 +1743,7 @@ class CommandManager:
             message: The original message being responded to.
             content: The response content.
             skip_user_rate_limit: If True, skip the user rate limiter check (for automated responses).
+            command_id: Optional id for repeat/transmission tracking (e.g. keyword or RandomLine flows).
 
         Returns:
             bool: True if response was sent successfully, False otherwise.
@@ -1531,13 +1758,17 @@ class CommandManager:
             rate_limit_key = self.get_rate_limit_key(message)
             if message.is_dm:
                 return await self.send_dm(
-                    message.sender_id or "", content,
+                    message.sender_pubkey or message.sender_id or "",
+                    content,
+                    command_id,
                     skip_user_rate_limit=skip_user_rate_limit,
                     rate_limit_key=rate_limit_key,
                 )
             else:
                 return await self.send_channel_message(
-                    message.channel or "", content,
+                    message.channel or "",
+                    content,
+                    command_id,
                     skip_user_rate_limit=skip_user_rate_limit,
                     rate_limit_key=rate_limit_key,
                     scope=getattr(message, 'reply_scope', None),
@@ -1577,6 +1808,53 @@ class CommandManager:
             text = text[split_at:].lstrip()
         return chunks
 
+    @staticmethod
+    def split_text_into_utf8_chunks(text: str, max_bytes: int) -> list[str]:
+        """Split *text* into chunks each at most *max_bytes* UTF-8 bytes.
+
+        Prefers splitting on newlines, then spaces; never splits mid-codepoint.
+        Returns ``[""]`` when *text* is empty.
+        """
+        if max_bytes < 1:
+            max_bytes = 1
+        if len(text.encode("utf-8")) <= max_bytes:
+            return [text]
+
+        chunks: list[str] = []
+        remaining = text
+        while remaining:
+            if len(remaining.encode("utf-8")) <= max_bytes:
+                chunks.append(remaining)
+                break
+
+            # Binary-search the largest prefix that fits in max_bytes
+            low, high = 1, len(remaining)
+            fit = 1
+            while low <= high:
+                mid = (low + high) // 2
+                if len(remaining[:mid].encode("utf-8")) <= max_bytes:
+                    fit = mid
+                    low = mid + 1
+                else:
+                    high = mid - 1
+
+            window = remaining[:fit]
+            # Prefer newline, then space, within the fitting window
+            split_at = window.rfind("\n")
+            if split_at <= 0:
+                split_at = window.rfind(" ")
+            if split_at <= 0:
+                split_at = fit
+
+            chunk = remaining[:split_at].rstrip("\n ")
+            if not chunk:
+                # Hard split — still codepoint-safe via fit
+                chunk = remaining[:fit]
+                split_at = fit
+            chunks.append(chunk)
+            remaining = remaining[split_at:].lstrip("\n ")
+        return chunks if chunks else [""]
+
     async def send_response_chunked(
         self, message: MeshMessage, chunks: list[str], *, skip_user_rate_limit_first: bool = True
     ) -> bool:
@@ -1607,7 +1885,7 @@ class CommandManager:
                     await asyncio.sleep(sleep_time)
                 skip = skip_user_rate_limit_first if i == 0 else True
                 success = await self.send_dm(
-                    message.sender_id or "",
+                    message.sender_pubkey or message.sender_id or "",
                     chunk,
                     skip_user_rate_limit=skip,
                     rate_limit_key=rate_limit_key,
@@ -1636,21 +1914,16 @@ class CommandManager:
         Args:
             message: The message triggering the command execution.
         """
-        content = message.content.strip()
-
-        # Check for command prefix if configured
-        if self.command_prefix:
-            # If prefix is configured, message must start with it
-            if not content.startswith(self.command_prefix):
-                return  # No prefix, no match
-            # Strip the prefix
-            content = content[len(self.command_prefix):].strip()
+        if getattr(message, 'prefix_normalized', False):
+            content = message.content.strip().lower()
         else:
-            # If no prefix configured, strip legacy "!" prefix for backward compatibility
-            if content.startswith('!'):
-                content = content[1:].strip()
-
-        content = content.lower()
+            normalized = self.normalize_command_content(message.content)
+            if normalized is None:
+                return
+            content = normalized.lower()
+            message.content = normalized
+            message.content_lower = content
+            message.prefix_normalized = True
 
         # Check each command to see if it should execute
         for command_name, command in self.commands.items():

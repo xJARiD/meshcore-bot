@@ -265,6 +265,25 @@ def _shrink_display_lcp(maximal: list[list[str]], lcp: list[str]) -> list[str]:
     return lcp
 
 
+def _cluster_head(common: str, suffix_tokens: list[list[str]]) -> str:
+    """Trunk line above a cluster's branch rows.
+
+    A path that stops exactly at the display LCP has an empty suffix, and the
+    branch renderers drop empty suffixes — so the trunk itself has to carry that
+    route. ``├ common`` (no ``┐``) is this file's marker for "a route ends here
+    and others continue"; ``common ┐`` means "everything continues past here".
+    Emitting ``┐`` in the first case silently lost the shortest path while the
+    header still counted it.
+
+    ``_shrink_display_lcp`` cannot cover this: it refuses to shrink below one
+    token, so a single-token LCP (the common case for ``96`` / ``96,e0``) always
+    lands here.
+    """
+    if any(len(t) == 0 for t in suffix_tokens):
+        return f"{_BRANCH_INTER} {common}"
+    return f"{common} {_BRANCH_CORNER}"
+
+
 def _format_path_cluster(token_lists: list[list[str]], use_brackets: bool) -> list[str]:
     """Format a cluster into condensed lines (common prefix + ┐ + ├/└, nested tails indented with 　).
 
@@ -293,7 +312,7 @@ def _format_path_cluster(token_lists: list[list[str]], use_brackets: bool) -> li
         common = ",".join(lcp)
         branch_lines = _format_suffix_branch_lines(suffix_tokens)
         if branch_lines:
-            lines = [f"{common} {_BRANCH_CORNER}"]
+            lines = [_cluster_head(common, suffix_tokens)]
             lines.extend(branch_lines)
         else:
             lines = [common]
@@ -328,7 +347,7 @@ def _format_path_cluster_flat(token_lists: list[list[str]], use_brackets: bool) 
         common = ",".join(lcp)
         branch_lines = _format_suffix_branch_lines_flat(suffix_tokens)
         if branch_lines:
-            lines = [f"{common} {_BRANCH_CORNER}"]
+            lines = [_cluster_head(common, suffix_tokens)]
             lines.extend(branch_lines)
         else:
             lines = [common]
@@ -486,13 +505,16 @@ def _format_path_cluster_nested(token_lists: list[list[str]], use_brackets: bool
     if len(lcp) > 0:
         suffix_tokens = [t[len(lcp) :] for t in token_lists]
         common = ",".join(lcp)
-        branch_lines = _nested_format_suffix_lines(suffix_tokens)
+        # Hand the branch renderer only the suffixes that actually continue.
+        # It strips its own LCP off every suffix, which maps an *empty* suffix
+        # (a route ending at ``common``) onto the same [] as a route ending at
+        # that inner LCP — making it emit a ``├ inner`` row for a route that
+        # does not exist. _cluster_head already represents the ends-at-common
+        # route on the trunk, so the empty suffix has no business here.
+        continuing = [s for s in suffix_tokens if s]
+        branch_lines = _nested_format_suffix_lines(continuing)
         if branch_lines:
-            nonempty_sfx = [s for s in suffix_tokens if s]
-            ne_lcp = _longest_common_prefix(nonempty_sfx) if nonempty_sfx else []
-            if any(len(t) == 0 for t in suffix_tokens) and len(ne_lcp) == 0:
-                return [f"{_BRANCH_INTER} {common}", *branch_lines]
-            return [f"{common} {_BRANCH_CORNER}", *branch_lines]
+            return [_cluster_head(common, suffix_tokens), *branch_lines]
         return [common]
 
     groups: dict[str, list[list[str]]] = defaultdict(list)
@@ -558,6 +580,21 @@ class MultitestCommand(BaseCommand):
     short_description = "Listens for 6 seconds and collects all unique paths your incoming messages took to reach the bot"
     usage = "multitest"
     examples = ["multitest", "mt"]
+
+    # Web-viewer settings schema (see modules/settings_schema.py)
+    settings_schema = [
+        {"key": "response_format", "label": "Response format", "type": "str",
+         "default": "",
+         "help": "Result template. Fields: {sender}, {path_count}, {paths}, {listening_duration}. Empty = default."},
+        {"key": "condense_paths", "label": "Path layout", "type": "enum",
+         "options": [
+             {"value": "true", "label": "Condensed tree (default)"},
+             {"value": "false", "label": "One full path per line"},
+             {"value": "nested", "label": "Nested/indented tree"},
+         ],
+         "default": "true",
+         "help": "How collected paths are displayed."},
+    ]
 
     def __init__(self, bot):
         super().__init__(bot)
@@ -1094,10 +1131,10 @@ class MultitestCommand(BaseCommand):
                 except (KeyError, ValueError) as e:
                     # If formatting fails, fall back to default
                     self.logger.debug(f"Error formatting multitest response: {e}, using default format")
-                    response = f"Found {path_count} unique path(s):\n{paths_text}"
+                    response = f"Paths({path_count}):\n{paths_text}"
             else:
                 # Default format
-                response = f"Found {path_count} unique path(s):\n{paths_text}"
+                response = f"Paths({path_count}):\n{paths_text}"
         else:
             # Provide more helpful error message with diagnostic info
             matching_packets = 0
@@ -1128,8 +1165,13 @@ class MultitestCommand(BaseCommand):
                 self.logger.info(f"Waiting {wait_time:.1f} seconds for rate limiter")
                 await asyncio.sleep(wait_time + 0.1)  # Small buffer
 
-        # Send the response
-        await self.send_response(message, response)
+        # Send without truncating path tokens; chunk if over DM/channel budget
+        max_len = self.get_max_message_length(message)
+        if len(response.encode("utf-8")) <= max_len:
+            await self.send_response(message, response)
+        else:
+            chunks = self.bot.command_manager.split_text_into_utf8_chunks(response, max_len)
+            await self.send_response_chunked(message, chunks)
 
         return True
 

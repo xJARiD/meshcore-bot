@@ -15,10 +15,10 @@ jobs:
     name: Lint Frontend (HTMLHint + ESLint)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
           cache: npm
@@ -36,7 +36,7 @@ jobs:
     name: Lint Shell Scripts (ShellCheck)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install ShellCheck
         run: sudo apt-get install -y shellcheck
@@ -48,16 +48,17 @@ jobs:
             -not -path "./node_modules/*" \
             -not -path "./.venv/*" \
             -not -path "./venv/*" \
+            -not -path "./dist/*" \
             -print0 | xargs -0 shellcheck --severity=warning
 
   lint:
     name: Lint (ruff)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install uv
@@ -67,19 +68,29 @@ jobs:
         run: uv sync --locked --group lint
 
       - name: ruff check — fail on any lint error
-        run: uv run ruff check modules/ tests/
+        run: uv run ruff check .
 
       - name: Log injection check — fail on new unsanitized logger calls
         run: uv run python scripts/check_log_injection.py
+
+      - name: Config validation — fail on unrecognized sections in shipped configs
+        run: |
+          set -e
+          for f in config.ini.example config.ini.minimal-example config.ini.quickstart config.min.ini config-pymc.ini; do
+            if [ -f "$f" ]; then
+              echo "Validating $f"
+              python validate_config.py --config "$f" --strict
+            fi
+          done
 
   typecheck:
     name: Type check (mypy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install uv
@@ -91,25 +102,53 @@ jobs:
       - name: mypy — strict overrides on typed modules
         run: uv run mypy modules/ --ignore-missing-imports
 
+  package:
+    name: Build and smoke-test distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Build wheel and source distribution
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+
+      - name: Install and smoke-test wheel outside the source tree
+        run: |
+          python -m venv /tmp/meshcore-wheel-smoke
+          /tmp/meshcore-wheel-smoke/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/meshcore-wheel-smoke/bin/python "$GITHUB_WORKSPACE/scripts/smoke_test_wheel.py"
+          /tmp/meshcore-wheel-smoke/bin/python "$GITHUB_WORKSPACE/scripts/smoke_test_no_geo.py"
+          /tmp/meshcore-wheel-smoke/bin/meshcore-bot --help >/dev/null
+          /tmp/meshcore-wheel-smoke/bin/meshcore-viewer --help >/dev/null
+
   test:
     name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
 
       - name: Install dependencies
-        run: uv sync --locked --extra test
+        run: uv sync --locked --extra test --extra geo
 
       - name: Run tests with coverage
         run: uv run pytest tests/ -v --tb=short

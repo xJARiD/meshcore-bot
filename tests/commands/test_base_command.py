@@ -76,7 +76,7 @@ class TestIsChannelAllowed:
         assert cmd.is_channel_allowed(msg) is False
 
 
-class TestFormatResponse:
+class TestFormatResponseDirectPath:
     """Tests for BaseCommand response placeholder formatting."""
 
     def test_direct_dm_without_path_formats_path_as_direct(self, command_mock_bot):
@@ -244,6 +244,36 @@ class TestGetMaxMessageLength:
         cmd = _TestCommand(command_mock_bot)
         msg = mock_message(content="x", channel="general", is_dm=False, reply_scope="#west")
         assert cmd.get_max_message_length(msg) == 147 - CHANNEL_REGIONAL_FLOOD_SCOPE_BODY_OVERHEAD
+
+
+class TestFormatResponse:
+    """Tests for BaseCommand response placeholder formatting."""
+
+    def test_formats_hops_and_enhanced_path_from_routing_info(self, command_mock_bot):
+        cmd = _TestCommand(command_mock_bot)
+        msg = mock_message(
+            content="path",
+            sender_id="alice",
+            path="raw fallback",
+            hops=2,
+            routing_info={"path_length": 2, "path_nodes": ["01", "5f"]},
+        )
+
+        result = cmd.format_response(msg, "{sender}|{path}|{hops}|{hops_label}")
+
+        assert result == "alice|01,5f (2 hops)|2|2 hops"
+
+    def test_formats_hops_from_path_suffix_when_hops_missing(self, command_mock_bot):
+        cmd = _TestCommand(command_mock_bot)
+        msg = mock_message(
+            content="path",
+            path="01,5f (2 hops)",
+            hops=None,
+        )
+
+        result = cmd.format_response(msg, "{path}|{hops}|{hops_label}")
+
+        assert result == "01,5f (2 hops)|2|2 hops"
 
 
 class TestCanExecute:
@@ -457,6 +487,17 @@ class TestCleanupMessageForMatching:
         cmd = self._cmd(command_mock_bot)
         msg = mock_message(content="testcmd")  # missing the ! prefix
         assert cmd.cleanup_message_for_matching(msg) == ""
+
+    def test_optional_command_prefix_allows_bare(self, command_mock_bot):
+        """require_command_prefix=false allows bare commands when prefix is configured."""
+        command_mock_bot.config.set("Bot", "respond_to_mentions", "false")
+        command_mock_bot.config.set("Bot", "command_prefix", "!")
+        command_mock_bot.config.set("Bot", "require_command_prefix", "false")
+        cmd = self._cmd(command_mock_bot)
+        msg = mock_message(content="testcmd")
+        assert cmd.cleanup_message_for_matching(msg) == "testcmd"
+        msg = mock_message(content="!testcmd")
+        assert cmd.cleanup_message_for_matching(msg) == "testcmd"
 
     # ---------------------------------------------- matches_keyword integration
     def test_matches_keyword_with_bot_mention(self, command_mock_bot):

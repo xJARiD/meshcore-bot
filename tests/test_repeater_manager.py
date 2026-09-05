@@ -10,9 +10,36 @@ import pytest
 from meshcore import EventType
 
 from modules.repeater_manager import (
+    REQUIRED_REPEATER_TABLES,
     RepeaterManager,
     collect_protected_pubkeys_for_device_mode,
+    validate_repeater_tables,
 )
+
+
+class TestValidateRepeaterTables:
+    """Callable without a RepeaterManager so lazy callers can still fail fast."""
+
+    def test_passes_on_a_migrated_database(self, test_db, mock_logger):
+        validate_repeater_tables(test_db, mock_logger)
+
+    def test_names_every_missing_table(self, test_db, mock_logger):
+        with test_db.connection() as conn:
+            conn.execute("DROP TABLE observed_paths")
+            conn.execute("DROP TABLE purging_log")
+            conn.commit()
+
+        with pytest.raises(RuntimeError) as excinfo:
+            validate_repeater_tables(test_db, mock_logger)
+
+        message = str(excinfo.value)
+        assert "observed_paths" in message
+        assert "purging_log" in message
+        assert "Run the bot once to apply migrations" in message
+
+    def test_covers_the_tables_the_manager_depends_on(self):
+        assert "mesh_connections" in REQUIRED_REPEATER_TABLES
+        assert "repeater_contacts" in REQUIRED_REPEATER_TABLES
 
 
 @pytest.fixture
@@ -346,7 +373,11 @@ class TestCleanupRepeaterRetention:
 
     def test_does_not_raise_when_db_raises(self, rm):
         from unittest.mock import patch as _patch
-        with _patch.object(rm.db_manager, "execute_update", side_effect=Exception("db error")):
+        with _patch.object(
+            rm.db_manager,
+            "delete_timestamp_rows_in_chunks",
+            side_effect=Exception("db error"),
+        ):
             rm.cleanup_repeater_retention()  # Should not raise
         rm.logger.error.assert_called()
 
@@ -734,17 +765,23 @@ class TestTrackContactAdvertisement:
         return data
 
     async def test_missing_public_key_returns_false(self, rm):
-        """Advertisement without public_key should return False immediately."""
+        """Advertisement without public_key should return ok=False immediately."""
+        from modules.repeater_manager import TrackAdvertResult
+
         result = await rm.track_contact_advertisement({"name": "Nameless"})
-        assert result is False
+        assert result == TrackAdvertResult(ok=False, duplicate_packet=False)
         rm.logger.warning.assert_called()
 
     async def test_empty_public_key_returns_false(self, rm):
+        from modules.repeater_manager import TrackAdvertResult
+
         result = await rm.track_contact_advertisement({"public_key": "", "name": "X"})
-        assert result is False
+        assert result == TrackAdvertResult(ok=False, duplicate_packet=False)
 
     async def test_new_contact_inserted_returns_true(self, rm):
-        """New contact (not in DB) is inserted and True is returned."""
+        """New contact (not in DB) is inserted and ok=True, duplicate_packet=False."""
+        from modules.repeater_manager import TrackAdvertResult
+
         advert = self._make_advert()
 
         rm.bot.meshcore = Mock()
@@ -752,7 +789,7 @@ class TestTrackContactAdvertisement:
 
         result = await rm.track_contact_advertisement(advert)
 
-        assert result is True
+        assert result == TrackAdvertResult(ok=True, duplicate_packet=False)
         # Verify the contact was actually inserted into the DB
         rows = rm.db_manager.execute_query(
             'SELECT * FROM complete_contact_tracking WHERE public_key = ?',
@@ -771,9 +808,11 @@ class TestTrackContactAdvertisement:
         await rm.track_contact_advertisement(advert)
 
         # Call again — should update existing entry, incrementing advert_count
+        from modules.repeater_manager import TrackAdvertResult
+
         result = await rm.track_contact_advertisement(advert)
 
-        assert result is True
+        assert result == TrackAdvertResult(ok=True, duplicate_packet=False)
         rows = rm.db_manager.execute_query(
             'SELECT advert_count FROM complete_contact_tracking WHERE public_key = ?',
             ('aabb1122',)
@@ -781,14 +820,17 @@ class TestTrackContactAdvertisement:
         assert rows[0]['advert_count'] == 2
 
     async def test_duplicate_packet_hash_skips_and_returns_true(self, rm):
-        """When packet_hash is already in unique_advert_packets, return True without re-inserting."""
+        """When packet_hash is already in unique_advert_packets, duplicate_packet=True without re-inserting."""
+        from modules.repeater_manager import TrackAdvertResult
+
         advert = self._make_advert()
         packet_hash = "deadbeef12345678"
         rm.bot.meshcore = Mock()
         rm.bot.meshcore.contacts = {}
 
         # First call inserts the contact and records the packet hash
-        await rm.track_contact_advertisement(advert, packet_hash=packet_hash)
+        first = await rm.track_contact_advertisement(advert, packet_hash=packet_hash)
+        assert first == TrackAdvertResult(ok=True, duplicate_packet=False)
         rows_before = rm.db_manager.execute_query(
             'SELECT advert_count FROM complete_contact_tracking WHERE public_key = ?',
             ('aabb1122',)
@@ -797,7 +839,7 @@ class TestTrackContactAdvertisement:
         # Second call with same packet_hash should skip the update
         result = await rm.track_contact_advertisement(advert, packet_hash=packet_hash)
 
-        assert result is True
+        assert result == TrackAdvertResult(ok=True, duplicate_packet=True)
         rows_after = rm.db_manager.execute_query(
             'SELECT advert_count FROM complete_contact_tracking WHERE public_key = ?',
             ('aabb1122',)
@@ -813,9 +855,11 @@ class TestTrackContactAdvertisement:
         rm.bot.meshcore = Mock()
         rm.bot.meshcore.contacts = {}
 
+        from modules.repeater_manager import TrackAdvertResult
+
         result = await rm.track_contact_advertisement(advert, signal_info=signal_info)
 
-        assert result is True
+        assert result == TrackAdvertResult(ok=True, duplicate_packet=False)
         rows = rm.db_manager.execute_query(
             'SELECT signal_strength, snr FROM complete_contact_tracking WHERE public_key = ?',
             ('direct_hop_key',)
@@ -841,13 +885,15 @@ class TestTrackContactAdvertisement:
         assert rows[0]['snr'] is None
 
     async def test_db_exception_returns_false(self, rm):
-        """An unexpected exception during DB operations should return False."""
+        """An unexpected exception during DB operations should return ok=False."""
         advert = self._make_advert()
         rm.db_manager.execute_query_on_connection = Mock(side_effect=Exception("db exploded"))
 
+        from modules.repeater_manager import TrackAdvertResult
+
         result = await rm.track_contact_advertisement(advert)
 
-        assert result is False
+        assert result == TrackAdvertResult(ok=False, duplicate_packet=False)
         rm.logger.error.assert_called()
 
     async def test_daily_stats_updated_on_insert(self, rm):
@@ -856,9 +902,11 @@ class TestTrackContactAdvertisement:
         rm.bot.meshcore = Mock()
         rm.bot.meshcore.contacts = {}
 
+        from modules.repeater_manager import TrackAdvertResult
+
         result = await rm.track_contact_advertisement(advert)
 
-        assert result is True
+        assert result == TrackAdvertResult(ok=True, duplicate_packet=False)
         # Verify daily_stats was inserted
         from datetime import date
         rows = rm.db_manager.execute_query(

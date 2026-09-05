@@ -1,36 +1,182 @@
 {
   "keywords": {
-    "help": ["help"],
-    "ping": ["ping"],
-    "test": ["test", "t"],
-    "wx": ["wx", "weather", "wxa", "wxalert"],
-    "gwx": ["gwx", "globalweather", "gwxa"],
-    "aqi": ["aqi", "air", "airquality", "air_quality"],
-    "aurora": ["aurora", "kp"],
-    "solar": ["solar"],
-    "sun": ["sun"],
-    "moon": ["moon"],
-    "hfcond": ["hfcond", "hf"],
-    "satpass": ["satpass"],
-    "sports": ["sports", "score", "scores"],
-    "stats": ["stats"],
-    "channels": ["channels", "channel"],
-    "path": ["path", "decode", "route"],
-    "prefix": ["prefix", "repeater", "lookup"],
-    "repeater": ["repeater", "repeaters", "rp"],
-    "solarforecast": ["sf", "solarforecast"],
-    "dice": ["dice"],
-    "roll": ["roll"],
-    "joke": ["joke", "jokes"],
-    "dadjoke": ["dadjoke", "dad joke", "dadjokes", "dad jokes"],
-    "catfact": ["catfact", "cat", "meow", "purr", "kitten"],
-    "hacker": ["hacker", "sudo", "ps aux", "grep", "ls -l", "ls -la", "echo $PATH"],
-    "hello": ["hello", "hi", "hey", "howdy", "greetings", "salutations", "good morning", "good afternoon", "good evening", "good night", "yo", "sup", "whats up", "what's up", "morning", "afternoon", "evening", "night", "gday", "g'day", "hola", "bonjour", "ciao", "namaste", "aloha", "shalom", "konnichiwa", "guten tag", "buenos dias", "buenas tardes", "buenas noches"],
-    "webviewer": ["webviewer", "web", "viewer", "wv"],
-    "cmd": ["cmd", "commands"],
-    "advert": ["advert"],
-    "multitest": ["multitest", "mt"],
-    "trace": ["trace", "tracer"]
+    "help": [
+      "help"
+    ],
+    "ping": [
+      "ping"
+    ],
+    "test": [
+      "test",
+      "t"
+    ],
+    "wx": [
+      "wx",
+      "weather",
+      "wxa",
+      "wxalert"
+    ],
+    "gwx": [
+      "gwx",
+      "globalweather",
+      "gwxa"
+    ],
+    "aqi": [
+      "aqi",
+      "air",
+      "airquality",
+      "air_quality"
+    ],
+    "rain": [
+      "rain",
+      "nowcast",
+      "snow"
+    ],
+    "aurora": [
+      "aurora",
+      "kp"
+    ],
+    "solar": [
+      "solar"
+    ],
+    "sun": [
+      "sun"
+    ],
+    "moon": [
+      "moon"
+    ],
+    "hfcond": [
+      "hfcond",
+      "hf"
+    ],
+    "satpass": [
+      "satpass"
+    ],
+    "sports": [
+      "sports",
+      "score",
+      "scores"
+    ],
+    "worldcup": [
+      "wc",
+      "worldcup"
+    ],
+    "stats": [
+      "stats"
+    ],
+    "channels": [
+      "channels",
+      "channel"
+    ],
+    "path": [
+      "path",
+      "decode",
+      "route"
+    ],
+    "prefix": [
+      "prefix",
+      "repeater",
+      "lookup"
+    ],
+    "repeater": [
+      "repeater",
+      "repeaters",
+      "rp"
+    ],
+    "solarforecast": [
+      "sf",
+      "solarforecast"
+    ],
+    "dice": [
+      "dice"
+    ],
+    "roll": [
+      "roll"
+    ],
+    "joke": [
+      "joke",
+      "jokes"
+    ],
+    "dadjoke": [
+      "dadjoke",
+      "dad joke",
+      "dadjokes",
+      "dad jokes"
+    ],
+    "catfact": [
+      "catfact",
+      "cat",
+      "meow",
+      "purr",
+      "kitten"
+    ],
+    "hacker": [
+      "hacker",
+      "sudo",
+      "ps aux",
+      "grep",
+      "ls -l",
+      "ls -la",
+      "echo $PATH"
+    ],
+    "hello": [
+      "hello",
+      "hi",
+      "hey",
+      "howdy",
+      "greetings",
+      "salutations",
+      "good morning",
+      "good afternoon",
+      "good evening",
+      "good night",
+      "yo",
+      "sup",
+      "whats up",
+      "what's up",
+      "morning",
+      "afternoon",
+      "evening",
+      "night",
+      "gday",
+      "g'day",
+      "hola",
+      "bonjour",
+      "ciao",
+      "namaste",
+      "aloha",
+      "shalom",
+      "konnichiwa",
+      "guten tag",
+      "buenos dias",
+      "buenas tardes",
+      "buenas noches"
+    ],
+    "webviewer": [
+      "webviewer",
+      "web",
+      "viewer",
+      "wv"
+    ],
+    "cmd": [
+      "cmd",
+      "commands"
+    ],
+    "advert": [
+      "advert"
+    ],
+    "neighbors": [
+      "neighbors",
+      "neighbours"
+    ],
+    "multitest": [
+      "multitest",
+      "mt"
+    ],
+    "trace": [
+      "trace",
+      "tracer"
+    ]
   },
   "commands": {
     "help": {
@@ -162,6 +308,17 @@
       "no_games_team": "No games found for {team}",
       "team_not_found": "Team/League '{team}' not found. Try: seahawks, mariners, sounders, kraken, storm, chiefs, lfc, mlb, nfl, mls, wnba, epl, etc."
     },
+    "worldcup": {
+      "description": "FIFA World Cup scores, standings & nation results (in-season only)",
+      "help": "World Cup scores. Use 'wc' for today's games, 'wc group [A-L]' for standings, or 'wc [nation]' for a team's matches.",
+      "not_in_season": "No World Cup is currently in progress.",
+      "no_games_today": "No World Cup games today.",
+      "no_games_nation": "No World Cup matches found for {nation}.",
+      "groups_list": "World Cup groups: {groups}. Try 'wc group A'.",
+      "group_not_found": "Group '{group}' not found. Try a group letter, e.g. 'wc group A'.",
+      "nation_not_found": "Nation '{nation}' not found in the current World Cup.",
+      "error_fetching": "Error fetching World Cup data"
+    },
     "stats": {
       "description": "Show statistics for past 24 hours. Use 'stats messages', 'stats channels', 'stats paths', or 'stats adverts' for specific stats.",
       "help": "Show 24h bot stats. Use 'stats' (basic), 'stats messages' (users), 'stats channels' (activity), 'stats paths', 'stats adverts'",
@@ -254,6 +411,18 @@
       "success": "Flood advert sent successfully!",
       "error": "Error sending flood advert: {error}"
     },
+    "neighbors": {
+      "description": "Runs a zero-hop neighbour discovery cycle (DM only)",
+      "disabled": "Neighbour discovery is not enabled. Set neighbors_enabled = true in the PacketCapture config.",
+      "busy": "A neighbour discovery cycle is already running. Try again once it finishes.",
+      "cooldown_active": "A neighbour discovery cycle ran recently. Please wait about {minutes} more minute(s) - discovery costs airtime for the whole mesh.",
+      "started": "Discovering neighbours - listening for about {seconds}s. I'll report back when done.",
+      "success": "Heard {count} neighbour(s), best SNR {best_snr}. Recorded {recorded} link(s).",
+      "published": "Published to {succeeded}/{attempted} broker(s).",
+      "none": "Discovery finished but no repeaters answered. Nothing is in direct range right now.",
+      "failed": "Neighbour discovery did not run: {reason}.",
+      "error": "Error running neighbour discovery: {error}"
+    },
     "path": {
       "description": "Decode hex path data to show which repeaters were involved in message routing",
       "help": "Path: path [hex] - Decode path to show repeaters. Use path alone for current message path, or path [7e,01] for specific path.",
@@ -271,7 +440,8 @@
       "continuation_start": "...\n{line}",
       "continuation_end": "\n...",
       "truncation": "...",
-      "unknown_name": "Unknown"
+      "unknown_name": "Unknown",
+      "repeater_resolution_deferred": "Path: {path}\n\n💡 Tip: Repeater identification requires {minimum_path_bytes}-byte paths."
     },
     "multitest": {
       "description": "Listens for 6 seconds and collects all unique paths from incoming messages with the same packet hash",
@@ -382,6 +552,35 @@
         "comet": "Comets have thin atmospheres of water vapor and dust. AQI: Variable, but you'd freeze in space anyway. ☄️"
       }
     },
+    "rain": {
+      "description": "Rain/snow nowcast: when precip starts or stops in the next ~2h, with amount",
+      "help_rain": "Rain nowcast: when rain starts/stops in ~2h, with amount. rain [city|zip|lat,lon]. Also: snow",
+      "help_snow": "Snow nowcast: when snow starts/stops in ~2h, with depth. snow [city|zip|lat,lon]. Also: rain",
+      "usage": "Usage: rain|snow [city|zipcode|lat,lon]",
+      "usage_short": "Usage: rain|snow [city|zipcode|lat,lon]",
+      "starting": "{emoji} {ptype} starting in ~{minutes}min for {location}{extra}",
+      "stopping": "{emoji} {ptype} easing in ~{minutes}min for {location}",
+      "continuing": "{emoji} {ptype} steady for {window}+ in {location}",
+      "clear": "☀️ No {precip} expected in next {window} for {location}",
+      "changeover": "{from_emoji}→{to_emoji} {first} {when} → {second} in ~{minutes}min for {location}",
+      "now": "now",
+      "duration_for": " (~{duration}min)",
+      "duration_open": " (steady)",
+      "error_fetching": "Error fetching rain nowcast data",
+      "no_location": "Usage: rain [city|zipcode|lat,lon]. No location: will use companion location if known, or bot location if not.",
+      "no_location_city": "Could not find city '{location}' in {state}",
+      "no_location_zipcode": "Could not find ZIP code '{location}'",
+      "error": "Error: {error}",
+      "precip_types": {
+        "drizzle": "Drizzle",
+        "rain": "Rain",
+        "heavy_rain": "Heavy rain",
+        "freezing": "Freezing rain",
+        "snow": "Snow",
+        "showers": "Showers",
+        "thunder": "Thunderstorms"
+      }
+    },
     "aurora": {
       "description": "Get aurora forecast (KP index and probability) for a location",
       "usage": "Usage: aurora [city|zipcode|lat,lon]",
@@ -480,7 +679,7 @@
       "category_other": "🛰️ Other: ",
       "examples": "\nExamples:\n• satpass iss\n• satpass noaa15\n• satpass 25544\n• satpass 27607 visual (visual passes only)",
       "labels": {
-        "geostationary": "{satname} appears to be geostationary or has invalid pass data. Geostationary satellites don't have traditional passes - they remain in a fixed position relative to Earth.",
+        "geostationary": "{satname}: GEO (no LEO pass)",
         "no_passes": "{satname} has no {pass_type} passes in the next 10 days from this location",
         "invalid_norad": "Provide NORAD# example use:🛰️satpass 25544,33591"
       }
@@ -893,47 +1092,150 @@
       "help": "Responds to greetings with robot-themed responses",
       "response_format": "I'm {bot_name}.",
       "greeting_openings": [
-        "Hello", "Greetings", "Salutations", "Hi", "Hey", "Howdy", "Yo", "Sup",
-        "What's up", "Good day", "Well met", "Hail", "Ahoy", "Bonjour", "Hola",
-        "Ciao", "Namaste", "Aloha", "Shalom", "Konnichiwa", "Guten tag", "G'day",
-        "How goes it", "What's good", "Peace", "Respect", "Blessings", "Cheers",
-        "Welcome", "Nice to see you", "Pleasure to meet you", "Good to see you",
-        "Long time no see", "Fancy meeting you here"
+        "Hello",
+        "Greetings",
+        "Salutations",
+        "Hi",
+        "Hey",
+        "Howdy",
+        "Yo",
+        "Sup",
+        "What's up",
+        "Good day",
+        "Well met",
+        "Hail",
+        "Ahoy",
+        "Bonjour",
+        "Hola",
+        "Ciao",
+        "Namaste",
+        "Aloha",
+        "Shalom",
+        "Konnichiwa",
+        "Guten tag",
+        "G'day",
+        "How goes it",
+        "What's good",
+        "Peace",
+        "Respect",
+        "Blessings",
+        "Cheers",
+        "Welcome",
+        "Nice to see you",
+        "Pleasure to meet you",
+        "Good to see you",
+        "Long time no see",
+        "Fancy meeting you here"
       ],
       "morning_greetings": [
-        "Good morning", "Top o' the morning", "Buenos dias", "Bonjour",
-        "Guten morgen", "Buongiorno", "Bom dia", "Dobro jutro", "Dobroye utro",
-        "Selamat pagi", "Ohayou gozaimasu", "Sabah al-khair", "Boker tov"
+        "Good morning",
+        "Top o' the morning",
+        "Buenos dias",
+        "Bonjour",
+        "Guten morgen",
+        "Buongiorno",
+        "Bom dia",
+        "Dobro jutro",
+        "Dobroye utro",
+        "Selamat pagi",
+        "Ohayou gozaimasu",
+        "Sabah al-khair",
+        "Boker tov"
       ],
       "afternoon_greetings": [
-        "Good afternoon", "Buenas tardes", "Boa tarde", "Dobro dan",
-        "Dobryy den", "Selamat siang", "Konnichiwa", "Ahlan bi-nahar",
+        "Good afternoon",
+        "Buenas tardes",
+        "Boa tarde",
+        "Dobro dan",
+        "Dobryy den",
+        "Selamat siang",
+        "Konnichiwa",
+        "Ahlan bi-nahar",
         "Tzoharaim tovim"
       ],
       "evening_greetings": [
-        "Good evening", "Buenas noches", "Boa noite", "Dobro veče",
-        "Dobryy vecher", "Selamat malam", "Konbanwa", "Ahlan bi-layl",
+        "Good evening",
+        "Buenas noches",
+        "Boa noite",
+        "Dobro veče",
+        "Dobryy vecher",
+        "Selamat malam",
+        "Konbanwa",
+        "Ahlan bi-layl",
         "Erev tov"
       ],
       "human_descriptors": [
-        "human", "carbon-based lifeform", "organic entity", "biological unit",
-        "flesh creature", "meat-based organism", "carbon unit", "organic being",
-        "biological entity", "meat-based lifeform", "carbon creature", "flesh unit",
-        "organic organism", "biological creature", "meat mech", "flesh bot", "organic automaton",
-        "biological android", "carbon construct", "flesh drone", "organic robot",
-        "biological machine", "meat cyborg", "flesh android", "organic droid", "biological bot",
-        "carbon android", "meat unit", "flesh construct", "organic mech", "biological droid",
-        "meat-based bot", "flesh-based unit", "organic-based entity", "biological-based organism",
-        "carbon-based unit", "meat-based entity", "flesh-based creature", "organic-based unit",
-        "DNA-based lifeform", "neural network user", "bipedal mammal",
-        "water-based organism", "protein assembler", "ATP consumer",
-        "cellular automaton", "genetic algorithm", "biochemical processor",
+        "human",
+        "carbon-based lifeform",
+        "organic entity",
+        "biological unit",
+        "flesh creature",
+        "meat-based organism",
+        "carbon unit",
+        "organic being",
+        "biological entity",
+        "meat-based lifeform",
+        "carbon creature",
+        "flesh unit",
+        "organic organism",
+        "biological creature",
+        "meat mech",
+        "flesh bot",
+        "organic automaton",
+        "biological android",
+        "carbon construct",
+        "flesh drone",
+        "organic robot",
+        "biological machine",
+        "meat cyborg",
+        "flesh android",
+        "organic droid",
+        "biological bot",
+        "carbon android",
+        "meat unit",
+        "flesh construct",
+        "organic mech",
+        "biological droid",
+        "meat-based bot",
+        "flesh-based unit",
+        "organic-based entity",
+        "biological-based organism",
+        "carbon-based unit",
+        "meat-based entity",
+        "flesh-based creature",
+        "organic-based unit",
+        "DNA-based lifeform",
+        "neural network user",
+        "bipedal mammal",
+        "water-based organism",
+        "protein assembler",
+        "ATP consumer",
+        "cellular automaton",
+        "genetic algorithm",
+        "biochemical processor",
         "metabolic engine",
-        "human friend", "fellow sentient being", "earthling", "fellow traveler",
-        "kindred spirit", "digital companion", "friend", "buddy", "pal", "mate",
-        "fellow human", "earth dweller", "terrestrial being", "planet walker",
-        "humanoid", "organic", "biological", "carbon-based buddy",
-        "flesh-based friend", "organic pal", "biological buddy", "carbon companion"
+        "human friend",
+        "fellow sentient being",
+        "earthling",
+        "fellow traveler",
+        "kindred spirit",
+        "digital companion",
+        "friend",
+        "buddy",
+        "pal",
+        "mate",
+        "fellow human",
+        "earth dweller",
+        "terrestrial being",
+        "planet walker",
+        "humanoid",
+        "organic",
+        "biological",
+        "carbon-based buddy",
+        "flesh-based friend",
+        "organic pal",
+        "biological buddy",
+        "carbon companion"
       ],
       "emoji_responses": {
         "🖖": [
@@ -1116,7 +1418,7 @@
     "management": "Management Commands"
   },
   "services": {
-    "darcmowas" : {
+    "darcmowas": {
       "messagetype": {
         "eu-alert-level-1": "Emergency Alert",
         "eu-alert-level-2": "Extreme Danger",
