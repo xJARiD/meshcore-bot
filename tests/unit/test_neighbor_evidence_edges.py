@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -21,7 +22,8 @@ SELF_KEY = "ff" * 32
 KEY_A = "aa" * 32
 KEY_B = "bb" * 32
 
-RECENT = "2026-08-01T00:00:00+00:00"
+# Relative to now so the 30-day window tests do not expire by the calendar.
+RECENT = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0).isoformat()
 ANCIENT = "2020-01-01T00:00:00+00:00"
 
 
