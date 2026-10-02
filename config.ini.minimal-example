@@ -246,8 +246,11 @@ max_response_hops = 7
 # channel_keywords =
 
 [Banned_Users]
-# List of banned sender names (comma-separated). Matching is prefix (starts-with):
-# "Awful Username" also matches "Awful Username 🍆". No bot responses in channels or DMs.
+# List of banned sender names (comma-separated). No bot responses in channels or DMs.
+# Plain entries match by prefix (starts-with, case-sensitive):
+# "Awful Username" also matches "Awful Username 🍆".
+# Entries with * (any characters) or ? (one character) are case-insensitive wildcard
+# patterns over the whole name: "*troll*" matches any name containing "troll".
 banned_users = 
 
 [Feed_Manager]

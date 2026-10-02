@@ -100,6 +100,19 @@ class TestLoadBannedUsers:
         assert "user1" in manager.banned_users
         assert "user2" in manager.banned_users
 
+    def test_load_banned_users_strips_quotes(self, cm_bot):
+        cm_bot.config.add_section("Banned_Users")
+        cm_bot.config.set("Banned_Users", "banned_users", '"*troll*"')
+        manager = make_manager(cm_bot)
+        assert manager.banned_users == ["*troll*"]
+        assert manager.is_user_banned("🍆 troll") is True
+
+    def test_load_banned_users_strips_per_entry_quotes(self, cm_bot):
+        cm_bot.config.add_section("Banned_Users")
+        cm_bot.config.set("Banned_Users", "banned_users", '"user1", \'user 2\'')
+        manager = make_manager(cm_bot)
+        assert manager.banned_users == ["user1", "user 2"]
+
 
 class TestIsUserBanned:
     """Tests for ban checking logic."""
@@ -125,6 +138,37 @@ class TestIsUserBanned:
     def test_none_sender(self, cm_bot):
         manager = make_manager(cm_bot)
         assert manager.is_user_banned(None) is False
+
+    def test_wildcard_contains_match(self, cm_bot):
+        cm_bot.config.add_section("Banned_Users")
+        cm_bot.config.set("Banned_Users", "banned_users", "*troll*")
+        manager = make_manager(cm_bot)
+        assert manager.is_user_banned("🍆 troll") is True
+        assert manager.is_user_banned("troll") is True
+        assert manager.is_user_banned("TROLL2") is True
+        assert manager.is_user_banned("tr oll") is False
+
+    def test_wildcard_is_anchored(self, cm_bot):
+        cm_bot.config.add_section("Banned_Users")
+        cm_bot.config.set("Banned_Users", "banned_users", "*troll")
+        manager = make_manager(cm_bot)
+        assert manager.is_user_banned("🍆 troll") is True
+        assert manager.is_user_banned("🍆 troll 2") is False
+
+    def test_wildcard_single_char_and_literal_specials(self, cm_bot):
+        cm_bot.config.add_section("Banned_Users")
+        cm_bot.config.set("Banned_Users", "banned_users", "[x]?bad*")
+        manager = make_manager(cm_bot)
+        assert manager.is_user_banned("[x]1bad user") is True
+        assert manager.is_user_banned("x1bad user") is False
+
+    def test_plain_entry_stays_case_sensitive_prefix(self, cm_bot):
+        cm_bot.config.add_section("Banned_Users")
+        cm_bot.config.set("Banned_Users", "banned_users", "troll, *other*")
+        manager = make_manager(cm_bot)
+        assert manager.is_user_banned("🍆 troll") is False
+        assert manager.is_user_banned("troll") is True
+        assert manager.is_user_banned("TROLL") is False
 
 
 class TestChannelTriggerAllowed:

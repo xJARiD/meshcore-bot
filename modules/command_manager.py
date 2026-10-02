@@ -6,6 +6,7 @@ Handles all bot commands, keyword matching, and response generation
 
 import asyncio
 import random
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -34,6 +35,12 @@ from .models import CHANNEL_REGIONAL_FLOOD_SCOPE_BODY_OVERHEAD, MeshMessage
 from .plugin_loader import PluginLoader
 from .security_utils import sanitize_name, validate_safe_path
 from .utils import check_internet_connectivity_async, decode_escape_sequences, format_keyword_response_with_placeholders
+
+
+def _ban_pattern(entry: str) -> re.Pattern[str]:
+    """Compile a banned_users wildcard entry (``*`` = any run, ``?`` = one char)."""
+    parts = (re.escape(c) if c not in '*?' else ('.*' if c == '*' else '.') for c in entry)
+    return re.compile(''.join(parts), re.IGNORECASE | re.DOTALL)
 
 
 @dataclass
@@ -611,17 +618,27 @@ class CommandManager:
         """Load banned users from config"""
         if not self.bot.config.has_section('Banned_Users'):
             return []
-        banned = self.bot.config.get('Banned_Users', 'banned_users', fallback='')
-        return [user.strip() for user in banned.split(',') if user.strip()]
+        banned = strip_optional_quotes(self.bot.config.get('Banned_Users', 'banned_users', fallback=''))
+        entries = (strip_optional_quotes(user) for user in banned.split(','))
+        return [user for user in entries if user]
 
     def is_user_banned(self, sender_id: str | None) -> bool:
-        """Check if sender is banned using prefix (starts-with) matching.
+        """Check if sender is banned.
 
-        A banned entry "Awful Username" matches "Awful Username" and "Awful Username 🍆".
+        Plain entries use prefix (starts-with) matching: "Awful Username" matches
+        "Awful Username" and "Awful Username 🍆". Entries containing ``*`` or ``?``
+        are case-insensitive wildcard patterns over the whole name: "*troll*"
+        matches "🍆 troll".
         """
         if not sender_id:
             return False
-        return any(sender_id.startswith(entry) for entry in self.banned_users)
+        for entry in self.banned_users:
+            if '*' in entry or '?' in entry:
+                if _ban_pattern(entry).fullmatch(sender_id):
+                    return True
+            elif sender_id.startswith(entry):
+                return True
+        return False
 
     def load_monitor_channels(self) -> list[str]:
         """Load monitored channels from config.

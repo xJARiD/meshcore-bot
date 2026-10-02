@@ -1051,9 +1051,26 @@ def test_mesh_refresh_coordinator_handles_bursts_visibility_and_failures():
 
     {coordinator}
 
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    // Poll instead of fixed sleeps so slow CI runners (late timers) don't flake.
+    async function waitForLiveRefreshIdle(timeoutMs = 3000) {{
+        const deadline = Date.now() + timeoutMs;
+        while (
+            meshLiveRefreshPending
+            || meshLiveRefreshRunning
+            || meshLiveRefreshTimer
+        ) {{
+            if (Date.now() > deadline) {{
+                throw new Error('timed out waiting for live refresh to settle');
+            }}
+            await sleep(2);
+        }}
+    }}
+
     (async () => {{
         for (let i = 0; i < 100; i++) scheduleMeshLiveRefresh(false);
-        await new Promise(resolve => setTimeout(resolve, 40));
+        await waitForLiveRefreshIdle();
+        await sleep(20);
         const burst = {{loadCount, statsCount, maxConcurrent}};
 
         loadCount = 0;
@@ -1094,7 +1111,7 @@ def test_mesh_refresh_coordinator_handles_bursts_visibility_and_failures():
         scheduleMeshLiveRefresh(true, 10);
         await firstStarted;
         firstReleaseResolve();
-        await new Promise(resolve => setTimeout(resolve, 35));
+        await waitForLiveRefreshIdle();
         const scheduledRetry = {{
             loadCount,
             statsCount,
@@ -1110,7 +1127,8 @@ def test_mesh_refresh_coordinator_handles_bursts_visibility_and_failures():
         failBlockedFirst = false;
         scheduleMeshLiveRefresh(false, 20);
         await refreshData();
-        await new Promise(resolve => setTimeout(resolve, 30));
+        await waitForLiveRefreshIdle();
+        await sleep(30);
         const manualAbsorbsTimer = {{
             loadCount,
             statsCount,
@@ -1130,7 +1148,7 @@ def test_mesh_refresh_coordinator_handles_bursts_visibility_and_failures():
         await firstStarted;
         firstReleaseResolve();
         await failedManualPromise;
-        await new Promise(resolve => setTimeout(resolve, 35));
+        await waitForLiveRefreshIdle();
         const failedManualRetries = {{
             loadCount,
             forcedLoads,
@@ -1150,7 +1168,8 @@ def test_mesh_refresh_coordinator_handles_bursts_visibility_and_failures():
         const activeManualPromise = refreshData();
         firstReleaseResolve();
         await activeManualPromise;
-        await new Promise(resolve => setTimeout(resolve, 10));
+        await waitForLiveRefreshIdle();
+        await sleep(10);
         const manualReusesActiveRefresh = {{
             loadCount,
             forcedLoads,
@@ -1179,7 +1198,7 @@ def test_mesh_refresh_coordinator_handles_bursts_visibility_and_failures():
         text=True,
         capture_output=True,
         check=True,
-        timeout=5,
+        timeout=30,
     )
     result = json.loads(completed.stdout.strip())
 
