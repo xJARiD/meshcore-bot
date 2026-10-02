@@ -105,7 +105,7 @@ class TestLoadBannedUsers:
         cm_bot.config.set("Banned_Users", "banned_users", '"*troll*"')
         manager = make_manager(cm_bot)
         assert manager.banned_users == ["*troll*"]
-        assert manager.is_user_banned("🍆 troll - Node") is True
+        assert manager.is_user_banned("🍆 troll") is True
 
     def test_load_banned_users_strips_per_entry_quotes(self, cm_bot):
         cm_bot.config.add_section("Banned_Users")
@@ -143,17 +143,17 @@ class TestIsUserBanned:
         cm_bot.config.add_section("Banned_Users")
         cm_bot.config.set("Banned_Users", "banned_users", "*troll*")
         manager = make_manager(cm_bot)
-        assert manager.is_user_banned("🍆 troll - Node") is True
+        assert manager.is_user_banned("🍆 troll") is True
         assert manager.is_user_banned("troll") is True
         assert manager.is_user_banned("TROLL2") is True
         assert manager.is_user_banned("tr oll") is False
 
     def test_wildcard_is_anchored(self, cm_bot):
         cm_bot.config.add_section("Banned_Users")
-        cm_bot.config.set("Banned_Users", "banned_users", "*Node")
+        cm_bot.config.set("Banned_Users", "banned_users", "*troll")
         manager = make_manager(cm_bot)
-        assert manager.is_user_banned("🍆 troll - Node") is True
-        assert manager.is_user_banned("🍆 troll - Node 2") is False
+        assert manager.is_user_banned("🍆 troll") is True
+        assert manager.is_user_banned("🍆 troll 2") is False
 
     def test_wildcard_single_char_and_literal_specials(self, cm_bot):
         cm_bot.config.add_section("Banned_Users")
@@ -166,8 +166,8 @@ class TestIsUserBanned:
         cm_bot.config.add_section("Banned_Users")
         cm_bot.config.set("Banned_Users", "banned_users", "troll, *other*")
         manager = make_manager(cm_bot)
-        assert manager.is_user_banned("🍆 troll - Node") is False
-        assert manager.is_user_banned("troll - Node") is True
+        assert manager.is_user_banned("🍆 troll") is False
+        assert manager.is_user_banned("troll") is True
         assert manager.is_user_banned("TROLL") is False
 
 

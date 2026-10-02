@@ -628,7 +628,7 @@ class CommandManager:
         Plain entries use prefix (starts-with) matching: "Awful Username" matches
         "Awful Username" and "Awful Username 🍆". Entries containing ``*`` or ``?``
         are case-insensitive wildcard patterns over the whole name: "*troll*"
-        matches "🍆 troll - Node".
+        matches "🍆 troll".
         """
         if not sender_id:
             return False
