@@ -101,12 +101,12 @@ If you are coming from v0.7 and skipping v0.8, also read [Upgrading from v0.8 �
 The standalone installer and Debian package now keep executable code root-owned and
 separate mutable runtime data:
 
-| Component | Linux | macOS |
-|-----------|-------|-------|
-| Code and virtual environment | `/opt/meshcore-bot` | `/usr/local/meshcore-bot` |
-| Configuration | `/etc/meshcore-bot/config.ini` | `/usr/local/etc/meshcore-bot/config.ini` |
-| Database and local plugins | `/var/lib/meshcore-bot` | `/usr/local/var/lib/meshcore-bot` |
-| Logs | `/var/log/meshcore-bot` | `/usr/local/var/log/meshcore-bot` |
+| Component                    | Linux                          | macOS                                    |
+| ---------------------------- | ------------------------------ | ---------------------------------------- |
+| Code and virtual environment | `/opt/meshcore-bot`            | `/usr/local/meshcore-bot`                |
+| Configuration                | `/etc/meshcore-bot/config.ini` | `/usr/local/etc/meshcore-bot/config.ini` |
+| Database and local plugins   | `/var/lib/meshcore-bot`        | `/usr/local/var/lib/meshcore-bot`        |
+| Logs                         | `/var/log/meshcore-bot`        | `/usr/local/var/log/meshcore-bot`        |
 
 Run `sudo ./install-service.sh --upgrade` from an updated source checkout. The
 installer requires Python 3.10+ and `rsync`. It stops an active service before the
@@ -202,6 +202,8 @@ Previous config files continue to work. The following legacy config formats are 
 ### Banned users: prefix matching
 
 `[Banned_Users]` uses **prefix (starts-with) matching** for `banned_users` entries. A banned entry `"Awful Username"` matches both `"Awful Username"` and `"Awful Username 🍆"`. If you rely on exact matching, ensure your banned entries are specific enough.
+
+Entries containing `*` or `?` are case-insensitive wildcard patterns matched against the whole name (`*` = any characters, `?` = one character). For example, `*troll*` bans any name containing "troll", such as `"🍆 troll"`.
 
 ### New optional sections
 
