@@ -19,7 +19,11 @@ class RollCommand(BaseCommand):
     """
 
     # Plugin metadata
+    # Read-only informational output; safe for scheduled {cmd:...} rendering.
+    render_safe = True
     name = "roll"
+    honors_skip_channel_check = False
+    enabled_attr = "roll_enabled"
     keywords = ['roll']
     description = "Roll a random number between 1 and X (default 100). Use 'roll' for 1-100, 'roll 50' for 1-50, etc."
     category = "games"
@@ -41,20 +45,7 @@ class RollCommand(BaseCommand):
         super().__init__(bot)
         self.roll_enabled = self.get_config_value('Roll_Command', 'enabled', fallback=True, value_type='bool')
 
-    def can_execute(self, message: MeshMessage, skip_channel_check: bool = False) -> bool:
-        """Check if this command can be executed with the given message.
-
-        Args:
-            message: The message triggering the command.
-
-        Returns:
-            bool: True if command is enabled and checks pass, False otherwise.
-        """
-        if not self.roll_enabled:
-            return False
-        return super().can_execute(message)
-
-    def get_help_text(self) -> str:
+    def get_help_text(self, message: MeshMessage | None = None) -> str:
         """Get help text for the roll command.
 
         Returns:
@@ -63,33 +54,18 @@ class RollCommand(BaseCommand):
         return self.translate('commands.roll.help')
 
     def matches_keyword(self, message: MeshMessage) -> bool:
-        """Override to handle roll-specific matching.
+        """Match ``roll`` / aliases; with args, only when the arg is a valid max."""
+        def _matches(content_lower: str) -> bool:
+            for keyword in self.keywords:
+                kw = keyword.lower()
+                if content_lower == kw:
+                    return True
+                if content_lower.startswith(kw + " "):
+                    roll_part = content_lower[len(kw):].strip()
+                    return self.parse_roll_notation(roll_part) is not None
+            return False
 
-        Custom matching logic to support variable maximums (e.g., "roll 50").
-
-        Args:
-            message: The message to check for a match.
-
-        Returns:
-            bool: True if the message matches the roll command syntax, False otherwise.
-        """
-        content_lower = self.cleanup_message_for_matching(message)
-
-        # Check for exact "roll" match
-        if content_lower == "roll":
-            return True
-
-        # Check for roll with parameters (roll 50, roll 1000, etc.)
-        # Ensure "roll" is the first word and followed by valid number
-        if content_lower.startswith("roll "):
-            words = content_lower.split()
-            if len(words) >= 2 and words[0] == "roll":
-                roll_part = content_lower[5:].strip()  # Get everything after "roll "
-                # Check if the roll part is valid number notation (not just any word)
-                max_num = self.parse_roll_notation(roll_part)
-                return max_num is not None  # Only match if it's valid number notation
-
-        return False
+        return self._cleaned_content_matches(message, _matches)
 
     def parse_roll_notation(self, roll_input: str) -> Optional[int]:
         """Parse roll notation and return the maximum number.
@@ -105,7 +81,7 @@ class RollCommand(BaseCommand):
         roll_input = roll_input.strip()
 
         # Handle direct number (e.g., "50", "100", "1000")
-        if roll_input.isdigit():
+        if roll_input.isdecimal():
             max_num = int(roll_input)
             if 1 <= max_num <= 10000:  # Reasonable limit
                 return max_num
@@ -149,18 +125,12 @@ class RollCommand(BaseCommand):
         Returns:
             bool: True if executed successfully, False otherwise.
         """
-        content = message.content.strip()
-
-        # Handle command-style messages
-        if content.startswith('!'):
-            content = content[1:].strip()
+        _trigger, roll_part = self.split_trigger_and_args(message.content)
 
         # Default to 1-100 if no specification
-        if content.lower() == "roll":
+        if not roll_part:
             max_num: Optional[int] = 100
         else:
-            # Parse roll specification
-            roll_part = content[5:].strip()  # Get everything after "roll "
             max_num = self.parse_roll_notation(roll_part)
 
             if max_num is None:

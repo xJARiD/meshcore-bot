@@ -22,7 +22,7 @@ fi
 if [[ -z "${VERSION}" ]]; then
     echo "ERROR: Could not read the version from pyproject.toml" >&2
     echo "       Install tomli (Python 3.10) or pass the version explicitly:" >&2
-    echo "       ./scripts/build-deb.sh 1.0.0" >&2
+    echo "       ./scripts/build-deb.sh 1.2.0" >&2
     exit 1
 fi
 
@@ -120,7 +120,7 @@ Type=simple
 User=meshcore
 Group=meshcore
 WorkingDirectory=/opt/meshcore-bot
-ExecStart=/opt/meshcore-bot/venv/bin/python /opt/meshcore-bot/meshcore_bot.py --config /etc/meshcore-bot/config.ini
+ExecStart=/opt/meshcore-bot/venv/bin/python /opt/meshcore-bot/meshcore_bot.py --config /etc/meshcore-bot/config.ini --wait-for-lock
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=10
@@ -243,6 +243,15 @@ if [ -d "${INSTALL_ROOT}/venv" ]; then
 fi
 if ! mv "${VENV_BUILD}" "${INSTALL_ROOT}/venv"; then
     [ -d "${VENV_OLD}" ] && mv "${VENV_OLD}" "${INSTALL_ROOT}/venv"
+    exit 1
+fi
+# Shebangs still point at .venv-build-$$; rewrite for the final path (#229).
+# Keep VENV_OLD until rewrite succeeds so a failure can restore the prior tree.
+if ! bash "${INSTALL_ROOT}/scripts/rewrite_venv_shebangs.sh" "${INSTALL_ROOT}/venv"; then
+    if [ -d "${VENV_OLD}" ]; then
+        rm -rf "${INSTALL_ROOT}/venv"
+        mv "${VENV_OLD}" "${INSTALL_ROOT}/venv"
+    fi
     exit 1
 fi
 rm -rf "${VENV_OLD}"

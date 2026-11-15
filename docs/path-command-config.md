@@ -11,6 +11,29 @@ The path command supports **1-, 2-, and 3-byte-per-hop** paths (2, 4, or 6 hex c
   - **Comma-separated** (e.g. `path 0102,5f7e`): Hop size is inferred from token length. All tokens must be the same length (2, 4, or 6 hex chars). Example: `0102,5f7e` → two 2-byte hops.
   - **Continuous hex** (e.g. `path 01025f7e`): The bot’s [Bot] **`prefix_bytes`** is used (2 hex chars = 1 byte, 4 = 2 bytes, 6 = 3 bytes). Use comma-separated input to force a multi-byte interpretation when the bot is in 1-byte mode.
 
+## Short names for test and keyword replies (`{path_names}`)
+
+`{path_names}` is a placeholder for `[Test_Command] response_format` and `[Keywords]` replies that shows the route as short repeater names, so a test reply can carry the names the path command would show, in a single line:
+
+```ini
+[Test_Command]
+response_format = ack @[{sender}]{phrase_part} | {path_names} | {elapsed}
+```
+
+renders `ack @[Alice] | BlackHls▸KalamaSum▸KelsoG3 | 842ms` for a message that came in over `a1b2,c3d4,e5f6`.
+
+- **Only confident multi-byte matches get a name.** The path must use 2 or 3 bytes per hop, and the hop's prefix must have exactly one recent repeater, or a collision that the same engine as the web viewer's path decode resolves with at least `path_names_min_confidence`. Any other hop keeps its hex prefix in its place (`BlackHls▸c3d4▸KelsoG3`), so the hop count and order are never misleading and no hop shows a guessed name. A 1-byte path renders as hex throughout (`a1▸c3▸e5`); a direct message renders `Direct`, like `{path}`.
+- **Names are compacted** (`modules/name_shortener.py`): accents folded to ASCII, emoji and punctuation dropped, filler words such as *Repeater*, *RP* and *The* removed, an amateur callsign dropped when the name has other words (`N7JMV-EVERETT-RP` → `Everett`, since one operator often runs many repeaters), words run together in CamelCase, and place words abbreviated (*Hills* → *Hls*, *Summit* → *Sum*, *Mountain* → *Mtn*). A name still over `path_names_max_name_length` loses compass words (*North* → *N*), then the word *Mesh*, then interior vowels, then trailing letters, keeping numbers to the end because they usually tell neighboring repeaters apart. A name with nothing left (all emoji) falls back to its hex prefix.
+- **The whole value fits `path_names_max_bytes`.** Names shrink together down to 4 characters; past that, hops after the first are replaced by `…`, keeping the last hops (nearest the bot).
+- The lookup costs one database query per hop, and only runs when the template contains `{path_names}`.
+
+| Setting (`[Path_Command]`) | Default | Meaning |
+|---|---|---|
+| `path_names_max_name_length` | `10` | Longest single name, in characters. |
+| `path_names_max_bytes` | `60` | Byte budget for the whole value; `0` = no limit. The default separator is 3 bytes in UTF-8. |
+| `path_names_separator` | `▸` | Text between hops. Quote it to keep spaces: `" > "`. |
+| `path_names_min_confidence` | `0.9` | Confidence a colliding prefix needs before its name is shown. |
+
 ## Reply prefix and repeater name gating
 
 These options only affect the **path** command’s reply text and whether repeater names are resolved from the database.
@@ -18,7 +41,27 @@ These options only affect the **path** command’s reply text and whether repeat
 **`reply_prefix`** (string, default empty)
 
 - Prepended as the first line of path command RF replies (only the **first** chunk when the reply is split for length).
-- Uses Python `str.format` on the **triggering** message. Placeholders: `{sender}`, `{connection_info}`, `{path}`, `{hops}`, `{hops_label}`, `{timestamp}`, `{snr}`, `{rssi}`.
+- Placeholders: `{sender}`, `{connection_info}`, `{path}`, `{hops}`, `{hops_label}`, `{timestamp}`, `{snr}`, `{rssi}`, `{packet_hash}`, `{path_distance}`.
+- `{path_distance}` is the total distance travelled, summed sender → each resolved hop → bot (e.g. `12.4km`). It is **empty** whenever the chain cannot be measured end to end: an unresolved hop, a prefix collision, a node with no stored coordinates, an unknown sender position, or no `[Bot] bot_latitude`/`bot_longitude`. A partial sum is never reported, since it would understate the real distance.
+- `{packet_hash}` is the 16-char MeshCore packet identity hash (uppercase hex) of the packet that carried the request. It is **empty** when RF correlation could not tie a heard packet to this message, so a hash from an unrelated transmission is never shown.
+- Supports the same **feed-style pipe filters** as the test command's `response_format` (see `modules/response_template.py`). Use `prefix_if_nonempty` so a label disappears along with an empty distance:
+
+```ini
+reply_prefix = "{path_distance|prefix_if_nonempty:📏 }\n"
+```
+- `hops_min:N` clears a field unless the message actually travelled at least N hops. `{path_distance}` renders `N/A` on a direct message, which `prefix_if_nonempty` treats as a value, so gate it first: `{path_distance|hops_min:1|prefix_if_nonempty:📏 }`. Unlike `pathbytes_min:N`, which asks how the path is *encoded*, this keeps a measurable one-byte multi-hop path.
+- `if_nonempty:LITERAL` (alias `if_notempty`) renders `LITERAL` when the value is non-empty after prior filters, and clears entirely otherwise — the opposite pairing of `prefix_if_nonempty`, useful when the whole output should be a fixed (or field-built) literal rather than the value with a label prepended. Since `{packet_hash}` is empty whenever RF correlation fails, gating on it hides the whole clause instead of printing a broken link:
+
+```ini
+reply_prefix = {packet_hash|if_nonempty:"https://scope.example.net/#/packets/{packet_hash}"}
+```
+  The `LITERAL` argument may itself be a double-quoted string containing nested `{field}` placeholders (expanded before the filter runs), so the link above still carries the packet hash even though the field being gated on (`packet_hash`) and the field inside the literal are the same one. Quoting also ends the argument at the closing quote, so more filters can follow it — including after `prefix_if_nonempty`, whose *unquoted* argument still swallows the rest of the chain so that a literal may contain `|`.
+- `shorten` (alias `shorten_url`, the same filter feed formats document) runs the value through the shared shortener configured under `[External_Data]` (`short_url_website`, `short_url_website_service` — `gd` for v.gd/is.gd-compatible or `shlink`, and `short_url_website_api_key` where required). It falls back to the original, unshortened value if shortening fails or isn't configured, so a clause never silently disappears because of a network error. Chain it after building the link so only the final URL is sent over RF:
+
+```ini
+reply_prefix = {packet_hash|if_nonempty:"https://scope.example.net/#/packets/{packet_hash}"|shorten}
+```
+  For `shlink`, `short_url_website` is required — with no base configured the bot skips shortening rather than sending your API key to the default `gd` host.
 
 **`minimum_path_bytes`** (integer `0`–`3`, default `0`)
 

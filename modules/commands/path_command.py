@@ -6,17 +6,21 @@ Decodes hex path data to show which repeaters were involved in message routing
 
 import asyncio
 import re
-import time
+import time  # noqa: F401  importable from this module on dev
 from typing import Any, Callable, Optional
 
+from ..location import latest_contact_position_rows
 from ..models import MeshMessage
 from ..path_inference import (
     PathInferenceConfig,
     select_node_repeater,
     select_repeater_by_graph,
 )
+from ..response_template import format_piped_template_async
+from ..template_reference import MESSAGE_PLACEHOLDERS, template_spec
 from ..utils import (
     bytes_per_hop_from_routing_and_nodes,
+    calculate_distance,
     parse_path_string,
     public_key_has_prefix,
 )
@@ -28,6 +32,8 @@ class PathCommand(BaseCommand):
 
     # Plugin metadata
     name = "path"
+    honors_skip_channel_check = False
+    enabled_attr = "path_enabled"
     keywords = ["path", "decode", "route"]
     description = "Decode hex path data to show which repeaters were involved in message routing"
     requires_dm = False
@@ -84,7 +90,26 @@ class PathCommand(BaseCommand):
          "help": "Allow 'p' as a shortcut for the path command."},
         {"key": "reply_prefix", "label": "Reply prefix", "type": "str",
          "default": "",
-         "help": "Optional text prepended to path replies."},
+         "help": "Optional first line of path replies (only the first part of a split reply).",
+         "template": template_spec(
+             "piped",
+             MESSAGE_PLACEHOLDERS + ("path_distance",),
+             notes=["\\n is not decoded here; the prefix is always one line."],
+             escapes=False,
+         )},
+        # {path_names} placeholder (test and keyword replies)
+        {"key": "path_names_max_name_length", "label": "Path names: name length", "type": "int",
+         "min": 1, "max": 30, "default": 10,
+         "help": "Longest a single repeater name may be in {path_names}, in characters."},
+        {"key": "path_names_max_bytes", "label": "Path names: max bytes", "type": "int",
+         "min": 0, "default": 60,
+         "help": "Byte budget for the whole {path_names} value. Names shrink, then middle hops become …, to fit. 0 = no limit."},
+        {"key": "path_names_separator", "label": "Path names: separator", "type": "str",
+         "default": "▸",
+         "help": "Text between hops in {path_names}. Quote it to keep spaces: \" > \"."},
+        {"key": "path_names_min_confidence", "label": "Path names: min confidence", "type": "float",
+         "min": 0, "max": 1, "default": 0.9,
+         "help": "Confidence a colliding prefix needs before {path_names} shows its name. A prefix with one candidate always qualifies."},
         # Confidence symbols
         {"key": "high_confidence_symbol", "label": "High-confidence symbol", "type": "str",
          "default": "🎯", "help": "Marker for high-confidence path results."},
@@ -145,7 +170,7 @@ class PathCommand(BaseCommand):
         # Path-byte gating
         {"key": "require_path_bytes_greater_or_equal_to", "label": "Require path bytes ≥", "type": "int",
          "min": 0, "max": 3, "default": 0,
-         "help": "Only respond when the path has at least this many bytes. 0/1 = allow all."},
+         "help": "Only respond when the path's total size is at least 2 bytes (2) or exactly 3 bytes (3), counting every hop. 0/1 = allow all."},
         {"key": "require_path_bytes_failure_response", "label": "Path-byte reject reply", "type": "str",
          "default": "",
          "help": "Reply when rejected by the path-byte requirement. Empty = silent reject."},
@@ -173,6 +198,9 @@ class PathCommand(BaseCommand):
         {"key": "graph_startup_load_days", "label": "Graph startup load window", "type": "int",
          "min": 0, "default": 0, "unit": "days",
          "help": "Days of historical edges to load at startup. 0 = load all."},
+        {"key": "geographic_scoring_enabled", "label": "Geographic scoring", "type": "bool",
+         "default": True,
+         "help": "Use repeater locations to pick between prefix collisions. Off disables it even when the bot has a location."},
     ]
 
     def __init__(self, bot):
@@ -278,9 +306,11 @@ class PathCommand(BaseCommand):
         # Check if "p" shortcut is enabled (on by default)
         self.enable_p_shortcut = bot.config.getboolean('Path_Command', 'enable_p_shortcut', fallback=True)
         if self.enable_p_shortcut:
-            # Add "p" to keywords if enabled
+            # Instance-level copy: appending to the inherited class list would leave
+            # "p" on PathCommand.keywords for every instance built later in the same
+            # process, so a reload with enable_p_shortcut = false would still answer "p".
             if "p" not in self.keywords:
-                self.keywords.append("p")
+                self.keywords = [*self.keywords, "p"]
 
         reply_prefix_raw = bot.config.get('Path_Command', 'reply_prefix', fallback='')
         self.path_reply_prefix = self._strip_quotes_from_config(reply_prefix_raw).strip()
@@ -380,10 +410,55 @@ class PathCommand(BaseCommand):
         bph = self._bytes_per_hop_from_nodes_and_routing(node_ids, routing_info)
         return bph >= self.minimum_path_bytes
 
-    def _format_path_reply_prefix(self, message: MeshMessage) -> str:
+    def _store_path_distance(
+        self, distance_km: Optional[float], message: Optional[MeshMessage]
+    ) -> None:
+        """Record the distance for this request.
+
+        Attached to the message when we have it, because the decode above awaits a
+        database lookup and a second path command can interleave there. Instance
+        state would let one request render the other's distance. The attribute
+        fallback keeps direct calls (and existing tests) working.
+        """
+        if message is not None:
+            message._path_distance_km = distance_km  # type: ignore[attr-defined]
+        self._last_path_distance_km = distance_km
+
+    def _format_path_distance(self, message: Optional[MeshMessage] = None) -> str:
+        """Render the {path_distance} placeholder; empty when the path cannot be measured.
+
+        Matches the ``{path_distance}`` name and ``12.4km`` shape already used by the
+        test command, so one prefix template reads the same across both commands.
+        """
+        # Only consult instance state when there is no request to read from. Falling
+        # back on a request-local None would render another request's distance next to
+        # a reply that has none of its own.
+        if message is not None:
+            distance = getattr(message, '_path_distance_km', None)
+        else:
+            distance = getattr(self, '_last_path_distance_km', None)
+        if distance is None:
+            return ''
+        return f"{distance:.1f}km"
+
+    async def _format_path_reply_prefix(self, message: MeshMessage) -> str:
+        """Render the configured reply prefix off the event loop.
+
+        Async because the prefix may carry a ``shorten`` filter, whose HTTP call
+        would otherwise block radio RX and every other handler for its full timeout.
+        """
         if not self.path_reply_prefix:
             return ''
-        formatted = self.format_response(message, self.path_reply_prefix).rstrip()
+        fields = self.get_standard_placeholder_fields(message)
+        fields['path_distance'] = self._format_path_distance(message)
+        formatted = (await format_piped_template_async(
+            self.path_reply_prefix,
+            {k: str(v) for k, v in fields.items()},
+            message=message,
+            logger=self.logger,
+            config=self.bot.config,
+            prefix_hex_chars=getattr(self.bot, 'prefix_hex_chars', 2),
+        )).rstrip()
         if not formatted:
             return ''
         return formatted + '\n'
@@ -397,40 +472,20 @@ class PathCommand(BaseCommand):
         )
 
     async def _decode_node_ids(
-        self, node_ids: list[str], routing_info: Optional[dict[str, Any]] = None
+        self,
+        node_ids: list[str],
+        routing_info: Optional[dict[str, Any]] = None,
+        message: Optional[MeshMessage] = None,
     ) -> str:
         self.logger.info(f"Decoding path with {len(node_ids)} nodes: {','.join(node_ids)}")
         if not self._should_resolve_repeater_names(node_ids, routing_info):
+            self._store_path_distance(None, message)
             return self._format_repeater_resolution_deferred(node_ids)
         repeater_info = await self._lookup_repeater_names(node_ids)
+        self._store_path_distance(
+            self._calculate_path_distance_km(node_ids, repeater_info, message), message
+        )
         return self._format_path_response(node_ids, repeater_info)
-
-    def can_execute(self, message: MeshMessage, skip_channel_check: bool = False) -> bool:
-        """Check if this command can be executed with the given message.
-
-        Args:
-            message: The message triggering the command.
-
-        Returns:
-            bool: True if command is enabled and checks pass, False otherwise.
-        """
-        if not self.path_enabled:
-            return False
-        return super().can_execute(message, skip_channel_check=skip_channel_check)
-
-    def matches_keyword(self, message: MeshMessage) -> bool:
-        """Check if message starts with 'path' keyword or 'p' shortcut (if enabled)"""
-        content_lower = self.cleanup_message_for_matching(message)
-
-        # Handle "p" shortcut if enabled
-        if self.enable_p_shortcut:
-            if content_lower == "p":
-                return True  # Just "p" by itself
-            elif content_lower.startswith('p ') and len(content_lower) > 2:
-                return True  # "p " followed by path data
-
-        # Check if message starts with any of our keywords
-        return any(content_lower == keyword or content_lower.startswith(keyword + ' ') for keyword in self.keywords)
 
     async def execute(self, message: MeshMessage) -> bool:
         """Execute path decode command"""
@@ -442,24 +497,26 @@ class PathCommand(BaseCommand):
         # Store the current message for use in _extract_path_from_recent_messages
         self._current_message = message
 
-        # Parse the message content to extract path data
-        content = message.content.strip()
-        parts = content.split()
+        # Instance state, so a value left by the previous request would otherwise be
+        # rendered next to this one's reply, including on the error paths below.
+        self._last_path_distance_km = None
 
-        if len(parts) < 2:
-            # No arguments provided - try to extract path from current message
-            response = await self._extract_path_from_recent_messages()
+        _trigger, args = self.split_trigger_and_args(message.content)
+        if not args:
+            # No arguments — decode the current message's routing path
+            response = await self._extract_path_from_recent_messages(message)
         else:
-            # Extract path data from the command
-            path_input = " ".join(parts[1:])
-            response = await self._decode_path(path_input)
+            response = await self._decode_path(args, message=message)
 
         # Send the response (may be split into multiple messages if long)
         await self._send_path_response(message, response)
         return True
 
     async def _decode_path(
-        self, path_input: str, routing_info: Optional[dict[str, Any]] = None
+        self,
+        path_input: str,
+        routing_info: Optional[dict[str, Any]] = None,
+        message: Optional[MeshMessage] = None,
     ) -> str:
         """Decode hex path data to repeater names.
         Comma-separated tokens infer hop size (2, 4, or 6 hex chars per node).
@@ -490,7 +547,7 @@ class PathCommand(BaseCommand):
             if not node_ids:
                 return self.translate('commands.path.no_valid_hex')
 
-            return await self._decode_node_ids(node_ids, routing_info)
+            return await self._decode_node_ids(node_ids, routing_info, message=message)
 
         except Exception as e:
             self.logger.error(f"Error decoding path: {e}")
@@ -521,256 +578,11 @@ class PathCommand(BaseCommand):
             # Query the database for repeaters with matching prefixes
             # Node IDs are the configured prefix of the public key (see Bot.prefix_bytes)
             for node_id in node_ids:
-                # Test dependency injection: use provided lookup when available
-                if lookup_func is not None:
-                    results = lookup_func(node_id)
-                    # Normalize to expected format (create_test_repeater already matches)
-                    if results:
-                        results = [
-                            {
-                                'name': r['name'],
-                                'public_key': r['public_key'],
-                                'device_type': r.get('device_type', 'repeater'),
-                                'last_seen': r.get('last_seen', r.get('last_heard')),
-                                'last_heard': r.get('last_heard', r.get('last_seen')),
-                                'last_advert_timestamp': r.get('last_advert_timestamp'),
-                                'is_active': r.get('is_active', True),
-                                'latitude': r.get('latitude'),
-                                'longitude': r.get('longitude'),
-                                'city': r.get('city'),
-                                'state': r.get('state'),
-                                'country': r.get('country'),
-                                'advert_count': r.get('advert_count', 1),
-                                'signal_strength': r.get('signal_strength'),
-                                'snr': r.get('snr'),
-                                'hop_count': r.get('hop_count'),
-                                'role': r.get('role', 'repeater'),
-                                'is_starred': bool(r.get('is_starred', False)),
-                            }
-                            for r in results
-                        ]
-                else:
-                    # First try complete tracking database (all heard contacts, filtered by role)
-                    results = []
-                    if hasattr(self.bot, 'repeater_manager'):
-                        try:
-                            # Get repeater devices from complete database (repeaters and roomservers)
-                            complete_db = await self.bot.repeater_manager.get_repeater_devices(include_historical=True)
-
-                            for row in complete_db:
-                                if public_key_has_prefix(row['public_key'], node_id):
-                                    results.append({
-                                        'name': row['name'],
-                                        'public_key': row['public_key'],
-                                        'device_type': row['device_type'],
-                                        'last_seen': row['last_heard'],
-                                        'last_heard': row['last_heard'],  # Include last_heard for recency calculation
-                                        'last_advert_timestamp': row.get('last_advert_timestamp'),  # Include last_advert_timestamp for recency calculation
-                                        'is_active': row['is_currently_tracked'],
-                                        'latitude': row['latitude'],
-                                        'longitude': row['longitude'],
-                                        'city': row['city'],
-                                        'state': row['state'],
-                                        'country': row['country'],
-                                        'advert_count': row['advert_count'],
-                                        'signal_strength': row['signal_strength'],
-                                        'snr': row.get('snr'),  # Include SNR for zero-hop bonus
-                                        'hop_count': row['hop_count'],
-                                        'role': row['role'],
-                                        'is_starred': bool(row.get('is_starred', 0))  # Include star status for bias
-                                    })
-                        except Exception as e:
-                            self.logger.debug(f"Error getting complete database: {e}")
-                            results = []
-
-                    # If complete tracking database failed, try direct query to complete_contact_tracking
-                    if not results:
-                        try:
-                            # Build query with age filtering if configured
-                            # Use last_advert_timestamp if available, otherwise fall back to last_heard
-                            if self.max_repeater_age_days > 0:
-                                query = f'''
-                                    SELECT name, public_key, device_type, last_heard, last_heard as last_seen,
-                                           last_advert_timestamp, latitude, longitude, city, state, country,
-                                           advert_count, signal_strength, snr, hop_count, role, is_starred
-                                    FROM complete_contact_tracking
-                                    WHERE public_key LIKE ? AND role IN ('repeater', 'roomserver')
-                                    AND (
-                                        (last_advert_timestamp IS NOT NULL AND last_advert_timestamp >= datetime('now', '-{self.max_repeater_age_days} days'))
-                                        OR (last_advert_timestamp IS NULL AND last_heard >= datetime('now', '-{self.max_repeater_age_days} days'))
-                                    )
-                                    ORDER BY COALESCE(last_advert_timestamp, last_heard) DESC
-                                '''
-                            else:
-                                query = '''
-                                    SELECT name, public_key, device_type, last_heard, last_heard as last_seen,
-                                           last_advert_timestamp, latitude, longitude, city, state, country,
-                                           advert_count, signal_strength, snr, hop_count, role, is_starred
-                                    FROM complete_contact_tracking
-                                    WHERE public_key LIKE ? AND role IN ('repeater', 'roomserver')
-                                    ORDER BY COALESCE(last_advert_timestamp, last_heard) DESC
-                                '''
-
-                            prefix_pattern = f"{node_id}%"
-                            results = self.bot.db_manager.execute_query(query, (prefix_pattern,))
-
-                            # Convert results to expected format
-                            if results:
-                                results = [
-                                    {
-                                        'name': row['name'],
-                                        'public_key': row['public_key'],
-                                        'device_type': row['device_type'],
-                                        'last_seen': row['last_seen'],
-                                        'last_heard': row.get('last_heard', row['last_seen']),
-                                        'last_advert_timestamp': row.get('last_advert_timestamp'),
-                                        'is_active': True,
-                                        'latitude': row['latitude'],
-                                        'longitude': row['longitude'],
-                                        'city': row['city'],
-                                        'state': row['state'],
-                                        'country': row['country'],
-                                        'advert_count': row.get('advert_count', 0),
-                                        'signal_strength': row.get('signal_strength'),
-                                        'snr': row.get('snr'),
-                                        'hop_count': row.get('hop_count'),
-                                        'role': row.get('role'),
-                                        'is_starred': bool(row.get('is_starred', 0))
-                                    } for row in results
-                                ]
-                        except Exception as e:
-                            self.logger.debug(f"Error querying complete_contact_tracking directly: {e}")
-                            results = []
-
+                results = await self._repeater_candidates(node_id, lookup_func)
                 if results:
-                    # Build repeaters_data with the fields the selection engine needs. hop_count is
-                    # intentionally omitted (this preserves prior behavior: the bot path's graph
-                    # selection never applied the zero-hop bonus through this code path).
-                    repeaters_data = [
-                        {
-                            'name': row['name'],
-                            'public_key': row['public_key'],
-                            'device_type': row['device_type'],
-                            'last_seen': row['last_seen'],
-                            'last_heard': row.get('last_heard', row['last_seen']),  # Include last_heard for recency calculation
-                            'last_advert_timestamp': row.get('last_advert_timestamp'),  # Include last_advert_timestamp for recency calculation
-                            'is_active': row['is_active'],
-                            'latitude': row['latitude'],
-                            'longitude': row['longitude'],
-                            'city': row['city'],
-                            'state': row['state'],
-                            'country': row['country'],
-                            'snr': row.get('snr'),  # Include SNR for zero-hop bonus
-                            'is_starred': row.get('is_starred', False)  # Include star status for bias
-                        } for row in results
-                    ]
-
-                    # Delegate recency filtering, graph-based disambiguation, and geographic
-                    # proximity to the shared engine (modules.path_inference). Candidate gathering
-                    # (above), output shaping, and the device-contacts fallback (below) stay here.
-                    selection = select_node_repeater(
-                        node_id, repeaters_data, node_ids, self._inference_config(),
-                        mesh_graph=getattr(self.bot, 'mesh_graph', None),
-                        db_manager=self.bot.db_manager,
-                        logger=self.logger,
-                        graph_n=getattr(self.bot, 'prefix_hex_chars', 2),
-                        sender_location=sender_location,
-                        # Deliberately NOT passing node_index: repeater_info below
-                        # is keyed by node_id, so a repeated 1-byte prefix shares
-                        # one entry. Resolving each occurrence separately would
-                        # make the later hop overwrite the earlier one's display.
-                        # Fixing that needs repeater_info re-keyed by hop index.
-                    )
-
-                    if selection.status == 'resolved':
-                        # High confidence selection (graph or geographic)
-                        selected_repeater = selection.repeater
-                        repeater_info[node_id] = {
-                            'name': selected_repeater['name'],
-                            'public_key': selected_repeater['public_key'],
-                            'device_type': selected_repeater['device_type'],
-                            'last_seen': selected_repeater['last_seen'],
-                            'is_active': selected_repeater['is_active'],
-                            'found': True,
-                            'collision': False,
-                            'geographic_guess': (selection.method == 'geographic'),
-                            'graph_guess': (selection.method == 'graph'),
-                            'confidence': selection.confidence
-                        }
-                    elif selection.status == 'collision':
-                        # Low confidence or no selection method - show collision warning
-                        repeater_info[node_id] = {
-                            'found': True,
-                            'collision': True,
-                            'matches': selection.matches,
-                            'node_id': node_id,
-                            'repeaters': selection.recent_repeaters
-                        }
-                    elif selection.status == 'single':
-                        # Single recent match after filtering - no choice made, so no confidence indicator
-                        repeater = selection.repeater
-                        repeater_info[node_id] = {
-                            'name': repeater['name'],
-                            'public_key': repeater['public_key'],
-                            'device_type': repeater['device_type'],
-                            'last_seen': repeater['last_seen'],
-                            'is_active': repeater['is_active'],
-                            'found': True,
-                            'collision': False
-                        }
-                    else:
-                        # All repeaters filtered out (too old) - show as not found
-                        repeater_info[node_id] = {
-                            'found': False,
-                            'node_id': node_id
-                        }
+                    self._resolve_repeater_candidates(node_id, results, node_ids, sender_location, repeater_info)
                 else:
-                    # Also check device contacts for active repeaters
-                    device_matches = []
-                    if hasattr(self.bot.meshcore, 'contacts'):
-                        for contact_key, contact_data in self.bot.meshcore.contacts.items():
-                            public_key = contact_data.get('public_key', contact_key)
-                            if public_key_has_prefix(public_key, node_id):
-                                # Check if this is a repeater
-                                if hasattr(self.bot, 'repeater_manager') and self.bot.repeater_manager._is_repeater_device(contact_data):
-                                    name = contact_data.get('adv_name', contact_data.get('name', self.translate('commands.path.unknown_name')))
-                                    device_matches.append({
-                                        'name': name,
-                                        'public_key': public_key,
-                                        'device_type': contact_data.get('type', 'Unknown'),
-                                        'last_seen': 'Active',
-                                        'is_active': True,
-                                        'source': 'device'
-                                    })
-
-                    if device_matches:
-                        if len(device_matches) > 1:
-                            # Multiple device matches - show collision warning
-                            repeater_info[node_id] = {
-                                'found': True,
-                                'collision': True,
-                                'matches': len(device_matches),
-                                'node_id': node_id,
-                                'repeaters': device_matches
-                            }
-                        else:
-                            # Single device match
-                            match = device_matches[0]
-                            repeater_info[node_id] = {
-                                'name': match['name'],
-                                'public_key': match['public_key'],
-                                'device_type': match['device_type'],
-                                'last_seen': match['last_seen'],
-                                'is_active': match['is_active'],
-                                'found': True,
-                                'collision': False,
-                                'source': 'device'
-                            }
-                    else:
-                        repeater_info[node_id] = {
-                            'found': False,
-                            'node_id': node_id
-                        }
+                    self._resolve_from_device_contacts(node_id, repeater_info)
 
         except Exception as e:
             self.logger.error(f"Error looking up repeater names: {e}")
@@ -784,45 +596,294 @@ class PathCommand(BaseCommand):
 
         return repeater_info
 
-    async def _get_api_cache_data(self) -> Optional[dict[str, dict[str, Any]]]:
-        """Get API cache data from the prefix command if available"""
-        try:
-            # Try to get the prefix command instance and its cache data
-            if hasattr(self.bot, 'command_manager'):
-                prefix_cmd = self.bot.command_manager.commands.get('prefix')
-                if prefix_cmd and hasattr(prefix_cmd, 'cache_data'):
-                    # Check if cache is valid
-                    current_time = time.time()
-                    if current_time - prefix_cmd.cache_timestamp > prefix_cmd.cache_duration:
-                        await prefix_cmd.refresh_cache()
-                    return prefix_cmd.cache_data
-        except Exception as e:
-            self.logger.warning(f"Could not get API cache data: {e}")
-        return None
+    async def _repeater_candidates(self, node_id, lookup_func):
+        """Candidate repeaters for a path prefix: the injected test lookup, else the
+        complete tracking database, else a direct complete_contact_tracking query.
+        """
+        # Test dependency injection: use provided lookup when available
+        if lookup_func is not None:
+            results = lookup_func(node_id)
+            # Normalize to expected format (create_test_repeater already matches)
+            if results:
+                results = [
+                    {
+                        'name': r['name'],
+                        'public_key': r['public_key'],
+                        'device_type': r.get('device_type', 'repeater'),
+                        'last_seen': r.get('last_seen', r.get('last_heard')),
+                        'last_heard': r.get('last_heard', r.get('last_seen')),
+                        'last_advert_timestamp': r.get('last_advert_timestamp'),
+                        'is_active': r.get('is_active', True),
+                        'latitude': r.get('latitude'),
+                        'longitude': r.get('longitude'),
+                        'city': r.get('city'),
+                        'state': r.get('state'),
+                        'country': r.get('country'),
+                        'advert_count': r.get('advert_count', 1),
+                        'signal_strength': r.get('signal_strength'),
+                        'snr': r.get('snr'),
+                        'hop_count': r.get('hop_count'),
+                        'role': r.get('role', 'repeater'),
+                        'is_starred': bool(r.get('is_starred', False)),
+                    }
+                    for r in results
+                ]
+        else:
+            # First try complete tracking database (all heard contacts, filtered by role)
+            results = []
+            if hasattr(self.bot, 'repeater_manager'):
+                try:
+                    # Get repeater devices from complete database (repeaters and roomservers)
+                    complete_db = await self.bot.repeater_manager.get_repeater_devices(include_historical=True)
 
+                    for row in complete_db:
+                        if public_key_has_prefix(row['public_key'], node_id):
+                            results.append({
+                                'name': row['name'],
+                                'public_key': row['public_key'],
+                                'device_type': row['device_type'],
+                                'last_seen': row['last_heard'],
+                                'last_heard': row['last_heard'],  # Include last_heard for recency calculation
+                                'last_advert_timestamp': row.get('last_advert_timestamp'),  # Include last_advert_timestamp for recency calculation
+                                'is_active': row['is_currently_tracked'],
+                                'latitude': row['latitude'],
+                                'longitude': row['longitude'],
+                                'city': row['city'],
+                                'state': row['state'],
+                                'country': row['country'],
+                                'advert_count': row['advert_count'],
+                                'signal_strength': row['signal_strength'],
+                                'snr': row.get('snr'),  # Include SNR for zero-hop bonus
+                                'hop_count': row['hop_count'],
+                                'role': row['role'],
+                                'is_starred': bool(row.get('is_starred', 0))  # Include star status for bias
+                            })
+                except Exception as e:
+                    self.logger.debug(f"Error getting complete database: {e}")
+                    results = []
 
-    def _get_sender_location(self) -> Optional[tuple[float, float]]:
-        """Get sender location from current message if available"""
+            # If complete tracking database failed, try direct query to complete_contact_tracking
+            if not results:
+                try:
+                    # Build query with age filtering if configured
+                    # Use last_advert_timestamp if available, otherwise fall back to last_heard
+                    if self.max_repeater_age_days > 0:
+                        query = f'''
+                                    SELECT name, public_key, device_type, last_heard, last_heard as last_seen,
+                                           last_advert_timestamp, latitude, longitude, city, state, country,
+                                           advert_count, signal_strength, snr, hop_count, role, is_starred
+                                    FROM complete_contact_tracking
+                                    WHERE public_key LIKE ? AND role IN ('repeater', 'roomserver')
+                                    AND (
+                                        (last_advert_timestamp IS NOT NULL AND last_advert_timestamp >= datetime('now', '-{self.max_repeater_age_days} days'))
+                                        OR (last_advert_timestamp IS NULL AND last_heard >= datetime('now', '-{self.max_repeater_age_days} days'))
+                                    )
+                                    ORDER BY COALESCE(last_advert_timestamp, last_heard) DESC
+                                '''
+                    else:
+                        query = '''
+                                    SELECT name, public_key, device_type, last_heard, last_heard as last_seen,
+                                           last_advert_timestamp, latitude, longitude, city, state, country,
+                                           advert_count, signal_strength, snr, hop_count, role, is_starred
+                                    FROM complete_contact_tracking
+                                    WHERE public_key LIKE ? AND role IN ('repeater', 'roomserver')
+                                    ORDER BY COALESCE(last_advert_timestamp, last_heard) DESC
+                                '''
+
+                    prefix_pattern = f"{node_id}%"
+                    results = self.bot.db_manager.execute_query(query, (prefix_pattern,))
+
+                    # Convert results to expected format
+                    if results:
+                        results = [
+                            {
+                                'name': row['name'],
+                                'public_key': row['public_key'],
+                                'device_type': row['device_type'],
+                                'last_seen': row['last_seen'],
+                                'last_heard': row.get('last_heard', row['last_seen']),
+                                'last_advert_timestamp': row.get('last_advert_timestamp'),
+                                'is_active': True,
+                                'latitude': row['latitude'],
+                                'longitude': row['longitude'],
+                                'city': row['city'],
+                                'state': row['state'],
+                                'country': row['country'],
+                                'advert_count': row.get('advert_count', 0),
+                                'signal_strength': row.get('signal_strength'),
+                                'snr': row.get('snr'),
+                                'hop_count': row.get('hop_count'),
+                                'role': row.get('role'),
+                                'is_starred': bool(row.get('is_starred', 0))
+                            } for row in results
+                        ]
+                except Exception as e:
+                    self.logger.debug(f"Error querying complete_contact_tracking directly: {e}")
+                    results = []
+        return results
+
+    def _resolve_repeater_candidates(self, node_id, results, node_ids, sender_location, repeater_info):
+        """Set ``repeater_info[node_id]`` from the shared selection engine's verdict on *results*."""
+        # Build repeaters_data with the fields the selection engine needs. hop_count is
+        # intentionally omitted (this preserves prior behavior: the bot path's graph
+        # selection never applied the zero-hop bonus through this code path).
+        repeaters_data = [
+            {
+                'name': row['name'],
+                'public_key': row['public_key'],
+                'device_type': row['device_type'],
+                'last_seen': row['last_seen'],
+                'last_heard': row.get('last_heard', row['last_seen']),  # Include last_heard for recency calculation
+                'last_advert_timestamp': row.get('last_advert_timestamp'),  # Include last_advert_timestamp for recency calculation
+                'is_active': row['is_active'],
+                'latitude': row['latitude'],
+                'longitude': row['longitude'],
+                'city': row['city'],
+                'state': row['state'],
+                'country': row['country'],
+                'snr': row.get('snr'),  # Include SNR for zero-hop bonus
+                'is_starred': row.get('is_starred', False)  # Include star status for bias
+            } for row in results
+        ]
+
+        # Delegate recency filtering, graph-based disambiguation, and geographic
+        # proximity to the shared engine (modules.path_inference). Candidate gathering
+        # (above), output shaping, and the device-contacts fallback (below) stay here.
+        selection = select_node_repeater(
+            node_id, repeaters_data, node_ids, self._inference_config(),
+            mesh_graph=getattr(self.bot, 'mesh_graph', None),
+            db_manager=self.bot.db_manager,
+            logger=self.logger,
+            graph_n=getattr(self.bot, 'prefix_hex_chars', 2),
+            sender_location=sender_location,
+            # Deliberately NOT passing node_index: repeater_info below
+            # is keyed by node_id, so a repeated 1-byte prefix shares
+            # one entry. Resolving each occurrence separately would
+            # make the later hop overwrite the earlier one's display.
+            # Fixing that needs repeater_info re-keyed by hop index.
+        )
+
+        if selection.status == 'resolved':
+            # High confidence selection (graph or geographic)
+            selected_repeater = selection.repeater
+            repeater_info[node_id] = {
+                'name': selected_repeater['name'],
+                'public_key': selected_repeater['public_key'],
+                'device_type': selected_repeater['device_type'],
+                'last_seen': selected_repeater['last_seen'],
+                'is_active': selected_repeater['is_active'],
+                'found': True,
+                'collision': False,
+                'geographic_guess': (selection.method == 'geographic'),
+                'graph_guess': (selection.method == 'graph'),
+                'confidence': selection.confidence,
+                # Carried through for {path_distance}; without these the
+                # distance calculation can never find a coordinate.
+                'latitude': selected_repeater.get('latitude'),
+                'longitude': selected_repeater.get('longitude'),
+            }
+        elif selection.status == 'collision':
+            # Low confidence or no selection method - show collision warning
+            repeater_info[node_id] = {
+                'found': True,
+                'collision': True,
+                'matches': selection.matches,
+                'node_id': node_id,
+                'repeaters': selection.recent_repeaters
+            }
+        elif selection.status == 'single':
+            # Single recent match after filtering - no choice made, so no confidence indicator
+            repeater = selection.repeater
+            repeater_info[node_id] = {
+                'name': repeater['name'],
+                'public_key': repeater['public_key'],
+                'device_type': repeater['device_type'],
+                'last_seen': repeater['last_seen'],
+                'is_active': repeater['is_active'],
+                'found': True,
+                'collision': False,
+                'latitude': repeater.get('latitude'),
+                'longitude': repeater.get('longitude'),
+            }
+        else:
+            # All repeaters filtered out (too old) - show as not found
+            repeater_info[node_id] = {
+                'found': False,
+                'node_id': node_id
+            }
+
+    def _resolve_from_device_contacts(self, node_id, repeater_info):
+        """Set ``repeater_info[node_id]`` from the radio's own contacts when no database candidate matched."""
+        # Also check device contacts for active repeaters
+        device_matches = []
+        if hasattr(self.bot.meshcore, 'contacts'):
+            for contact_key, contact_data in self.bot.meshcore.contacts.items():
+                public_key = contact_data.get('public_key', contact_key)
+                if public_key_has_prefix(public_key, node_id):
+                    # Check if this is a repeater
+                    if hasattr(self.bot, 'repeater_manager') and self.bot.repeater_manager._is_repeater_device(contact_data):
+                        name = contact_data.get('adv_name', contact_data.get('name', self.translate('commands.path.unknown_name')))
+                        device_matches.append({
+                            'name': name,
+                            'public_key': public_key,
+                            'device_type': contact_data.get('type', 'Unknown'),
+                            'last_seen': 'Active',
+                            'is_active': True,
+                            'source': 'device',
+                            'latitude': contact_data.get('adv_lat'),
+                            'longitude': contact_data.get('adv_lon'),
+                        })
+
+        if device_matches:
+            if len(device_matches) > 1:
+                # Multiple device matches - show collision warning
+                repeater_info[node_id] = {
+                    'found': True,
+                    'collision': True,
+                    'matches': len(device_matches),
+                    'node_id': node_id,
+                    'repeaters': device_matches
+                }
+            else:
+                # Single device match
+                match = device_matches[0]
+                repeater_info[node_id] = {
+                    'name': match['name'],
+                    'public_key': match['public_key'],
+                    'device_type': match['device_type'],
+                    'last_seen': match['last_seen'],
+                    'is_active': match['is_active'],
+                    'found': True,
+                    'collision': False,
+                    'source': 'device',
+                    'latitude': match.get('latitude'),
+                    'longitude': match.get('longitude'),
+                }
+        else:
+            repeater_info[node_id] = {
+                'found': False,
+                'node_id': node_id
+            }
+
+    def _get_sender_location(
+        self, message: Optional[MeshMessage] = None
+    ) -> Optional[tuple[float, float]]:
+        """Get sender location for this request.
+
+        Takes the request's own message; ``_current_message`` is shared instance
+        state and a concurrent path command can replace it mid-request.
+        """
         try:
-            if not hasattr(self, '_current_message') or not self._current_message:
+            request = message if message is not None else getattr(self, '_current_message', None)
+            if not request:
                 return None
 
-            sender_pubkey = self._current_message.sender_pubkey
+            sender_pubkey = request.sender_pubkey
             if not sender_pubkey:
                 return None
 
             # Look up sender location from database (any role, not just repeaters)
-            query = '''
-                SELECT latitude, longitude
-                FROM complete_contact_tracking
-                WHERE public_key = ?
-                AND latitude IS NOT NULL AND longitude IS NOT NULL
-                AND latitude != 0 AND longitude != 0
-                ORDER BY COALESCE(last_advert_timestamp, last_heard) DESC
-                LIMIT 1
-            '''
-
-            results = self.bot.db_manager.execute_query(query, (sender_pubkey,))
+            results = latest_contact_position_rows(self.bot, sender_pubkey, zero_rule="either")
 
             if results:
                 row = results[0]
@@ -831,60 +892,6 @@ class PathCommand(BaseCommand):
         except Exception as e:
             self.logger.debug(f"Error getting sender location: {e}")
             return None
-
-    def _filter_recent_repeaters(self, repeaters: list[dict[str, Any]], cutoff_hours: int = 24) -> list[dict[str, Any]]:
-        """Filter repeaters to only include those that have advertised recently"""
-        from datetime import datetime, timedelta
-
-        recent_repeaters = []
-        cutoff_time = datetime.now() - timedelta(hours=cutoff_hours)
-
-        for repeater in repeaters:
-            # Check recency using multiple timestamp fields
-            is_recent = False
-
-            # Check last_heard from complete_contact_tracking
-            last_heard = repeater.get('last_heard')
-            if last_heard:
-                try:
-                    if isinstance(last_heard, str):
-                        last_heard_dt = datetime.fromisoformat(last_heard.replace('Z', '+00:00'))
-                    else:
-                        last_heard_dt = last_heard
-                    is_recent = last_heard_dt > cutoff_time
-                except:
-                    pass
-
-            # Check last_advert_timestamp if last_heard check failed
-            if not is_recent:
-                last_advert = repeater.get('last_advert_timestamp')
-                if last_advert:
-                    try:
-                        if isinstance(last_advert, str):
-                            last_advert_dt = datetime.fromisoformat(last_advert.replace('Z', '+00:00'))
-                        else:
-                            last_advert_dt = last_advert
-                        is_recent = last_advert_dt > cutoff_time
-                    except:
-                        pass
-
-            # Check last_seen from complete_contact_tracking table
-            if not is_recent:
-                last_seen = repeater.get('last_seen')
-                if last_seen:
-                    try:
-                        if isinstance(last_seen, str):
-                            last_seen_dt = datetime.fromisoformat(last_seen.replace('Z', '+00:00'))
-                        else:
-                            last_seen_dt = last_seen
-                        is_recent = last_seen_dt > cutoff_time
-                    except:
-                        pass
-
-            if is_recent:
-                recent_repeaters.append(repeater)
-
-        return recent_repeaters
 
     def _select_repeater_by_graph(self, repeaters: list[dict[str, Any]], node_id: str,
                                   path_context: list[str],
@@ -904,6 +911,45 @@ class PathCommand(BaseCommand):
             graph_n=getattr(self.bot, 'prefix_hex_chars', 2),
             path_prefix_hex_chars=path_prefix_hex_chars,
         )
+
+    def _calculate_path_distance_km(
+        self,
+        node_ids: list[str],
+        repeater_info: dict[str, dict[str, Any]],
+        message: Optional[MeshMessage] = None,
+    ) -> Optional[float]:
+        """Total distance along sender -> each hop -> bot, in kilometres.
+
+        Returns None when any node in the chain has no usable coordinates, since a
+        partial sum would understate the real distance travelled.
+        """
+        if self.bot_latitude is None or self.bot_longitude is None:
+            return None
+
+        chain: list[tuple[float, float]] = []
+
+        sender = self._get_sender_location(message)
+        if sender is None:
+            return None
+        chain.append(sender)
+
+        for node_id in node_ids:
+            info = repeater_info.get(node_id, {})
+            # A prefix collision has no single node to measure from.
+            if not info.get('found', False) or info.get('collision', False):
+                return None
+            lat = info.get('latitude')
+            lon = info.get('longitude')
+            if lat is None or lon is None or (lat == 0 and lon == 0):
+                return None
+            chain.append((lat, lon))
+
+        chain.append((self.bot_latitude, self.bot_longitude))
+
+        total = 0.0
+        for (lat1, lon1), (lat2, lon2) in zip(chain, chain[1:], strict=False):
+            total += calculate_distance(lat1, lon1, lat2, lon2)
+        return total
 
     def _format_path_response(self, node_ids: list[str], repeater_info: dict[str, dict[str, Any]]) -> str:
         """Format the path decode response
@@ -962,7 +1008,7 @@ class PathCommand(BaseCommand):
 
     async def _send_path_response(self, message: MeshMessage, response: str):
         """Send path response, splitting into multiple messages if necessary"""
-        prefix = self._format_path_reply_prefix(message)
+        prefix = await self._format_path_reply_prefix(message)
         self.last_response = prefix + response if prefix else response
 
         max_length = self.get_max_message_length(message)
@@ -1007,15 +1053,18 @@ class PathCommand(BaseCommand):
             out = (prefix + current_message.rstrip()) if message_count == 0 else current_message.rstrip()
             await self.send_response(message, out, skip_user_rate_limit=True)
 
-    async def _extract_path_from_recent_messages(self) -> str:
+    async def _extract_path_from_recent_messages(
+        self, message: Optional[MeshMessage] = None
+    ) -> str:
         """Extract path from the current message's path information (same as test command).
         Prefers already-extracted routing_info.path_nodes when present (multi-byte path support).
         """
         try:
-            if not hasattr(self, '_current_message') or not self._current_message:
+            request = message if message is not None else getattr(self, '_current_message', None)
+            if not request:
                 return self.translate('commands.path.no_path')
 
-            msg = self._current_message
+            msg = request
 
             # Prefer routing_info when present (no re-parsing; preserves bytes_per_hop)
             routing_info = getattr(msg, 'routing_info', None)
@@ -1026,7 +1075,7 @@ class PathCommand(BaseCommand):
                 path_nodes = routing_info.get('path_nodes', [])
                 if path_nodes:
                     node_ids = [n.upper() for n in path_nodes]
-                    return await self._decode_node_ids(node_ids, routing_info)
+                    return await self._decode_node_ids(node_ids, routing_info, message=message)
 
             # Fallback: parse message.path string (e.g. no routing_info or legacy path)
             if not msg.path:
@@ -1039,10 +1088,10 @@ class PathCommand(BaseCommand):
             path_part = path_string.split(" via ROUTE_TYPE_")[0] if " via ROUTE_TYPE_" in path_string else path_string
 
             if ',' in path_part:
-                return await self._decode_path(path_part, routing_info)
+                return await self._decode_path(path_part, routing_info, message=message)
             hex_pattern = rf'[0-9a-fA-F]{{{getattr(self.bot, "prefix_hex_chars", 2)}}}'
             if re.search(hex_pattern, path_part):
-                return await self._decode_path(path_part, routing_info)
+                return await self._decode_path(path_part, routing_info, message=message)
             return self.translate('commands.path.path_prefix', path_string=path_string)
 
         except Exception as e:
@@ -1071,6 +1120,6 @@ class PathCommand(BaseCommand):
         """Get help text for the path command"""
         return self.translate('commands.path.help')
 
-    def get_help_text(self) -> str:
+    def get_help_text(self, message: MeshMessage | None = None) -> str:
         """Get help text for the path command (used by help system)"""
         return self.get_help()

@@ -9,9 +9,16 @@ import re
 from datetime import datetime
 from typing import Any, Optional
 
+from ..location import latest_contact_position_rows
 from ..models import MeshMessage
+from ..path_names import format_path_names, template_uses_path_names
 from ..response_template import format_piped_template
-from ..utils import calculate_distance, extract_path_node_ids_from_message
+from ..template_reference import MESSAGE_PLACEHOLDERS, template_spec
+from ..utils import (
+    calculate_distance,
+    decode_escape_sequences,
+    extract_path_node_ids_from_message,
+)
 from .base_command import BaseCommand
 
 
@@ -24,6 +31,8 @@ class TestCommand(BaseCommand):
 
     # Plugin metadata
     name = "test"
+    honors_skip_channel_check = False
+    enabled_attr = "test_enabled"
     keywords = ['test', 't']
     description = "Responds to 'test' or 't' with connection info"
     category = "basic"
@@ -36,12 +45,43 @@ class TestCommand(BaseCommand):
     # Web-viewer settings schema (see modules/settings_schema.py)
     settings_schema = [
         {"key": "response_format", "label": "Response format", "type": "str", "default": "",
-         "help": "Template for the test reply. Empty uses the default format."},
+         "help": "Template for the test reply. Empty uses the default format.",
+         "template": template_spec(
+             "piped",
+             MESSAGE_PLACEHOLDERS + ("phrase", "phrase_part", "elapsed", "path_distance", "firstlast_distance",
+                                     "path_names"),
+             notes=[
+                 "Blank uses [Keywords] test if set, else the default the preview shows.",
+                 "{path_distance} and {firstlast_distance} are N/A on a direct message, which "
+                 "counts as not empty: put hops_min:1 before prefix_if_nonempty to drop them there.",
+                 "{path_names} names a hop only on a 2- or 3-byte path with a confident match; "
+                 "other hops keep their hex prefix. Length settings are under [Path_Command].",
+                 "\\n starts a new line.",
+             ],
+             samples={"path_distance": {"direct": "N/A"}, "firstlast_distance": {"direct": "N/A"}},
+             blank_default="ack @[{sender}]{phrase_part} | {connection_info} | Received at: {timestamp}",
+             blank_config=("Keywords", "test"),
+         )},
+        {"key": "distance_unit", "label": "Distance unit", "type": "enum",
+         "options": [
+             {"value": "auto", "label": "Auto (follow reply language)"},
+             {"value": "km", "label": "Kilometres"},
+             {"value": "mi", "label": "Miles"},
+         ],
+         "default": "auto",
+         "help": "Unit for {path_distance} and {firstlast_distance}."},
+        {"key": "require_path_bytes_greater_or_equal_to", "label": "Require path bytes ≥", "type": "int",
+         "min": 0, "max": 3, "default": 0,
+         "help": "Only respond when the path's total size is at least 2 bytes (2) or exactly 3 bytes (3), counting every hop. 0/1 = allow all."},
+        {"key": "require_path_bytes_failure_response", "label": "Path-byte reject reply", "type": "str",
+         "default": "",
+         "help": "Reply when rejected by the path-byte requirement. Empty = silent reject."},
     ]
 
     def __init__(self, bot):
         super().__init__(bot)
         self.test_enabled = self.get_config_value('Test_Command', 'enabled', fallback=True, value_type='bool')
+        self.distance_unit = self._read_distance_unit()
         # Get bot location from config for geographic proximity calculations
         self.geographic_guessing_enabled = False
         self.bot_latitude = None
@@ -70,20 +110,7 @@ class TestCommand(BaseCommand):
         except Exception as e:
             self.logger.warning(f"Error reading bot location from config: {e}")
 
-    def can_execute(self, message: MeshMessage, skip_channel_check: bool = False) -> bool:
-        """Check if this command can be executed with the given message.
-
-        Args:
-            message: The message triggering the command.
-
-        Returns:
-            bool: True if command is enabled and checks pass, False otherwise.
-        """
-        if not self.test_enabled:
-            return False
-        return super().can_execute(message)
-
-    def get_help_text(self) -> str:
+    def get_help_text(self, message: MeshMessage | None = None) -> str:
         """Get help text for the command.
 
         Returns:
@@ -107,37 +134,29 @@ class TestCommand(BaseCommand):
         return cleaned
 
     def matches_keyword(self, message: MeshMessage) -> bool:
-        """Override to implement special test keyword matching with optional phrase.
+        """Match 'test'/'t' and any config ``aliases`` over control-cleaned content.
 
-        Matches 'test', 't', 'test <phrase>', or 't <phrase>'.
+        Mesh clients occasionally embed stray control bytes in message text, and a
+        test is exactly the message someone sends when their link is marginal, so
+        the cleaned text is what gets matched. Keyword and alias matching itself is
+        inherited from :class:`BaseCommand`.
+
+        The cleaned text only sticks when this command claims the message. Matching
+        runs against the shared message object early in the command scan, and
+        collapsing whitespace on someone else's free-form argument (a scheduled
+        message body, say) is not this command's business.
 
         Args:
             message: The message to check.
 
         Returns:
-            bool: True if the message matches the keyword patterns.
+            bool: True if the message matches a test keyword or configured alias.
         """
-        # Clean content to remove control characters and normalize whitespace
-        content = self.clean_content(message.content)
-
-        # Strip exclamation mark if present (for command-style messages)
-        if content.startswith('!'):
-            content = content[1:].strip()
-
-        # Handle "test" alone or "test " with phrase
-        if content.lower() == "test":
-            return True  # Just "test" by itself
-        elif (content.startswith('test ') or content.startswith('Test ')) and len(content) > 5:
-            phrase = content[5:].strip()  # Get everything after "test " and strip whitespace
-            return bool(phrase)  # Make sure there's actually a phrase
-
-        # Handle "t" alone or "t " with phrase
-        elif content.lower() == "t":
-            return True  # Just "t" by itself
-        elif (content.startswith('t ') or content.startswith('T ')) and len(content) > 2:
-            phrase = content[2:].strip()  # Get everything after "t " and strip whitespace
-            return bool(phrase)  # Make sure there's actually a phrase
-
+        original = message.content
+        message.content = self.clean_content(original)
+        if super().matches_keyword(message):
+            return True
+        message.content = original
         return False
 
     DEFAULT_FORMAT = "ack @[{sender}]{phrase_part} | {connection_info} | Received at: {timestamp}"
@@ -153,11 +172,13 @@ class TestCommand(BaseCommand):
             if raw:
                 cleaned = self._strip_quotes_from_config(raw).strip()
                 if cleaned:
-                    return cleaned
+                    return decode_escape_sequences(cleaned)
         if self.bot.config.has_section('Keywords'):
             format_str = self.bot.config.get('Keywords', 'test', fallback=None)
             if format_str:
-                return self._strip_quotes_from_config(format_str)
+                return decode_escape_sequences(
+                    self._strip_quotes_from_config(format_str)
+                )
         return self.DEFAULT_FORMAT
 
     def _extract_path_node_ids(self, message: MeshMessage) -> list[str]:
@@ -252,17 +273,7 @@ class TestCommand(BaseCommand):
                 return None
 
             # Look up sender location from database (any role, not just repeaters)
-            query = '''
-                SELECT latitude, longitude
-                FROM complete_contact_tracking
-                WHERE public_key = ?
-                AND latitude IS NOT NULL AND longitude IS NOT NULL
-                AND latitude != 0 AND longitude != 0
-                ORDER BY COALESCE(last_advert_timestamp, last_heard) DESC
-                LIMIT 1
-            '''
-
-            results = self.bot.db_manager.execute_query(query, (sender_pubkey,))
+            results = latest_contact_position_rows(self.bot, sender_pubkey, zero_rule="either")
 
             if results:
                 row = results[0]
@@ -544,6 +555,75 @@ class TestCommand(BaseCommand):
 
         return best_repeater
 
+    # Whether a reply reads in kilometres or miles is an operator choice, so
+    # [Test_Command] distance_unit decides it — the same call !gwx makes with its
+    # [Weather] unit config. 'auto' keeps the language as a proxy for the operator
+    # not having stated one: only US English gets miles, and en-GB is deliberately
+    # excluded because it shares the "en" catalog but not the units.
+    KM_TO_MILES = 0.621371
+    DISTANCE_UNITS = frozenset({'auto', 'km', 'mi'})
+    MILES_LANGUAGES = frozenset({'en', 'en-us'})
+
+    def _read_distance_unit(self) -> str:
+        """Read and validate ``[Test_Command] distance_unit``.
+
+        Returns:
+            str: One of 'auto', 'km' or 'mi'; 'auto' when unset or invalid.
+        """
+        raw = self.get_config_value('Test_Command', 'distance_unit', fallback='auto')
+        unit = str(raw or 'auto').strip().lower()
+        if unit not in self.DISTANCE_UNITS:
+            self.logger.warning(
+                f"Invalid distance_unit '{raw}' in [Test_Command]; "
+                f"expected one of {sorted(self.DISTANCE_UNITS)}. Falling back to 'auto'."
+            )
+            return 'auto'
+        return unit
+
+    def _response_language(self) -> str:
+        """Get the normalized language code the current reply is rendered in.
+
+        Prefers the translator bound for this reply (so an auto-detected sender
+        language wins) and falls back to ``[Localization] language``.
+
+        Returns:
+            str: Lowercased language code with ``_`` normalized to ``-`` (e.g. 'en-gb').
+        """
+        language = getattr(self.response_translator, 'language', None)
+        if not isinstance(language, str) or not language:
+            try:
+                language = self.bot.config.get('Localization', 'language', fallback='en')
+            except Exception:
+                language = 'en'
+        return str(language).strip().replace('_', '-').lower() or 'en'
+
+    def _uses_miles(self) -> bool:
+        """Check whether distances should be rendered in miles.
+
+        Returns:
+            bool: True when ``distance_unit`` is 'mi', or when it is 'auto' and
+            the reply language is US English.
+        """
+        if self.distance_unit != 'auto':
+            return self.distance_unit == 'mi'
+        return self._response_language() in self.MILES_LANGUAGES
+
+    def _format_distance(self, distance_km: float) -> str:
+        """Format a distance for display in the reply's units.
+
+        Only display is converted; proximity scoring stays in kilometres so the
+        repeater-selection thresholds keep their meaning.
+
+        Args:
+            distance_km: Distance in kilometres.
+
+        Returns:
+            str: Distance with its unit suffix, e.g. ``'12.4km'`` or ``'7.7mi'``.
+        """
+        if self._uses_miles():
+            return f"{distance_km * self.KM_TO_MILES:.1f}mi"
+        return f"{distance_km:.1f}km"
+
     def _calculate_path_distance(self, message: MeshMessage) -> str:
         """Calculate total distance along path (sum of distances between consecutive repeaters with locations).
 
@@ -597,10 +677,11 @@ class TestCommand(BaseCommand):
             return ""  # No valid segments found
 
         # Format the result compactly
+        distance_str = self._format_distance(total_distance)
         if skipped_nodes > 0:
-            return f"{total_distance:.1f}km ({valid_segments} segs, {skipped_nodes} no-loc)"
+            return f"{distance_str} ({valid_segments} segs, {skipped_nodes} no-loc)"
         else:
-            return f"{total_distance:.1f}km ({valid_segments} segs)"
+            return f"{distance_str} ({valid_segments} segs)"
 
     def _calculate_firstlast_distance(self, message: MeshMessage) -> str:
         """Calculate straight-line distance between first and last repeater in path.
@@ -642,80 +723,52 @@ class TestCommand(BaseCommand):
             last_location[0], last_location[1]
         )
 
-        return f"{distance:.1f}km"
+        return self._format_distance(distance)
 
-    def format_response(self, message: MeshMessage, response_format: str) -> str:
+    def format_response(self, message: MeshMessage, response_format: str,
+                        extra: Optional[dict[str, Any]] = None) -> str:
         """Override to handle phrase extraction.
 
         Args:
             message: The original message.
             response_format: The format string.
+            extra: Additional placeholders merged over this command's own fields.
 
         Returns:
             str: Formatted response string.
         """
-        # Clean content to remove control characters and normalize whitespace
         content = self.clean_content(message.content)
-
-        # Strip exclamation mark if present (for command-style messages)
-        if content.startswith('!'):
-            content = content[1:].strip()
-
-        # Extract phrase if present, otherwise use empty string
-        if content.lower() == "test" or content.lower() == "t":
-            phrase = ""
-        elif content.startswith('test ') or content.startswith('Test '):
-            phrase = content[5:].strip()  # Get everything after "test "
-        elif content.startswith('t ') or content.startswith('T '):
-            phrase = content[2:].strip()  # Get everything after "t "
-        else:
-            phrase = ""
+        trigger, args = self.split_trigger_and_args(content)
+        # Phrase is whatever follows the matched stem (test, t, or a config alias),
+        # so an alias carries a phrase the same way the built-in stems do.
+        phrase = args if trigger is not None else ""
 
         try:
-            connection_info = self.build_enhanced_connection_info(message)
-            timestamp = self.format_timestamp(message)
-            elapsed = self.format_elapsed(message)
-            path_display = self.get_path_display_string(message)
-            # Hops: from message.hops, or routing_info.path_length, or len(path_nodes)
-            routing_info = getattr(message, 'routing_info', None)
-            if getattr(message, 'hops', None) is not None:
-                hops_val = message.hops
-            elif routing_info is not None:
-                hops_val = routing_info.get('path_length')
-                if hops_val is None and routing_info.get('path_nodes'):
-                    hops_val = len(routing_info['path_nodes'])
-            else:
-                hops_val = None
-            hops_str = str(hops_val) if hops_val is not None else "?"
-            if hops_val is None:
-                hops_label = "?"
-            elif hops_val == 1:
-                hops_label = "1 hop"
-            else:
-                hops_label = f"{hops_val} hops"
-            path_distance = self._calculate_path_distance(message)
-            firstlast_distance = self._calculate_firstlast_distance(message)
+            fields = self.get_standard_placeholder_fields(message)
             phrase_part = f": {phrase}" if phrase else ""
-            fields = {
+            fields.update({
                 'sender': message.sender_id or self.translate('common.unknown_sender'),
                 'phrase': phrase,
                 'phrase_part': phrase_part,
-                'connection_info': connection_info,
-                'path': path_display,
-                'hops': hops_str,
-                'hops_label': hops_label,
-                'timestamp': timestamp,
-                'elapsed': elapsed,
+                'elapsed': self.format_elapsed(message),
                 'snr': str(message.snr) if message.snr is not None else self.translate('common.unknown'),
                 'rssi': str(message.rssi) if message.rssi is not None else self.translate('common.unknown'),
-                'path_distance': path_distance or '',
-                'firstlast_distance': firstlast_distance or '',
-            }
+                'path_distance': self._calculate_path_distance(message) or '',
+                'firstlast_distance': self._calculate_firstlast_distance(message) or '',
+            })
+            # A database lookup per hop, so only when the template asks for it.
+            fields['path_names'] = (
+                format_path_names(self.bot, message)
+                if template_uses_path_names(response_format) else ''
+            )
+            if extra:
+                fields.update(extra)
             return format_piped_template(
                 response_format,
                 fields,
                 message=message,
                 logger=self.logger,
+                config=self.bot.config,
                 prefix_hex_chars=getattr(self.bot, 'prefix_hex_chars', 2),
             )
         except (KeyError, ValueError) as e:

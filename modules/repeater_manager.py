@@ -5,6 +5,7 @@ Manages a database of repeater contacts and provides purging functionality
 """
 
 import asyncio
+import contextlib
 import json
 import time
 from collections.abc import MutableMapping
@@ -108,6 +109,24 @@ def validate_repeater_tables(db_manager: Any, logger: Any) -> None:
 class RepeaterManager:
     """Manages repeater contacts database and purging operations"""
 
+    # A contact the device keeps refusing is dropped from future sweeps after this many
+    # consecutive failures, so one unremovable contact cannot generate warnings forever.
+    MAX_STALE_REMOVAL_ATTEMPTS = 3
+
+    # MeshCore firmware seeds an unset clock with a hardcoded time, so a device that
+    # has never been synced advertises one of these rather than a real observation:
+    #   1715770351 — 15 May 2024, VolatileRTCClock's base_time (helpers/ArduinoHelpers.h)
+    #   1772323200 — 1 Mar 2026, RTC_TIME_MIN used by the NRF52 and ESP32 RTC paths
+    # These are not staleness. Treating them as such made unsynced-but-active contacts
+    # look like the oldest entries in the list: they sorted to the top, consumed the
+    # whole per-sweep removal budget, and the bot kept trying to evict live nodes
+    # (see issue #176, where every affected contact reported exactly 722 days).
+    FIRMWARE_CLOCK_SEEDS = (1715770351, 1772323200)
+
+    # Nothing below the earliest seed can be a real observation either; a raw 0 for a
+    # contact that was never heard decodes to 1970.
+    FIRMWARE_CLOCK_FLOOR = 1715770351
+
     def __init__(self, bot):
         self.bot = bot
         self.logger = bot.logger
@@ -118,6 +137,11 @@ class RepeaterManager:
 
         # Initialize repeater-specific tables
         self._init_repeater_tables()
+
+        # Public keys the device has refused to remove, and how many times. A refusal
+        # leaves the contact in place, so without this the next sweep re-selects the
+        # same contacts and retries forever (see issue #176).
+        self._stale_removal_failures: dict[str, int] = {}
 
         # Initialize auto-purge monitoring
         self.contact_limit = 300  # MeshCore device limit (will be updated from device info)
@@ -135,6 +159,8 @@ class RepeaterManager:
 
         # Geocoding cache: packet_hash -> timestamp (to prevent duplicate geocoding within 1 minute)
         self.geocoding_cache = {}
+        # public_key -> [lock, holders]; serializes adverts per contact across the geocode await
+        self._advert_locks: dict[str, list] = {}
         self.geocoding_cache_window = 60  # 1 minute window
         # Prevent overlapping auto-purge runs and duplicate per-key purge attempts.
         self._auto_purge_lock = asyncio.Lock()
@@ -204,10 +230,42 @@ class RepeaterManager:
             self.logger.error(f"Failed to initialize repeater database: {e}")
             raise
 
+    def _is_duplicate_advert_packet(self, conn, public_key: str, packet_hash: Optional[str]) -> bool:
+        """True when this advert packet_hash was already recorded for this contact."""
+        if not packet_hash or packet_hash == "0000000000000000":
+            return False
+        return bool(self.db_manager.execute_query_on_connection(
+            conn,
+            'SELECT id FROM unique_advert_packets WHERE public_key = ? AND packet_hash = ?',
+            (public_key, packet_hash)
+        ))
+
+    @contextlib.asynccontextmanager
+    async def _advert_lock(self, public_key: str):
+        """Serialize adverts for one contact, so a burst cannot each geocode from the same stale row."""
+        entry = self._advert_locks.setdefault(public_key, [asyncio.Lock(), 0])
+        entry[1] += 1
+        try:
+            async with entry[0]:
+                yield
+        finally:
+            entry[1] -= 1
+            if entry[1] == 0:
+                del self._advert_locks[public_key]
+
     async def track_contact_advertisement(
         self, advert_data: dict, signal_info: Optional[dict] = None, packet_hash: Optional[str] = None
     ) -> TrackAdvertResult:
         """Track any contact advertisement in the complete tracking database."""
+        public_key = advert_data.get('public_key', '')
+        if not public_key:
+            return await self._track_contact_advertisement(advert_data, signal_info, packet_hash)
+        async with self._advert_lock(public_key):
+            return await self._track_contact_advertisement(advert_data, signal_info, packet_hash)
+
+    async def _track_contact_advertisement(
+        self, advert_data: dict, signal_info: Optional[dict], packet_hash: Optional[str]
+    ) -> TrackAdvertResult:
         try:
             # Extract basic information
             public_key = advert_data.get('public_key', '')
@@ -243,20 +301,44 @@ class RepeaterManager:
             out_path_len = advert_data.get('out_path_len', -1)
             out_bytes_per_hop = advert_data.get('out_bytes_per_hop')
 
+            # Decide on reverse geocoding before the write block and do it off the
+            # event loop: it is a blocking, rate-limited Nominatim call, and the
+            # write block below must stay free of awaits so concurrent adverts
+            # cannot interleave between its reads and writes.
+            with self.db_manager.connection() as conn:
+                if self._is_duplicate_advert_packet(conn, public_key, packet_hash):
+                    self.logger.debug(f"Skipping duplicate advert packet for {name}: {(packet_hash or '')[:8]}... (already processed)")
+                    return TrackAdvertResult(ok=True, duplicate_packet=True)
+                prior = self.db_manager.execute_query_on_connection(
+                    conn,
+                    'SELECT latitude, longitude, city, state, country FROM complete_contact_tracking WHERE public_key = ?',
+                    (public_key,)
+                )
+            self.logger.debug(f"🔍 Extracting location data for {name}...")
+            location_info = self._extract_location_data(advert_data, should_geocode=False)
+            self.logger.debug(f"📍 Location data extracted: {location_info}")
+            should_geocode, location_info = self._should_geocode_location(
+                location_info, prior[0] if prior else None, name, packet_hash
+            )
+            if should_geocode:
+                self.logger.debug(f"📍 Re-extracting location data with geocoding for {name}")
+                location_info = await asyncio.to_thread(
+                    self._extract_location_data, advert_data, True, packet_hash
+                )
+                self.logger.debug(f"📍 Location data with geocoding: {location_info}")
+
+                # Update geocoding cache if we have a valid packet_hash (skip invalid/default hashes)
+                if packet_hash and packet_hash != "0000000000000000" and location_info.get('latitude') and location_info.get('longitude'):
+                    self.geocoding_cache[packet_hash] = time.time()
+                    self.logger.debug(f"📍 Cached geocoding for packet_hash {packet_hash[:16]}...")
+
             # Wrap all DB operations in a single transaction for atomicity
             with self.db_manager.connection() as conn:
                 # Check if this packet_hash was already processed for this contact
                 # This prevents duplicate writes of the same advert packet
-                if packet_hash and packet_hash != "0000000000000000":
-                    existing_packet = self.db_manager.execute_query_on_connection(
-                        conn,
-                        'SELECT id FROM unique_advert_packets WHERE public_key = ? AND packet_hash = ?',
-                        (public_key, packet_hash)
-                    )
-                    if existing_packet:
-                        # This packet_hash was already processed - skip contact update
-                        self.logger.debug(f"Skipping duplicate advert packet for {name}: {packet_hash[:8]}... (already processed)")
-                        return TrackAdvertResult(ok=True, duplicate_packet=True)
+                if self._is_duplicate_advert_packet(conn, public_key, packet_hash):
+                    self.logger.debug(f"Skipping duplicate advert packet for {name}: {(packet_hash or '')[:8]}... (already processed)")
+                    return TrackAdvertResult(ok=True, duplicate_packet=True)
 
                 # Check if this contact is already in our complete tracking
                 existing = self.db_manager.execute_query_on_connection(
@@ -266,26 +348,6 @@ class RepeaterManager:
                 )
 
                 current_time = datetime.now()
-
-                # Extract location data first (without geocoding)
-                self.logger.debug(f"🔍 Extracting location data for {name}...")
-                location_info = self._extract_location_data(advert_data, should_geocode=False)
-                self.logger.debug(f"📍 Location data extracted: {location_info}")
-
-                # Check if we need to perform geocoding based on location changes
-                existing_data = existing[0] if existing else None
-                should_geocode, location_info = self._should_geocode_location(location_info, existing_data, name, packet_hash)
-
-                # Re-extract location data with geocoding if needed
-                if should_geocode:
-                    self.logger.debug(f"📍 Re-extracting location data with geocoding for {name}")
-                    location_info = self._extract_location_data(advert_data, should_geocode=True, packet_hash=packet_hash)
-                    self.logger.debug(f"📍 Location data with geocoding: {location_info}")
-
-                    # Update geocoding cache if we have a valid packet_hash (skip invalid/default hashes)
-                    if packet_hash and packet_hash != "0000000000000000" and location_info.get('latitude') and location_info.get('longitude'):
-                        self.geocoding_cache[packet_hash] = time.time()
-                        self.logger.debug(f"📍 Cached geocoding for packet_hash {packet_hash[:16]}...")
 
                 if existing:
                     # Update existing entry
@@ -980,6 +1042,17 @@ class RepeaterManager:
                     else:
                         last_seen_dt = datetime.now() - timedelta(days=30)  # Default to old
 
+                    # An unset device clock reports a firmware seed, which would rank
+                    # this repeater as the oldest thing on the mesh and purge it first
+                    # even if it is active. Staleness is unknown, so it is not grounds
+                    # for removal (see issue #176).
+                    if self._is_unset_device_clock(last_seen_dt):
+                        self.logger.debug(
+                            "Not offering %s for purging: device clock is not set",
+                            sanitize_name(name),
+                        )
+                        continue
+
                     device_repeaters.append({
                         'public_key': public_key,
                         'name': name,
@@ -1132,6 +1205,15 @@ class RepeaterManager:
                                 last_seen_dt = datetime.fromtimestamp(last_seen)
                             else:
                                 last_seen_dt = last_seen
+                            if self._is_unset_device_clock(last_seen_dt):
+                                # Unknown staleness, not extreme staleness. Leaving it
+                                # in would give this companion the most purgeable score
+                                # despite possibly being active (see issue #176).
+                                self.logger.debug(
+                                    "Not offering %s for purging: device clock is not set",
+                                    sanitize_name(name),
+                                )
+                                continue
                             days_inactive = (current_time - last_seen_dt).days
                         except:
                             days_inactive = 999  # Very old if we can't parse
@@ -1497,20 +1579,58 @@ class RepeaterManager:
 
         return None
 
+    def _recent_geocode_age(self, packet_hash: Optional[str]) -> Optional[float]:
+        """Seconds since *packet_hash* was geocoded, if within the cache window; else None."""
+        if not packet_hash or packet_hash == "0000000000000000":
+            return None
+        cached_at = self.geocoding_cache.get(packet_hash)
+        if cached_at is None:
+            return None
+        cache_age = time.time() - cached_at
+        return cache_age if cache_age < self.geocoding_cache_window else None
+
+    def _city_from_address(self, address: dict, latitude: float, longitude: float) -> Optional[str]:
+        """City name from a Nominatim address, county as a rural fallback, with neighborhood for large cities."""
+        # Get city name from various fields (in order of preference)
+        city = (address.get('city') or
+               address.get('town') or
+               address.get('village') or
+               address.get('hamlet') or
+               address.get('municipality') or
+               address.get('suburb'))
+
+        # If no city found, try county as fallback (for rural areas)
+        # Keep "County" in the name to disambiguate from cities with the same name
+        if not city:
+            county = address.get('county')
+            if county:
+                # Keep full county name to distinguish from cities (e.g., "Snohomish County" vs "Snohomish" city)
+                city = county  # Keep "County" suffix to avoid ambiguity
+                self.logger.debug(f"Using county '{county}' as location name for coordinates {latitude}, {longitude}")
+
+        if not city:
+            return None
+        # For large cities, try to get neighborhood information
+        neighborhood = self._get_neighborhood_for_large_city(address, city)
+        return f"{neighborhood}, {city}" if neighborhood else city
+
+    @staticmethod
+    def _state_from_address(address: dict) -> Optional[str]:
+        """State, province or region from a Nominatim address."""
+        return (address.get('state') or
+                address.get('province') or
+                address.get('region'))
+
     def _get_state_country_from_coordinates(self, latitude: float, longitude: float, packet_hash: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
         """Get state and country from coordinates using reverse geocoding"""
         # Check packet hash cache first to prevent duplicate API calls
-        if packet_hash and packet_hash != "0000000000000000":
-            current_time = time.time()
-            if packet_hash in self.geocoding_cache:
-                cache_age = current_time - self.geocoding_cache[packet_hash]
-                if cache_age < self.geocoding_cache_window:
-                    # Check database for state/country data
-                    existing_data = self._get_existing_geocoded_data(latitude, longitude)
-                    if existing_data:
-                        return existing_data.get('state'), existing_data.get('country')
-                    # If no data in database, return None (don't make API call)
-                    return None, None
+        if self._recent_geocode_age(packet_hash) is not None:
+            # Check database for state/country data
+            existing_data = self._get_existing_geocoded_data(latitude, longitude)
+            if existing_data:
+                return existing_data.get('state'), existing_data.get('country')
+            # If no data in database, return None (don't make API call)
+            return None, None
 
         # Check database first to avoid duplicate API calls
         existing_data = self._get_existing_geocoded_data(latitude, longitude)
@@ -1525,10 +1645,7 @@ class RepeaterManager:
             if location:
                 address = location.raw.get('address', {})
 
-                # Get state/province
-                state = (address.get('state') or
-                        address.get('province') or
-                        address.get('region'))
+                state = self._state_from_address(address)
 
                 # Get country
                 country = address.get('country')
@@ -1543,17 +1660,13 @@ class RepeaterManager:
     def _get_city_from_coordinates(self, latitude: float, longitude: float, packet_hash: Optional[str] = None) -> Optional[str]:
         """Get city name from coordinates using reverse geocoding, with neighborhood for large cities"""
         # Check packet hash cache first to prevent duplicate API calls
-        if packet_hash and packet_hash != "0000000000000000":
-            current_time = time.time()
-            if packet_hash in self.geocoding_cache:
-                cache_age = current_time - self.geocoding_cache[packet_hash]
-                if cache_age < self.geocoding_cache_window:
-                    # Check database for city data
-                    existing_data = self._get_existing_geocoded_data(latitude, longitude)
-                    if existing_data and existing_data.get('city'):
-                        return existing_data.get('city')
-                    # If no city in database, return None (don't make API call)
-                    return None
+        if self._recent_geocode_age(packet_hash) is not None:
+            # Check database for city data
+            existing_data = self._get_existing_geocoded_data(latitude, longitude)
+            if existing_data and existing_data.get('city'):
+                return existing_data.get('city')
+            # If no city in database, return None (don't make API call)
+            return None
 
         # Check database first to avoid duplicate API calls
         existing_data = self._get_existing_geocoded_data(latitude, longitude)
@@ -1567,31 +1680,9 @@ class RepeaterManager:
             )
             if location:
                 address = location.raw.get('address', {})
-
-                # Get city name from various fields (in order of preference)
-                city = (address.get('city') or
-                       address.get('town') or
-                       address.get('village') or
-                       address.get('hamlet') or
-                       address.get('municipality') or
-                       address.get('suburb'))
-
-                # If no city found, try county as fallback (for rural areas)
-                # Keep "County" in the name to disambiguate from cities with the same name
-                if not city:
-                    county = address.get('county')
-                    if county:
-                        # Keep full county name to distinguish from cities (e.g., "Snohomish County" vs "Snohomish" city)
-                        city = county  # Keep "County" suffix to avoid ambiguity
-                        self.logger.debug(f"Using county '{county}' as location name for coordinates {latitude}, {longitude}")
-
+                city = self._city_from_address(address, latitude, longitude)
                 if city:
-                    # For large cities, try to get neighborhood information
-                    neighborhood = self._get_neighborhood_for_large_city(address, city)
-                    if neighborhood:
-                        return f"{neighborhood}, {city}"
-                    else:
-                        return city
+                    return city
 
             return None
 
@@ -1619,18 +1710,15 @@ class RepeaterManager:
                 return location_info
 
             # Check packet hash cache first (before database check)
-            if packet_hash and packet_hash != "0000000000000000":
-                current_time = time.time()
-                if packet_hash in self.geocoding_cache:
-                    cache_age = current_time - self.geocoding_cache[packet_hash]
-                    if cache_age < self.geocoding_cache_window:
-                        self.logger.debug(f"📍 Skipping geocoding API call for packet_hash {packet_hash[:16]}... (geocoded {cache_age:.1f}s ago)")
-                        # Still check database for location data
-                        existing_data = self._get_existing_geocoded_data(latitude, longitude)
-                        if existing_data:
-                            return existing_data
-                        # If no database data, return empty (don't make API call)
-                        return location_info
+            cache_age = self._recent_geocode_age(packet_hash)
+            if cache_age is not None:
+                self.logger.debug(f"📍 Skipping geocoding API call for packet_hash {(packet_hash or '')[:16]}... (geocoded {cache_age:.1f}s ago)")
+                # Still check database for location data
+                existing_data = self._get_existing_geocoded_data(latitude, longitude)
+                if existing_data:
+                    return existing_data
+                # If no database data, return empty (don't make API call)
+                return location_info
 
             # Check database first for existing geocoded data
             existing_data = self._get_existing_geocoded_data(latitude, longitude)
@@ -1655,36 +1743,13 @@ class RepeaterManager:
                 address = location.raw.get('address', {})
                 self.logger.debug(f"Geocoding API returned address data: {list(address.keys())}")
 
-                # Get city name from various fields (in order of preference)
-                city = (address.get('city') or
-                       address.get('town') or
-                       address.get('village') or
-                       address.get('hamlet') or
-                       address.get('municipality') or
-                       address.get('suburb'))
-
-                # If no city found, try county as fallback (for rural areas)
-                # Keep "County" in the name to disambiguate from cities with the same name
-                if not city:
-                    county = address.get('county')
-                    if county:
-                        # Keep full county name to distinguish from cities (e.g., "Snohomish County" vs "Snohomish" city)
-                        city = county  # Keep "County" suffix to avoid ambiguity
-                        self.logger.debug(f"Using county '{county}' as location name for coordinates {latitude}, {longitude}")
-
+                city = self._city_from_address(address, latitude, longitude)
                 if city:
-                    # For large cities, try to get neighborhood information
-                    neighborhood = self._get_neighborhood_for_large_city(address, city)
-                    if neighborhood:
-                        location_info['city'] = f"{neighborhood}, {city}"
-                    else:
-                        location_info['city'] = city
+                    location_info['city'] = city
                     self.logger.debug(f"Extracted city: {location_info['city']}")
 
                 # Get state/province information (don't use county here since we may have used it for city)
-                state = (address.get('state') or
-                        address.get('province') or
-                        address.get('region'))
+                state = self._state_from_address(address)
                 if state:
                     location_info['state'] = state
                     self.logger.debug(f"Extracted state: {state}")
@@ -2026,9 +2091,11 @@ class RepeaterManager:
                     should_geocode, location_info = self._should_geocode_location(location_info, existing_data, name)
 
                     if should_geocode:
-                        city_from_coords = self._get_city_from_coordinates(
+                        # Nominatim is a blocking, rate-limited HTTP call; keep it off the loop.
+                        city_from_coords = await asyncio.to_thread(
+                            self._get_city_from_coordinates,
                             location_info['latitude'],
-                            location_info['longitude']
+                            location_info['longitude'],
                         )
                         if city_from_coords:
                             location_info['city'] = city_from_coords
@@ -2121,49 +2188,6 @@ class RepeaterManager:
         except Exception as e:
             self.logger.error(f"Error retrieving repeater contacts: {e}")
             return []
-
-    async def test_meshcore_cli_commands(self) -> dict[str, Any]:
-        """Test if meshcore-cli commands are working properly"""
-        results: dict[str, Any] = {}
-
-        try:
-            from meshcore_cli.meshcore_cli import next_cmd
-
-            # Test a simple command that should always work
-            try:
-                result = await asyncio.wait_for(
-                    next_cmd(self.bot.meshcore, ["help"]),
-                    timeout=10.0
-                )
-                results['help'] = result is not None
-                self.logger.info(f"meshcore-cli help command test: {'PASS' if results['help'] else 'FAIL'}")
-            except Exception as e:
-                results['help'] = False
-                self.logger.warning(f"meshcore-cli help command test FAILED: {e}")
-
-            # Test remove_contact command (we'll use a dummy key)
-            try:
-                result = await asyncio.wait_for(
-                    next_cmd(self.bot.meshcore, ["remove_contact", "dummy_key"]),
-                    timeout=10.0
-                )
-                # Even if it fails, if we get here without "Unknown command" error, the command exists
-                results['remove_contact'] = True
-                self.logger.info("meshcore-cli remove_contact command test: PASS")
-            except Exception as e:
-                if "Unknown command" in str(e):
-                    results['remove_contact'] = False
-                    self.logger.error(f"meshcore-cli remove_contact command test FAILED: {e}")
-                else:
-                    # Command exists but failed for other reasons (expected with dummy key)
-                    results['remove_contact'] = True
-                    self.logger.info("meshcore-cli remove_contact command test: PASS (command exists)")
-
-        except Exception as e:
-            self.logger.error(f"Error testing meshcore-cli commands: {e}")
-            results['error'] = str(e)
-
-        return results
 
     async def purge_repeater_from_contacts(self, public_key: str, reason: str = "Manual purge") -> bool:
         """Remove a specific repeater from the device's contact list using proper MeshCore API"""
@@ -2499,6 +2523,15 @@ class RepeaterManager:
                                     # Assume it's already a datetime object
                                     last_advert_dt = last_advert
 
+                                # An unset device clock is not evidence of age, and
+                                # purging on it would evict active repeaters (#176).
+                                if self._is_unset_device_clock(last_advert_dt):
+                                    self.logger.debug(
+                                        f"Skipping {name}: device clock is not set "
+                                        f"(last_advert: {last_advert})"
+                                    )
+                                    break
+
                                 # Check if it's older than cutoff
                                 if last_advert_dt < cutoff_date:
                                     old_repeaters.append({
@@ -2548,7 +2581,7 @@ class RepeaterManager:
 
             # Process repeaters with delays to avoid overwhelming LoRa network
             self.logger.info(f"Starting batch purge of {len(old_repeaters)} old repeaters...")
-            start_time = asyncio.get_event_loop().time()
+            start_time = asyncio.get_running_loop().time()
 
             for i, repeater in enumerate(old_repeaters):
                 public_key = repeater['public_key']
@@ -2571,7 +2604,7 @@ class RepeaterManager:
                     self.logger.debug("Waiting 2 seconds before next removal...")
                     await asyncio.sleep(2)  # 2 second delay between removals
 
-            end_time = asyncio.get_event_loop().time()
+            end_time = asyncio.get_running_loop().time()
             total_duration = end_time - start_time
             self.logger.info(f"Batch purge completed in {total_duration:.2f} seconds")
 
@@ -2683,6 +2716,21 @@ class RepeaterManager:
             self.logger.error(f"Error getting contact list status: {e}")
             return {}
 
+    @classmethod
+    def _is_unset_device_clock(cls, last_seen_dt: datetime) -> bool:
+        """True when a last_seen came from a device whose clock was never set.
+
+        Matches the firmware's hardcoded seeds exactly, plus anything at or below the
+        earliest of them (which also covers a raw 0 decoding to 1970). A device that
+        has been running unsynced for a while reports seed + uptime and is not
+        detectable this way; those still look stale, but they are at least removable.
+        """
+        if last_seen_dt <= datetime.fromtimestamp(cls.FIRMWARE_CLOCK_FLOOR):
+            return True
+        return any(
+            last_seen_dt == datetime.fromtimestamp(seed) for seed in cls.FIRMWARE_CLOCK_SEEDS
+        )
+
     async def _get_stale_contacts(self, days_without_advert: int = 7) -> list[dict]:
         """Get contacts that haven't sent adverts in specified days"""
         try:
@@ -2712,12 +2760,32 @@ class RepeaterManager:
                             # Assume it's already a datetime object
                             last_seen_dt = last_seen
 
+                        now = datetime.now()
+
+                        # An unset device clock reports a firmware seed, which says
+                        # nothing about when the contact was last heard. A future
+                        # timestamp cannot be a past observation either.
+                        if self._is_unset_device_clock(last_seen_dt) or last_seen_dt > now:
+                            self.logger.debug(
+                                "Ignoring unset/implausible last_seen %r for contact %s "
+                                "(device clock not set)",
+                                last_seen,
+                                sanitize_name(contact_data.get('name', 'Unknown')),
+                            )
+                            continue
+
                         if last_seen_dt < cutoff_date:
+                            public_key = contact_data.get('public_key', '')
+                            attempts = self._stale_removal_failures.get(public_key, 0)
+                            if public_key and attempts >= self.MAX_STALE_REMOVAL_ATTEMPTS:
+                                # Already given up on this one; excluded so it does not
+                                # keep occupying the removal budget or the warning log.
+                                continue
                             stale_contacts.append({
                                 'name': contact_data.get('name', contact_data.get('adv_name', 'Unknown')),
-                                'public_key': contact_data.get('public_key', ''),
+                                'public_key': public_key,
                                 'last_seen': last_seen,
-                                'days_stale': (datetime.now() - last_seen_dt).days
+                                'days_stale': (now - last_seen_dt).days
                             })
                     except Exception as e:
                         self.logger.debug(f"Error parsing timestamp for contact {sanitize_name(contact_data.get('name', 'Unknown'))}: {e}")
@@ -2785,6 +2853,7 @@ class RepeaterManager:
         """Remove stale contacts to free up space"""
         try:
             removed_count = 0
+            given_up = 0
 
             for contact in stale_contacts[:max_remove]:
                 try:
@@ -2806,6 +2875,7 @@ class RepeaterManager:
 
                     if result.type == EventType.OK:
                         removed_count += 1
+                        self._stale_removal_failures.pop(public_key, None)
                         self.logger.info(f"✅ Successfully removed stale contact: {contact_name}")
 
                         # Log the removal
@@ -2815,14 +2885,51 @@ class RepeaterManager:
                         )
                     else:
                         error_code = result.payload.get('error_code', 'unknown') if hasattr(result, 'payload') else 'unknown'
-                        self.logger.warning(f"❌ Failed to remove stale contact: {contact_name} - Error: {result.type}, Code: {error_code}")
+                        # A refusal leaves the contact on the device, so the next sweep
+                        # would pick it up again. Count the attempt and stop after a few.
+                        attempts = self._stale_removal_failures.get(public_key, 0) + 1
+                        self._stale_removal_failures[public_key] = attempts
+
+                        if attempts >= self.MAX_STALE_REMOVAL_ATTEMPTS:
+                            given_up += 1
+                            self.logger.warning(
+                                f"❌ Giving up on stale contact: {contact_name} - the device "
+                                f"refused removal {attempts} times (last error: {result.type}, "
+                                f"Code: {error_code}). It will be skipped from now on."
+                            )
+                        else:
+                            self.logger.warning(
+                                f"❌ Failed to remove stale contact: {contact_name} - "
+                                f"Error: {result.type}, Code: {error_code} "
+                                f"(attempt {attempts}/{self.MAX_STALE_REMOVAL_ATTEMPTS})"
+                            )
 
                     # Small delay between removals
                     await asyncio.sleep(1)
 
                 except Exception as e:
-                    self.logger.error(f"Error removing stale contact {sanitize_name(contact.get('name', 'Unknown'))}: {e}")
+                    # Timeouts and command exceptions are failures too. Without counting
+                    # them the contact stays eligible forever and the retry storm this
+                    # guard exists to stop can come back through the exception path.
+                    public_key = contact.get('public_key', '')
+                    if public_key:
+                        attempts = self._stale_removal_failures.get(public_key, 0) + 1
+                        self._stale_removal_failures[public_key] = attempts
+                        if attempts >= self.MAX_STALE_REMOVAL_ATTEMPTS:
+                            given_up += 1
+                    self.logger.error(
+                        f"Error removing stale contact "
+                        f"{sanitize_name(contact.get('name', 'Unknown'))}: {e}"
+                    )
                     continue
+
+            if given_up:
+                self.logger.warning(
+                    "%d stale contact(s) could not be removed by the device and are now "
+                    "excluded from cleanup. The contact list may stay near its limit; "
+                    "remove them from the companion app if space is needed.",
+                    given_up,
+                )
 
             return removed_count
 
@@ -3050,153 +3157,6 @@ class RepeaterManager:
             if spacing > 0:
                 await asyncio.sleep(spacing)
 
-    async def add_discovered_contact(self, contact_name: str, public_key: Optional[str] = None, reason: str = "Manual addition") -> bool:
-        """Add a discovered contact to the contact list using multiple methods"""
-        try:
-            self.logger.info(f"Adding discovered contact: {contact_name}")
-
-            # Track whether contact addition was successful
-            contact_addition_successful = False
-
-            # Method 1: Try using meshcore commands if available
-            if hasattr(self.bot.meshcore, 'commands'):
-                try:
-                    self.logger.info("Method 1: Attempting addition via meshcore commands...")
-                    # Check if there's an add_contact method
-                    if hasattr(self.bot.meshcore.commands, 'add_contact'):
-                        # Try different parameter combinations
-                        try:
-                            # Try with contact_name and public_key
-                            result = await self.bot.meshcore.commands.add_contact(contact_name, public_key)
-                            if result:
-                                self.logger.info(f"Successfully added contact '{contact_name}' via meshcore commands (name+key)")
-                                contact_addition_successful = True
-                        except Exception as e1:
-                            self.logger.debug(f"add_contact(name, key) failed: {e1}")
-                            try:
-                                # Try with just contact_name
-                                result = await self.bot.meshcore.commands.add_contact(contact_name)
-                                if result:
-                                    self.logger.info(f"Successfully added contact '{contact_name}' via meshcore commands (name only)")
-                                    contact_addition_successful = True
-                            except Exception as e2:
-                                self.logger.debug(f"add_contact(name) failed: {e2}")
-                                self.logger.warning("All meshcore commands add_contact attempts failed")
-                    else:
-                        self.logger.info("No add_contact method found in meshcore commands")
-                except Exception as e:
-                    self.logger.warning(f"Meshcore commands addition failed: {e}")
-
-            # Method 2: Try CLI as fallback
-            if not contact_addition_successful:
-                try:
-                    self.logger.info("Method 2: Attempting addition via CLI...")
-                    import io
-                    import sys
-
-                    from meshcore_cli.meshcore_cli import next_cmd
-
-                    # Capture stdout/stderr to catch any error messages
-                    old_stdout = sys.stdout
-                    old_stderr = sys.stderr
-                    captured_output = io.StringIO()
-                    captured_errors = io.StringIO()
-
-                    try:
-                        sys.stdout = captured_output
-                        sys.stderr = captured_errors
-
-                        result = await asyncio.wait_for(
-                            next_cmd(self.bot.meshcore, ["add_contact", contact_name, public_key] if public_key else ["add_contact", contact_name]),
-                            timeout=15.0
-                        )
-                    finally:
-                        sys.stdout = old_stdout
-                        sys.stderr = old_stderr
-
-                    # Get captured output
-                    stdout_content = captured_output.getvalue()
-                    stderr_content = captured_errors.getvalue()
-                    all_output = stdout_content + stderr_content
-
-                    self.logger.debug(f"CLI command result: {result}")
-                    self.logger.debug(f"CLI captured output: {all_output}")
-
-                    if result is not None:
-                        self.logger.info(f"CLI: Successfully added contact '{contact_name}' from device")
-                        contact_addition_successful = True
-                    else:
-                        self.logger.warning(f"CLI: Contact addition command returned no result for '{contact_name}'")
-
-                except Exception as e:
-                    self.logger.warning(f"CLI addition failed: {e}")
-
-            # Method 3: Try discovery approach as last resort
-            if not contact_addition_successful:
-                try:
-                    self.logger.info("Method 3: Attempting addition via discovery...")
-                    from meshcore_cli.meshcore_cli import next_cmd
-
-                    result = await asyncio.wait_for(
-                        next_cmd(self.bot.meshcore, ["discover_companion_contacts"]),
-                        timeout=30.0
-                    )
-
-                    if result is not None:
-                        self.logger.info("Contact discovery initiated")
-                        contact_addition_successful = True
-                    else:
-                        self.logger.warning("Contact discovery failed")
-
-                except Exception as e:
-                    self.logger.warning(f"Discovery addition failed: {e}")
-
-            # Log the addition if successful
-            if contact_addition_successful:
-                self.log_purging_action(
-                    "contact_addition",
-                    f"Added discovered contact: {contact_name} - {reason}",
-                )
-                self.logger.info(f"Successfully added contact '{contact_name}': {reason}")
-                return True
-            else:
-                self.logger.error(f"Failed to add contact '{contact_name}' - all methods failed")
-                return False
-
-        except Exception as e:
-            self.logger.error(f"Error adding discovered contact: {e}")
-            return False
-
-    async def toggle_auto_add(self, enabled: bool, reason: str = "Manual toggle") -> bool:
-        """Toggle the manual contact addition setting on the device"""
-        try:
-            from meshcore_cli.meshcore_cli import next_cmd
-
-            self.logger.info(f"{'Enabling' if enabled else 'Disabling'} manual contact addition on device...")
-
-            result = await asyncio.wait_for(
-                next_cmd(self.bot.meshcore, ["set_manual_add_contacts", "true" if enabled else "false"]),
-                timeout=15.0
-            )
-
-            self.logger.info(f"Successfully {'enabled' if enabled else 'disabled'} manual contact addition")
-            self.logger.debug(f"Manual contact addition toggle result: {result}")
-
-            # Log the action
-            self.log_purging_action(
-                "manual_add_toggle",
-                f'{"Enabled" if enabled else "Disabled"} manual contact addition - {reason}',
-            )
-
-            return True
-
-        except asyncio.TimeoutError:
-            self.logger.warning("Timeout toggling manual contact addition (LoRa communication)")
-            return False
-        except Exception as e:
-            self.logger.error(f"Failed to toggle manual contact addition: {e}")
-            return False
-
     async def discover_companion_contacts(self, reason: str = "Manual discovery") -> bool:
         """Manually discover companion contacts"""
         try:
@@ -3226,70 +3186,6 @@ class RepeaterManager:
         except Exception as e:
             self.logger.error(f"Failed to discover companion contacts: {e}")
             return False
-
-    async def restore_repeater(self, public_key: str, reason: str = "Manual restore") -> bool:
-        """Restore a previously purged repeater"""
-        try:
-            # Get repeater info before updating
-            result = self.db_manager.execute_query('''
-                SELECT name, contact_data FROM repeater_contacts WHERE public_key = ?
-            ''', (public_key,))
-
-            if not result:
-                self.logger.warning(f"No repeater found with public key {public_key}")
-                return False
-
-            name = result[0]['name']
-
-            # Mark as active again
-            self.db_manager.execute_update(
-                'UPDATE repeater_contacts SET is_active = 1 WHERE public_key = ?',
-                (public_key,)
-            )
-
-            # Log the restore action
-            self.db_manager.execute_update('''
-                INSERT INTO purging_log (action, public_key, name, reason)
-                VALUES ('restored', ?, ?, ?)
-            ''', (public_key, name, reason))
-
-            # Note: Restoring a contact to the device would require re-adding it
-            # This is complex as it requires the contact's URI or public key
-            # For now, we just mark it as active in our database
-            # The contact would need to be re-discovered through normal mesh operations
-
-            self.logger.info(f"Restored repeater {name} ({public_key}) - contact will need to be re-discovered")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Error restoring repeater {public_key}: {e}")
-            return False
-
-    async def get_purging_stats(self) -> dict:
-        """Get statistics about repeater purging operations"""
-        try:
-            # Get total counts
-            total_repeaters = self.db_manager.execute_query('SELECT COUNT(*) as count FROM repeater_contacts')[0]['count']
-            active_repeaters = self.db_manager.execute_query('SELECT COUNT(*) as count FROM repeater_contacts WHERE is_active = 1')[0]['count']
-            purged_repeaters = self.db_manager.execute_query('SELECT COUNT(*) as count FROM repeater_contacts WHERE is_active = 0')[0]['count']
-
-            # Get recent purging activity
-            recent_activity = self.db_manager.execute_query('''
-                SELECT action, COUNT(*) as count FROM purging_log
-                WHERE timestamp > datetime('now', '-7 days')
-                GROUP BY action
-            ''')
-
-            return {
-                'total_repeaters': total_repeaters,
-                'active_repeaters': active_repeaters,
-                'purged_repeaters': purged_repeaters,
-                'recent_activity_7_days': {row['action']: row['count'] for row in recent_activity}
-            }
-
-        except Exception as e:
-            self.logger.error(f"Error getting purging stats: {e}")
-            return {}
 
     async def cleanup_database(self, days_to_keep_logs: int = 90):
         """Clean up old purging log entries"""
@@ -3435,7 +3331,9 @@ class RepeaterManager:
 
                 try:
                     # Get full location information from coordinates
-                    location_info = self._get_full_location_from_coordinates(latitude, longitude, packet_hash=None)
+                    location_info = await asyncio.to_thread(
+                        self._get_full_location_from_coordinates, latitude, longitude, None
+                    )
 
                     # Debug logging to see what we got
                     self.logger.debug(f"Geocoding result for {name}: city='{location_info['city']}', state='{location_info['state']}', country='{location_info['country']}'")
@@ -3608,11 +3506,9 @@ class RepeaterManager:
 
             # Attempt geocoding
             try:
-                # Get city from coordinates
-                city = self._get_city_from_coordinates(lat, lon)
-
-                # Get state and country from coordinates
-                state, country = self._get_state_country_from_coordinates(lat, lon)
+                # Blocking, rate-limited Nominatim calls; keep them off the loop.
+                city = await asyncio.to_thread(self._get_city_from_coordinates, lat, lon)
+                state, country = await asyncio.to_thread(self._get_state_country_from_coordinates, lat, lon)
 
                 # Update the contact with geocoded data
                 updates = []
@@ -3803,6 +3699,260 @@ class RepeaterManager:
                 'error': str(e)
             }
 
+    async def test_meshcore_cli_commands(self) -> dict[str, Any]:
+        """Test if meshcore-cli commands are working properly"""
+        results: dict[str, Any] = {}
+
+        try:
+            from meshcore_cli.meshcore_cli import next_cmd
+
+            # Test a simple command that should always work
+            try:
+                result = await asyncio.wait_for(
+                    next_cmd(self.bot.meshcore, ["help"]),
+                    timeout=10.0
+                )
+                results['help'] = result is not None
+                self.logger.info(f"meshcore-cli help command test: {'PASS' if results['help'] else 'FAIL'}")
+            except Exception as e:
+                results['help'] = False
+                self.logger.warning(f"meshcore-cli help command test FAILED: {e}")
+
+            # Test remove_contact command (we'll use a dummy key)
+            try:
+                result = await asyncio.wait_for(
+                    next_cmd(self.bot.meshcore, ["remove_contact", "dummy_key"]),
+                    timeout=10.0
+                )
+                # Even if it fails, if we get here without "Unknown command" error, the command exists
+                results['remove_contact'] = True
+                self.logger.info("meshcore-cli remove_contact command test: PASS")
+            except Exception as e:
+                if "Unknown command" in str(e):
+                    results['remove_contact'] = False
+                    self.logger.error(f"meshcore-cli remove_contact command test FAILED: {e}")
+                else:
+                    # Command exists but failed for other reasons (expected with dummy key)
+                    results['remove_contact'] = True
+                    self.logger.info("meshcore-cli remove_contact command test: PASS (command exists)")
+
+        except Exception as e:
+            self.logger.error(f"Error testing meshcore-cli commands: {e}")
+            results['error'] = str(e)
+
+        return results
+
+    async def add_discovered_contact(self, contact_name: str, public_key: Optional[str] = None, reason: str = "Manual addition") -> bool:
+        """Add a discovered contact to the contact list using multiple methods"""
+        try:
+            self.logger.info(f"Adding discovered contact: {contact_name}")
+
+            # Track whether contact addition was successful
+            contact_addition_successful = False
+
+            # Method 1: Try using meshcore commands if available
+            if hasattr(self.bot.meshcore, 'commands'):
+                try:
+                    self.logger.info("Method 1: Attempting addition via meshcore commands...")
+                    # Check if there's an add_contact method
+                    if hasattr(self.bot.meshcore.commands, 'add_contact'):
+                        # Try different parameter combinations
+                        try:
+                            # Try with contact_name and public_key
+                            result = await self.bot.meshcore.commands.add_contact(contact_name, public_key)
+                            if result:
+                                self.logger.info(f"Successfully added contact '{contact_name}' via meshcore commands (name+key)")
+                                contact_addition_successful = True
+                        except Exception as e1:
+                            self.logger.debug(f"add_contact(name, key) failed: {e1}")
+                            try:
+                                # Try with just contact_name
+                                result = await self.bot.meshcore.commands.add_contact(contact_name)
+                                if result:
+                                    self.logger.info(f"Successfully added contact '{contact_name}' via meshcore commands (name only)")
+                                    contact_addition_successful = True
+                            except Exception as e2:
+                                self.logger.debug(f"add_contact(name) failed: {e2}")
+                                self.logger.warning("All meshcore commands add_contact attempts failed")
+                    else:
+                        self.logger.info("No add_contact method found in meshcore commands")
+                except Exception as e:
+                    self.logger.warning(f"Meshcore commands addition failed: {e}")
+
+            # Method 2: Try CLI as fallback
+            if not contact_addition_successful:
+                try:
+                    self.logger.info("Method 2: Attempting addition via CLI...")
+                    import io
+                    import sys
+
+                    from meshcore_cli.meshcore_cli import next_cmd
+
+                    # Capture stdout/stderr to catch any error messages
+                    old_stdout = sys.stdout
+                    old_stderr = sys.stderr
+                    captured_output = io.StringIO()
+                    captured_errors = io.StringIO()
+
+                    try:
+                        sys.stdout = captured_output
+                        sys.stderr = captured_errors
+
+                        result = await asyncio.wait_for(
+                            next_cmd(self.bot.meshcore, ["add_contact", contact_name, public_key] if public_key else ["add_contact", contact_name]),
+                            timeout=15.0
+                        )
+                    finally:
+                        sys.stdout = old_stdout
+                        sys.stderr = old_stderr
+
+                    # Get captured output
+                    stdout_content = captured_output.getvalue()
+                    stderr_content = captured_errors.getvalue()
+                    all_output = stdout_content + stderr_content
+
+                    self.logger.debug(f"CLI command result: {result}")
+                    self.logger.debug(f"CLI captured output: {all_output}")
+
+                    if result is not None:
+                        self.logger.info(f"CLI: Successfully added contact '{contact_name}' from device")
+                        contact_addition_successful = True
+                    else:
+                        self.logger.warning(f"CLI: Contact addition command returned no result for '{contact_name}'")
+
+                except Exception as e:
+                    self.logger.warning(f"CLI addition failed: {e}")
+
+            # Method 3: Try discovery approach as last resort
+            if not contact_addition_successful:
+                try:
+                    self.logger.info("Method 3: Attempting addition via discovery...")
+                    from meshcore_cli.meshcore_cli import next_cmd
+
+                    result = await asyncio.wait_for(
+                        next_cmd(self.bot.meshcore, ["discover_companion_contacts"]),
+                        timeout=30.0
+                    )
+
+                    if result is not None:
+                        self.logger.info("Contact discovery initiated")
+                        contact_addition_successful = True
+                    else:
+                        self.logger.warning("Contact discovery failed")
+
+                except Exception as e:
+                    self.logger.warning(f"Discovery addition failed: {e}")
+
+            # Log the addition if successful
+            if contact_addition_successful:
+                self.log_purging_action(
+                    "contact_addition",
+                    f"Added discovered contact: {contact_name} - {reason}",
+                )
+                self.logger.info(f"Successfully added contact '{contact_name}': {reason}")
+                return True
+            else:
+                self.logger.error(f"Failed to add contact '{contact_name}' - all methods failed")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"Error adding discovered contact: {e}")
+            return False
+
+    async def toggle_auto_add(self, enabled: bool, reason: str = "Manual toggle") -> bool:
+        """Toggle the manual contact addition setting on the device"""
+        try:
+            from meshcore_cli.meshcore_cli import next_cmd
+
+            self.logger.info(f"{'Enabling' if enabled else 'Disabling'} manual contact addition on device...")
+
+            result = await asyncio.wait_for(
+                next_cmd(self.bot.meshcore, ["set_manual_add_contacts", "true" if enabled else "false"]),
+                timeout=15.0
+            )
+
+            self.logger.info(f"Successfully {'enabled' if enabled else 'disabled'} manual contact addition")
+            self.logger.debug(f"Manual contact addition toggle result: {result}")
+
+            # Log the action
+            self.log_purging_action(
+                "manual_add_toggle",
+                f'{"Enabled" if enabled else "Disabled"} manual contact addition - {reason}',
+            )
+
+            return True
+
+        except asyncio.TimeoutError:
+            self.logger.warning("Timeout toggling manual contact addition (LoRa communication)")
+            return False
+        except Exception as e:
+            self.logger.error(f"Failed to toggle manual contact addition: {e}")
+            return False
+
+    async def restore_repeater(self, public_key: str, reason: str = "Manual restore") -> bool:
+        """Restore a previously purged repeater"""
+        try:
+            # Get repeater info before updating
+            result = self.db_manager.execute_query('''
+                SELECT name, contact_data FROM repeater_contacts WHERE public_key = ?
+            ''', (public_key,))
+
+            if not result:
+                self.logger.warning(f"No repeater found with public key {public_key}")
+                return False
+
+            name = result[0]['name']
+
+            # Mark as active again
+            self.db_manager.execute_update(
+                'UPDATE repeater_contacts SET is_active = 1 WHERE public_key = ?',
+                (public_key,)
+            )
+
+            # Log the restore action
+            self.db_manager.execute_update('''
+                INSERT INTO purging_log (action, public_key, name, reason)
+                VALUES ('restored', ?, ?, ?)
+            ''', (public_key, name, reason))
+
+            # Note: Restoring a contact to the device would require re-adding it
+            # This is complex as it requires the contact's URI or public key
+            # For now, we just mark it as active in our database
+            # The contact would need to be re-discovered through normal mesh operations
+
+            self.logger.info(f"Restored repeater {name} ({public_key}) - contact will need to be re-discovered")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error restoring repeater {public_key}: {e}")
+            return False
+
+    async def get_purging_stats(self) -> dict:
+        """Get statistics about repeater purging operations"""
+        try:
+            # Get total counts
+            total_repeaters = self.db_manager.execute_query('SELECT COUNT(*) as count FROM repeater_contacts')[0]['count']
+            active_repeaters = self.db_manager.execute_query('SELECT COUNT(*) as count FROM repeater_contacts WHERE is_active = 1')[0]['count']
+            purged_repeaters = self.db_manager.execute_query('SELECT COUNT(*) as count FROM repeater_contacts WHERE is_active = 0')[0]['count']
+
+            # Get recent purging activity
+            recent_activity = self.db_manager.execute_query('''
+                SELECT action, COUNT(*) as count FROM purging_log
+                WHERE timestamp > datetime('now', '-7 days')
+                GROUP BY action
+            ''')
+
+            return {
+                'total_repeaters': total_repeaters,
+                'active_repeaters': active_repeaters,
+                'purged_repeaters': purged_repeaters,
+                'recent_activity_7_days': {row['action']: row['count'] for row in recent_activity}
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error getting purging stats: {e}")
+            return {}
+
     def get_daily_advertisement_stats(self, days: int = 30) -> dict:
         """Get daily advertisement statistics for the specified number of days"""
         try:
@@ -3891,3 +4041,4 @@ class RepeaterManager:
         except Exception as e:
             self.logger.error(f"Error getting nodes per day stats: {e}")
             return {'error': str(e)}
+

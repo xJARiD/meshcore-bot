@@ -18,6 +18,8 @@ class TraceCommand(BaseCommand):
     """Trace (manual path) and Tracer (reciprocal path) for link diagnostics."""
 
     name = "trace"
+    honors_skip_channel_check = False
+    enabled_attr = "trace_enabled"
     keywords = ["trace", "tracer"]
     description = "Run a trace along a path (trace=manual if path given, else round-trip; tracer=always round-trip)"
     requires_dm = False
@@ -59,6 +61,15 @@ class TraceCommand(BaseCommand):
         {"key": "update_graph_two_byte", "label": "Update graph (2-byte)", "type": "bool",
          "default": True,
          "help": "Add a 2-byte link identification to the mesh graph when supported."},
+        {"key": "timeout_base_seconds", "label": "Base timeout", "type": "float",
+         "min": 0.1, "default": 2.0, "unit": "s",
+         "help": "Per-attempt timeout before the per-hop allowance is added."},
+        {"key": "trace_retry_count", "label": "Attempts", "type": "int",
+         "min": 1, "default": 2,
+         "help": "Maximum trace attempts. A reply to an earlier attempt counts until the last one times out."},
+        {"key": "trace_retry_delay_seconds", "label": "Retry delay", "type": "float",
+         "min": 0, "default": 1.0, "unit": "s",
+         "help": "Wait before retrying a trace that got no reply."},
     ]
 
     def __init__(self, bot):
@@ -80,24 +91,13 @@ class TraceCommand(BaseCommand):
         output_fmt = (self.bot.config.get("Trace_Command", "output_format", fallback="inline") or "inline").strip().lower()
         self.output_format = output_fmt if output_fmt in ("inline", "vertical") else "inline"
 
-    def can_execute(self, message: MeshMessage, skip_channel_check: bool = False) -> bool:
-        if not self.trace_enabled:
-            return False
-        return super().can_execute(message)
-
-    def get_help_text(self) -> str:
+    def get_help_text(self, message: MeshMessage | None = None) -> str:
         return (
             "trace [path] — run trace along path (return may not be heard). No path = round-trip like tracer. "
             "tracer [path] — round-trip so bot hears return. Path: comma-separated hex nodes "
             "(2-char 1-byte e.g. 01,7a,55; 4-char 2-byte e.g. feed,6ddf,feed). "
             "No path = use your message path (round-trip)."
         )
-
-    def matches_keyword(self, message: MeshMessage) -> bool:
-        content_lower = self.cleanup_message_for_matching(message)
-        if content_lower == "trace" or content_lower == "tracer":
-            return True
-        return bool(content_lower.startswith("trace ") or content_lower.startswith("tracer "))
 
     def _extract_path_from_message(self, message: MeshMessage) -> list[str]:
         """Extract path node IDs from message.path (supports 1-byte, 2-byte, and 3-byte hashes)."""
@@ -133,21 +133,14 @@ class TraceCommand(BaseCommand):
         return valid
 
     def _parse_path_arg(self, content: str) -> Optional[list[str]]:
-        """Parse path from command content after 'trace ' or 'tracer '.
+        """Parse path from command content after the matched trigger keyword.
         Accepts comma-separated hex nodes where each segment is the same length:
           2-char = 1-byte (e.g. 01,7a,55), 4-char = 2-byte (e.g. feed,6ddf),
           6-char = 3-byte (e.g. feedca,6ddf01).
         Without commas, treats contiguous hex as 2-char (1-byte) nodes.
         Returns list of hex node IDs, or None if no path args / invalid.
         """
-        content = content.strip()
-        if content.startswith("!"):
-            content = content[1:].strip()
-        rest = ""
-        for kw in ["tracer ", "trace "]:
-            if content.lower().startswith(kw):
-                rest = content[len(kw) :].strip()
-                break
+        _trigger, rest = self.split_trigger_and_args(content)
         if not rest:
             return None
         # Comma-separated: each segment is one node; preserves multibyte groupings
@@ -224,11 +217,9 @@ class TraceCommand(BaseCommand):
         return "\n".join(lines)
 
     async def execute(self, message: MeshMessage) -> bool:
-        content = message.content.strip()
-        if content.startswith("!"):
-            content = content[1:].strip()
-
-        is_tracer = content.lower().startswith("tracer")
+        trigger, _args = self.split_trigger_and_args(message.content)
+        # Reciprocal round-trip only when the tracer stem is used (not aliases of trace)
+        is_tracer = trigger == "tracer"
         path_arg = self._parse_path_arg(message.content)
         if path_arg is not None:
             path_nodes = path_arg[: self.maximum_hops]
@@ -281,7 +272,10 @@ class TraceCommand(BaseCommand):
                 await asyncio.sleep(wait_s)
                 await self.send_response(message, response)
 
-        if result.success and self.update_graph_one_byte and result.path_nodes:
+        # 1-byte hashes follow update_graph_one_byte; 2-byte and wider, update_graph_two_byte
+        hash_bytes = 1 << ((result.flags or 0) & 3)
+        update_graph = self.update_graph_one_byte if hash_bytes == 1 else self.update_graph_two_byte
+        if result.success and update_graph and result.path_nodes:
             path_hashes = [n.get("hash") for n in result.path_nodes if n.get("hash")]
             if path_hashes and hasattr(self.bot, "mesh_graph") and self.bot.mesh_graph and self.bot.mesh_graph.capture_enabled:
                 update_mesh_graph_from_trace_data(

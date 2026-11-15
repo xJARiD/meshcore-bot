@@ -58,6 +58,27 @@ attempt to restart that service while preserving the original failure status.
 
 Read the [upgrade guide](upgrade.md) before upgrading an existing installation.
 
+### Optional feature packages
+
+Two feature sets are not installed by default because most bots do not need them:
+the profanity filter (`better-profanity`, `unidecode`) and geocoding extras
+(`pycountry`, `us`). A fresh install and a `--upgrade` both prompt for each one.
+
+For an unattended run, install both without prompting:
+
+```bash
+sudo ./install-service.sh --upgrade --install-extras
+```
+
+`--install-extras` also works alongside `--update-venv`, which otherwise keeps
+whatever is already in the virtual environment and does not prompt:
+
+```bash
+sudo ./install-service.sh -u --update-venv --install-extras
+```
+
+A failed extras install is non-fatal; the bot installs and starts without them.
+
 ## Manual Installation
 
 If you prefer to install manually:
@@ -99,7 +120,7 @@ tree writable by the service account.
 
 ```bash
 sudo python3 -m venv /opt/meshcore-bot/venv
-sudo /opt/meshcore-bot/venv/bin/pip install \
+sudo /opt/meshcore-bot/venv/bin/python -m pip install \
   -r /opt/meshcore-bot/requirements.txt
 ```
 
@@ -203,7 +224,10 @@ sudo systemctl restart meshcore-bot
 - Automatic restart on failure
 - Restart delay of 10 seconds
 - Maximum 3 restart attempts per minute
+- Waits for a running instance instead of failing its restart budget
 - Logs to systemd journal
+
+The packaged unit starts the bot with `--wait-for-lock`. If another copy is already running against the same database (for example a manual run during maintenance), the service waits for it to exit and then takes over, rather than exiting and spending its start limit. Stop the manual copy when you are done so the service can resume.
 
 ### Monitoring
 - Systemd journal integration

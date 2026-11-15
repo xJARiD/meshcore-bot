@@ -72,6 +72,8 @@ CANONICAL_NON_COMMAND_SECTIONS = frozenset({
     "DiscordBridge",
     "TelegramBridge",
     "DARC_MoWaS_Service",
+    "Region_Warnings",
+    "Repeater_Watch",
 })
 
 # Sections required for the bot to start (accessed without has_section guards)

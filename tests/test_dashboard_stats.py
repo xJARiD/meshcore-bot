@@ -315,15 +315,20 @@ class TestStatsPerformance:
         """~35ms after the rework, against ~264ms for the linear hop-prefix scan."""
         with seeded_viewer.app.test_client() as client:
             client.get("/api/stats")  # warm the page cache
-            started = time.perf_counter()
-            response = client.get("/api/stats")
-            elapsed = time.perf_counter() - started
+            timings = []
+            for _ in range(5):
+                started = time.perf_counter()
+                response = client.get("/api/stats")
+                timings.append(time.perf_counter() - started)
 
         assert response.status_code == 200
         payload = response.get_json()
         assert "error" not in payload
         assert payload["total_contacts"] == CONTACTS
-        assert elapsed < 0.2, f"/api/stats took {elapsed:.2f}s on a synthetic 100k-row DB"
+        # The fastest of several requests: a GC pause or a busy runner slows one
+        # request, while an algorithmic regression slows them all.
+        shown = ", ".join(f"{t * 1000:.0f}" for t in timings)
+        assert min(timings) < 0.2, f"/api/stats took {shown} ms on a synthetic 100k-row DB"
 
     def test_dashboard_summary_is_a_single_row_read(self, seeded_viewer):
         with closing(seeded_viewer._dashboard_connection()) as conn:
@@ -784,12 +789,9 @@ class TestDerivedWindows:
 
 
 class TestOneHopNeighbours:
-    """Neighbour membership comes from path evidence, not the stored hop_count.
+    """Neighbour membership is MeshCore hop count 0 (empty path), not 1-hop relays.
 
-    On the live database hop_count claims 800 zero-hop contacts while only 68
-    have any one-hop path to corroborate it, and their stored SNR piles up in a
-    1.5 dB band — one strong local link recorded against every node whose
-    traffic came through it.
+    hop_count on contacts over-claims zero-hop and is not used for membership.
     """
 
     def _seed_contact(self, conn, pk, name, role, hop_count, snr, rssi):
@@ -802,52 +804,71 @@ class TestOneHopNeighbours:
             (pk, name, role, hop_count, snr, rssi),
         )
 
-    def _seed_path(self, conn, pk, path_length, bytes_per_hop, age="-1 hours"):
+    def _seed_path(self, conn, pk, path_length, bytes_per_hop, age="-1 hours",
+                   snr=None, rssi=None):
         conn.execute(
             """
             INSERT INTO observed_paths
                 (public_key, from_prefix, to_prefix, path_hex, path_length,
-                 bytes_per_hop, packet_type, last_seen)
-            VALUES (?, 'aa', 'bb', ?, ?, ?, 'advert', datetime('now','localtime', ?))
+                 bytes_per_hop, packet_type, last_seen, snr, rssi)
+            VALUES (?, 'aa', 'bb', ?, ?, ?, 'advert', datetime('now','localtime', ?), ?, ?)
             """,
-            (pk, "ab" * path_length, path_length, bytes_per_hop, age),
+            (pk, "ab" * path_length, path_length, bytes_per_hop, age, snr, rssi),
+        )
+
+    def _seed_neighbor_link(self, conn, pk, snr, age_hours=1):
+        seen = datetime.now(timezone.utc) - timedelta(hours=age_hours)
+        conn.execute(
+            """
+            INSERT INTO neighbor_links
+                (self_public_key, neighbor_public_key, last_seen, last_snr, snr_sum, snr_count)
+            VALUES (?, ?, ?, ?, ?, 1)
+            """,
+            ("ff" * 32, pk, seen.isoformat(), snr, snr),
         )
 
     def _top(self, viewer, window="24h", limit=10):
         with closing(viewer._dashboard_connection()) as conn:
             return viewer.dashboard_stats.read_top(conn, "neighbors", window, limit)
 
-    def test_multibyte_paths_are_not_read_as_extra_hops(self, viewer):
-        """path_length is bytes: 3 bytes at 3 bytes/hop is ONE hop, not three."""
+    def test_empty_path_is_a_direct_neighbour(self, viewer):
+        """path_length = 0 is MeshCore hop count 0 — heard directly."""
+        with sqlite3.connect(viewer.db_path) as conn:
+            self._seed_contact(conn, _pk(1), "direct", "repeater", 4, 12.0, -45.0)
+            self._seed_path(conn, _pk(1), path_length=0, bytes_per_hop=2, snr=5.0, rssi=-80.0)
+            self._seed_contact(conn, _pk(2), "one-hop-relay", "repeater", 0, 6.0, -60.0)
+            self._seed_path(conn, _pk(2), path_length=1, bytes_per_hop=1)
+            self._seed_contact(conn, _pk(3), "multibyte-1hop", "repeater", 0, 7.0, -50.0)
+            self._seed_path(conn, _pk(3), path_length=3, bytes_per_hop=3)
+
+        items = self._top(viewer)["items"]
+        assert [item["name"] for item in items] == ["direct"]
+        assert items[0]["signal_corroborated"] is True
+        assert items[0]["snr"] == 5.0
+        assert items[0]["rssi"] == -80
+
+    def test_relayed_one_hop_paths_are_not_neighbours(self, viewer):
+        """path_length == bytes_per_hop is one encoded hop, not a direct neighbour."""
         with sqlite3.connect(viewer.db_path) as conn:
             self._seed_contact(conn, _pk(1), "onebyte-1hop", "repeater", 0, 5.0, -70.0)
             self._seed_path(conn, _pk(1), path_length=1, bytes_per_hop=1)
             self._seed_contact(conn, _pk(2), "multibyte-1hop", "repeater", 0, 6.0, -60.0)
             self._seed_path(conn, _pk(2), path_length=3, bytes_per_hop=3)
-            self._seed_contact(conn, _pk(3), "multibyte-2hop", "repeater", 0, 7.0, -50.0)
-            self._seed_path(conn, _pk(3), path_length=6, bytes_per_hop=3)
+        assert self._top(viewer)["items"] == []
+        assert self._top(viewer)["total"] == 0
 
-        names = {item["name"] for item in self._top(viewer)["items"]}
-        assert names == {"onebyte-1hop", "multibyte-1hop"}
-
-    def test_uncorroborated_signal_is_withheld(self, viewer):
-        """Path evidence without a matching hop_count gets no SNR figure."""
+    def test_path_snr_is_shown_without_hop_count_agreement(self, viewer):
+        """The path-row measurement belongs to this link; hop_count is ignored."""
         with sqlite3.connect(viewer.db_path) as conn:
-            self._seed_contact(conn, _pk(1), "agrees", "repeater", 0, 4.0, -80.0)
-            self._seed_path(conn, _pk(1), 1, 1)
-            # hop_count says 4 hops but a one-hop path exists: the stored signal
-            # belongs to some other link, so it must not be shown.
-            self._seed_contact(conn, _pk(2), "disagrees", "repeater", 4, 12.0, -45.0)
-            self._seed_path(conn, _pk(2), 1, 1)
+            self._seed_contact(conn, _pk(1), "direct", "repeater", 4, 12.0, -45.0)
+            self._seed_path(conn, _pk(1), 0, 1, snr=4.0, rssi=-80.0)
 
-        items = {item["name"]: item for item in self._top(viewer)["items"]}
-        assert items["agrees"]["signal_corroborated"] is True
-        assert items["agrees"]["snr"] == 4.0
-        assert items["disagrees"]["signal_corroborated"] is False
-        assert items["disagrees"]["snr"] is None
-        assert items["disagrees"]["rssi"] is None
+        item = self._top(viewer)["items"][0]
+        assert item["signal_corroborated"] is True
+        assert item["snr"] == 4.0
+        assert item["rssi"] == -80
 
-    def test_contacts_with_no_one_hop_path_are_excluded(self, viewer):
+    def test_contacts_with_no_zero_hop_path_are_excluded(self, viewer):
         """hop_count = 0 alone does not make something a neighbour."""
         with sqlite3.connect(viewer.db_path) as conn:
             self._seed_contact(conn, _pk(1), "claims-direct", "repeater", 0, 12.0, -45.0)
@@ -858,10 +879,10 @@ class TestOneHopNeighbours:
     def test_weakest_measured_links_are_promoted(self, viewer):
         with sqlite3.connect(viewer.db_path) as conn:
             for i, snr in enumerate([9.0, -8.0, 2.0]):
-                self._seed_contact(conn, _pk(i), f"m{i}", "repeater", 0, snr, -70.0)
-                self._seed_path(conn, _pk(i), 1, 1)
+                self._seed_contact(conn, _pk(i), f"m{i}", "repeater", 0, None, None)
+                self._seed_path(conn, _pk(i), 0, 1, snr=snr, rssi=-70.0)
             self._seed_contact(conn, _pk(9), "unmeasured", "repeater", 3, None, None)
-            self._seed_path(conn, _pk(9), 1, 1)
+            self._seed_path(conn, _pk(9), 0, 1)
 
         items = self._top(viewer)["items"]
         assert [i["name"] for i in items[:3]] == ["m1", "m2", "m0"]
@@ -870,12 +891,27 @@ class TestOneHopNeighbours:
     def test_window_bounds_membership(self, viewer):
         with sqlite3.connect(viewer.db_path) as conn:
             self._seed_contact(conn, _pk(1), "today", "repeater", 0, 5.0, -70.0)
-            self._seed_path(conn, _pk(1), 1, 1, age="-2 hours")
+            self._seed_path(conn, _pk(1), 0, 1, age="-2 hours", snr=5.0)
             self._seed_contact(conn, _pk(2), "last-week", "repeater", 0, 5.0, -70.0)
-            self._seed_path(conn, _pk(2), 1, 1, age="-4 days")
+            self._seed_path(conn, _pk(2), 0, 1, age="-4 days", snr=5.0)
 
         assert {i["name"] for i in self._top(viewer, "24h")["items"]} == {"today"}
         assert {i["name"] for i in self._top(viewer, "7d")["items"]} == {"today", "last-week"}
+
+    def test_discover_links_are_unioned(self, viewer):
+        """A repeater that answered node-discover is a neighbour even without an advert path."""
+        with sqlite3.connect(viewer.db_path) as conn:
+            self._seed_contact(conn, _pk(1), "heard-advert", "repeater", 0, None, None)
+            self._seed_path(conn, _pk(1), 0, 1, snr=3.0, rssi=-90.0)
+            self._seed_contact(conn, _pk(2), "discover-only", "repeater", 1, None, None)
+            self._seed_neighbor_link(conn, _pk(2), snr=8.5, age_hours=2)
+
+        items = {item["name"]: item for item in self._top(viewer)["items"]}
+        assert set(items) == {"heard-advert", "discover-only"}
+        assert items["heard-advert"]["snr"] == 3.0
+        assert items["discover-only"]["snr"] == 8.5
+        assert items["discover-only"]["rssi"] is None
+        assert self._top(viewer)["total"] == 2
 
     def test_windows_are_capped_below_retention(self, viewer):
         """observed_paths keeps 90 days; a month-old link says nothing about today."""
@@ -902,6 +938,38 @@ class TestOneHopNeighbours:
         payload = self._top(viewer)
         assert payload["items"] == []
         assert payload["total"] == 0
+
+    def test_packet_stream_backfill_inserts_zero_hop_adverts(self, viewer):
+        pk = _pk(7)
+        payload_hex = pk + "00" * 70
+        packet = {
+            "payload_type_name": "ADVERT",
+            "path_len": 0,
+            "bytes_per_hop": 2,
+            "payload_hex": payload_hex,
+            "snr": 6.5,
+            "rssi": -72,
+        }
+        with sqlite3.connect(viewer.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO packet_stream
+                    (timestamp, data, type, route_type_name, payload_type_name, path_len, bytes_per_hop)
+                VALUES (?, ?, 'packet', 'FLOOD', 'ADVERT', 0, 2)
+                """,
+                (time.time() - 3600, json.dumps(packet)),
+            )
+            self._seed_contact(conn, pk, "from-log", "repeater", 2, None, None)
+
+        _refresh(viewer)
+        items = {item["name"]: item for item in self._top(viewer)["items"]}
+        assert "from-log" in items
+        assert items["from-log"]["snr"] == 6.5
+        assert items["from-log"]["rssi"] == -72
+
+        # Second refresh must not duplicate or clear the marker.
+        _refresh(viewer)
+        assert self._top(viewer)["total"] == 1
 
 
 class TestHopConventions:
@@ -1271,3 +1339,88 @@ class TestDashboardApi:
         assert response.headers["Deprecation"] == "true"
         assert "Sunset" in response.headers
         assert response.get_json()["deprecated"] is True
+
+
+class TestDeltaGaps:
+    """A compared day on which nothing was heard is a collection gap, not a collapse."""
+
+    @staticmethod
+    def _day(conn, date_str, packets, adverts, messages):
+        conn.execute(
+            "INSERT INTO daily_rollup (date, is_final, packets_total, adverts_total, messages_total, nodes_active) "
+            "VALUES (?, 1, ?, ?, ?, ?)",
+            (date_str, packets, adverts, messages, adverts),
+        )
+
+    def _deltas(self, viewer):
+        with closing(viewer._dashboard_connection()) as conn:
+            return (viewer.dashboard_stats._deltas_from_rollup(conn),
+                    viewer.dashboard_stats._delta_gap_from_rollup(conn))
+
+    def test_silent_last_day_suppresses_the_change(self, viewer):
+        with closing(viewer._dashboard_connection()) as conn:
+            self._day(conn, "2026-10-22", 44000, 600, 340)
+            self._day(conn, "2026-10-23", 0, 0, 0)
+            conn.commit()
+        deltas, gap = self._deltas(viewer)
+        assert gap == "2026-10-23"
+        assert deltas and all(value is None for value in deltas.values())
+
+    def test_silent_baseline_day_is_named_too(self, viewer):
+        with closing(viewer._dashboard_connection()) as conn:
+            self._day(conn, "2026-10-22", 0, 0, 0)
+            self._day(conn, "2026-10-23", 44000, 600, 340)
+            conn.commit()
+        deltas, gap = self._deltas(viewer)
+        assert gap == "2026-10-22"
+        assert all(value is None for value in deltas.values())
+
+    def test_no_history_at_all_is_not_called_a_gap(self, viewer):
+        """A fresh install has two empty days: nothing to compare, but no gap to name."""
+        with closing(viewer._dashboard_connection()) as conn:
+            self._day(conn, "2026-10-22", 0, 0, 0)
+            self._day(conn, "2026-10-23", 0, 0, 0)
+            conn.commit()
+        deltas, gap = self._deltas(viewer)
+        assert gap is None
+        assert all(value is None for value in deltas.values())
+
+    def test_quiet_but_heard_days_still_compare(self, viewer):
+        with closing(viewer._dashboard_connection()) as conn:
+            self._day(conn, "2026-10-22", 200, 10, 0)
+            self._day(conn, "2026-10-23", 100, 5, 0)
+            conn.commit()
+        deltas, gap = self._deltas(viewer)
+        assert gap is None
+        assert deltas["adverts"] == -50.0
+
+
+class TestNewestNode:
+    """The New nodes tile names the newest arrival heard in the last day."""
+
+    def _mesh(self, viewer):
+        from modules.web_viewer.dashboard_stats import SOURCE_CONTACT_TRACKING
+        with closing(viewer._dashboard_connection()) as conn:
+            return viewer.dashboard_stats._mesh_snapshot(conn, SOURCE_CONTACT_TRACKING)
+
+    def _contact(self, conn, pk, name, hops, age):
+        conn.execute(
+            "INSERT INTO complete_contact_tracking (public_key, name, role, hop_count, first_heard, last_heard) "
+            "VALUES (?, ?, 'repeater', ?, datetime('now','localtime',?), datetime('now','localtime'))",
+            (pk, name, hops, age),
+        )
+
+    def test_names_the_most_recent_first_heard(self, viewer):
+        with sqlite3.connect(viewer.db_path) as conn:
+            self._contact(conn, _pk(1), "older", 2, "-5 hours")
+            self._contact(conn, _pk(2), "newest", 3, "-1 hours")
+            self._contact(conn, _pk(3), "last-week", 1, "-6 days")
+        newest = self._mesh(viewer)["newest_node"]
+        assert newest["name"] == "newest"
+        assert newest["hops"] == 3
+        assert abs(time.time() - 3600 - newest["first_heard"]) < 120
+
+    def test_nothing_new_in_a_day_is_none(self, viewer):
+        with sqlite3.connect(viewer.db_path) as conn:
+            self._contact(conn, _pk(1), "last-week", 1, "-6 days")
+        assert self._mesh(viewer)["newest_node"] is None
