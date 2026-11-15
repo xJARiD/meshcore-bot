@@ -14,6 +14,7 @@
 #   ./install-service.sh          # Normal installation (non-destructive if already installed)
 #   ./install-service.sh --upgrade # Upgrade mode (copies new files, updates dependencies)
 #   ./install-service.sh -u        # Short form of --upgrade
+#   ./install-service.sh -u --install-extras # upgrade + install optional packages (profanity, geocoding)
 #   ./install-service.sh --update-venv           # Only refresh the venv, in place
 #   ./install-service.sh -u --update-venv        # Upgrade code, reuse the venv
 #
@@ -80,6 +81,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Parse command line arguments (before sudo check so help works)
 UPGRADE_MODE=false
 UPDATE_VENV=false
+INSTALL_EXTRAS=false
 for arg in "$@"; do
     case $arg in
         --upgrade|-u)
@@ -87,6 +89,9 @@ for arg in "$@"; do
             ;;
         --update-venv)
             UPDATE_VENV=true
+            ;;
+        --install-extras|-ie)
+            INSTALL_EXTRAS=true
             ;;
         --help|-h)
             echo "MeshCore Bot Service Installation Script"
@@ -106,6 +111,7 @@ for arg in "$@"; do
             echo "  $0                     # Normal installation (non-destructive if already installed)"
             echo "  $0 --upgrade           # Upgrade existing installation (rebuilds the venv)"
             echo "  $0 -u                  # Short form of --upgrade"
+            echo "  $0 -u --install-extras # Upgrade and install optional packages without prompting"
             echo "  $0 --update-venv       # Refresh dependencies only, keeping the venv"
             echo "  $0 -u --update-venv    # Upgrade code and refresh the venv in place"
             exit 0
@@ -385,12 +391,30 @@ venv_reuse_blocker() {
 update_venv_in_place() {
     local venv="$1"
     local project_dir="$2"
+    local rewrite_helper
+    local -a sync_args=(--locked --no-dev --no-install-project --inexact)
+    if [[ "$INSTALL_EXTRAS" == true ]]; then
+        sync_args+=(--extra profanity --extra geo)
+    fi
 
     print_info "Reusing the existing virtualenv at $venv"
     print_info "Synchronizing dependencies from $project_dir/uv.lock"
-    if ! (cd "$project_dir" && UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --no-dev --no-install-project --inexact); then
+    if ! (cd "$project_dir" && UV_PROJECT_ENVIRONMENT="$venv" uv sync "${sync_args[@]}"); then
         print_error "Failed to update Python dependencies"
         print_info "Check your internet connection, or rebuild with: $0 --upgrade"
+        return 1
+    fi
+
+    # Prefer the helper shipped with this installer invocation so --update-venv
+    # heals broken shebangs even before a full code sync lands under INSTALL_DIR.
+    if [ -f "$SCRIPT_DIR/scripts/rewrite_venv_shebangs.sh" ]; then
+        rewrite_helper="$SCRIPT_DIR/scripts/rewrite_venv_shebangs.sh"
+    else
+        rewrite_helper="$INSTALL_DIR/scripts/rewrite_venv_shebangs.sh"
+    fi
+    if ! bash "$rewrite_helper" "$venv"; then
+        print_error "Failed to rewrite virtualenv console-script shebangs"
+        print_info "Rebuild with: $0 --upgrade"
         return 1
     fi
 
@@ -485,7 +509,7 @@ else
     else
         print_warning "User $SERVICE_USER already exists (skipping creation)"
     fi
-    
+
     # Add user to dialout group for serial port access (Linux)
     print_info "Configuring serial port access permissions"
     if getent group dialout > /dev/null 2>&1; then
@@ -499,7 +523,7 @@ else
         print_warning "dialout group not found - serial port access may require manual configuration"
         print_info "If using serial connection, you may need to: sudo usermod -a -G dialout $SERVICE_USER"
     fi
-    
+
     # Also check for other common serial port groups (tty, uucp, lock)
     for group in tty uucp lock; do
         if getent group "$group" > /dev/null 2>&1; then
@@ -711,29 +735,39 @@ if [[ "$UPDATE_VENV" == true ]]; then
 fi
 
 if [[ "$VENV_UPDATED_IN_PLACE" == true ]]; then
-    print_info "Kept any optional packages already installed in the virtualenv"
+    if [[ "$INSTALL_EXTRAS" == true ]]; then
+        print_info "Installed optional feature packages (--install-extras)"
+    else
+        print_info "Kept any optional packages already installed in the virtualenv"
+    fi
 else
     # Optional extras are resolved from uv.lock as part of the sync below, so ask
     # before building.  A rebuild starts empty, so they have to be re-chosen.
     UV_SYNC_ARGS=(--locked --no-dev --no-install-project)
-    echo ""
-    print_info "Optional feature packages are available:"
-    echo "  • Profanity filter (better-profanity, unidecode) — drop/censor offensive messages"
-    echo "  • Geocoding extras (pycountry, us) — improved country/state name resolution"
-    echo ""
-
-    if ask_yes_no "Install profanity filter packages? (recommended if using the profanity filter feature)" "n"; then
-        UV_SYNC_ARGS+=(--extra profanity)
-        print_success "Enabled profanity filter packages"
+    # --install-extras selects both sets non-interactively.
+    if [[ "$INSTALL_EXTRAS" == true ]]; then
+        print_info "Installing optional feature packages (--install-extras)"
+        UV_SYNC_ARGS+=(--extra profanity --extra geo)
     else
-        print_info "Skipping profanity filter packages"
-    fi
+        echo ""
+        print_info "Optional feature packages are available:"
+        echo "  • Profanity filter (better-profanity, unidecode) — drop/censor offensive messages"
+        echo "  • Geocoding extras (pycountry, us) — improved country/state name resolution"
+        echo ""
 
-    if ask_yes_no "Install geocoding extras? (recommended if using location/path commands)" "n"; then
-        UV_SYNC_ARGS+=(--extra geo)
-        print_success "Enabled geocoding extras"
-    else
-        print_info "Skipping geocoding extras"
+        if ask_yes_no "Install profanity filter packages? (recommended if using the profanity filter feature)" "n"; then
+            UV_SYNC_ARGS+=(--extra profanity)
+            print_success "Enabled profanity filter packages"
+        else
+            print_info "Skipping profanity filter packages"
+        fi
+
+        if ask_yes_no "Install geocoding extras? (recommended if using location/path commands)" "n"; then
+            UV_SYNC_ARGS+=(--extra geo)
+            print_success "Enabled geocoding extras"
+        else
+            print_info "Skipping geocoding extras"
+        fi
     fi
 
     # Build dependencies in a fresh environment.  The legacy venv was writable by
@@ -763,6 +797,18 @@ else
     if ! mv "$VENV_BUILD" "$INSTALL_DIR/venv"; then
         [ -d "$VENV_OLD" ] && mv "$VENV_OLD" "$INSTALL_DIR/venv"
         print_error "Failed to activate the newly built virtual environment"
+        exit 1
+    fi
+    # Console scripts still embed the .venv-build-$$ shebang; rewrite before any
+    # later call to venv/bin/pip or other entry points (see issue #229).  Keep
+    # VENV_OLD until rewrite succeeds so a failure can restore the prior tree.
+    if ! bash "$INSTALL_DIR/scripts/rewrite_venv_shebangs.sh" "$INSTALL_DIR/venv"; then
+        print_error "Failed to rewrite virtualenv console-script shebangs after relocate"
+        if [ -d "$VENV_OLD" ]; then
+            rm -rf "$INSTALL_DIR/venv"
+            mv "$VENV_OLD" "$INSTALL_DIR/venv"
+            print_warning "Restored the previous virtualenv after shebang rewrite failure"
+        fi
         exit 1
     fi
     rm -rf "$VENV_OLD"
@@ -819,7 +865,7 @@ if [[ "$IS_MACOS" == true ]]; then
     print_info "The service will be configured to start on boot and restart on failure"
     # Create LaunchDaemons directory if it doesn't exist
     mkdir -p "$LAUNCHD_DIR"
-    
+
     # Update plist with actual installation paths and copy to LaunchDaemons
     if [ -f "$LAUNCHD_DIR/$SERVICE_FILE" ] && [[ "$UPGRADE_MODE" != true ]]; then
         print_info "Plist file already exists at $LAUNCHD_DIR/$SERVICE_FILE"
@@ -847,12 +893,12 @@ with open('$LAUNCHD_DIR/$SERVICE_FILE', 'w') as f:
         fi
         print_success "Copied and configured plist file to $LAUNCHD_DIR/"
     fi
-    
+
     # Set ownership
     chown root:wheel "$LAUNCHD_DIR/$SERVICE_FILE"
     chmod 644 "$LAUNCHD_DIR/$SERVICE_FILE"
     print_success "Set plist permissions"
-    
+
     print_section "Step 7: Loading Service"
     # Check if service is already loaded
     if launchctl list "$PLIST_NAME" &>/dev/null; then
@@ -905,7 +951,7 @@ else
         systemctl daemon-reload
         print_success "Systemd configuration reloaded"
     fi
-    
+
     print_section "Step 7: Enabling Service"
     # Check if service is already enabled
     if systemctl is-enabled "$SERVICE_NAME" &>/dev/null; then

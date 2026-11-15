@@ -97,6 +97,19 @@ cmd
 
 ---
 
+### `contact`
+
+Share the bot's own contact card so you can add it and send DMs without waiting for an advert.
+
+**Usage:**
+```
+contact
+```
+
+**Response:** A clickable contact card containing the bot's public key and device name.
+
+---
+
 ### `version`
 
 Show the bot's current software version.
@@ -147,67 +160,77 @@ channels #general
 
 ---
 
-### `wx <zipcode>`
+### `wx [location] [option]`
 
-Get weather information for a US zip code using NOAA data.
+Weather from NOAA for US locations: current conditions with today's forecast, plus a separate message when weather alerts are active. With `[Weather] weather_provider = openmeteo`, `wx` answers like `gwx` instead.
 
 **Aliases:** `weather`, `wxa`, `wxalert`
 
 **Usage:**
 ```
-wx <zipcode>
-weather <zipcode>
-wxa <zipcode>
-wxalert <zipcode>
+wx <zipcode | city | lat,lon> [tomorrow | hourly | Nd | alerts]
+wx [tomorrow | hourly | Nd]
 ```
 
 **Examples:**
 ```
 wx 98101
-weather 90210
-wxa 10001
+wx Seattle
+wx Portland, OR tomorrow
+wx 47.6062,-122.3321 hourly
+wx Spokane 5d
+wx 98101 alerts
+wx
 ```
 
-**Response:** Current weather conditions, forecast for tonight/tomorrow, and active weather alerts. Includes:
-- Current conditions (temperature, humidity, wind, etc.)
-- Short-term forecast (tonight, tomorrow)
-- Weather alerts if any are active
+**Options:**
+- `tomorrow`: tomorrow's day and night periods.
+- `hourly`: the coming hours, as many as fit in one message.
+- `Nd` (or a bare number, or `7day`): an N-day forecast starting tomorrow, one line per day, for 2 to 16 days. The forecast ends where the provider's does: about 7 days for NOAA, 15 after today for Open-Meteo.
+- `alerts`: every active alert for the location.
 
-**Note:** Weather alerts are automatically included when available.
+**With no location** (an option alone, such as `wx hourly`, is fine), `wx` uses, in order: a `custom.wxsim.default` or `custom.mqtt_weather.default` source, the sender's last advertised position, `[Weather] default_city`, and the bot's own position when `[Wx_Command] use_bot_location_when_no_location = true`.
+
+**Units** follow `[Weather] temperature_unit` and `wind_speed_unit` (`[Wx_Command]` overrides them for `wx`). The default is °F and mph.
+
+**The place is named** in the reply only when it adds information: for a position (the sender's, the bot's or typed coordinates) when a place is found for it, and for a city in another state than `[Weather] default_state` (or any city, when `default_state` is not set). ZIP codes are not named. With `[Weather] always_show_location = true`, every city, ZIP code and position a place is found for is named; the name takes message length from the forecast, and a ZIP code costs one extra reverse lookup.
+
+**Outside the US:** NOAA only covers the US, so by default `wx Tokyo` replies with an error. With `[Weather] openmeteo_fallback = true` (and `weather_provider = noaa`), a place NWS reports as outside its coverage is answered from Open-Meteo instead, in the same format as `gwx`, named as `gwx` names it (`Tokyo, JP: …`), and in `wx`'s units. Current conditions, `tomorrow`, `Nd` and `hourly` all fall back; `alerts` replies that alerts are not available there, since NWS is the only alert source. NWS timeouts and server errors still reply with an error rather than switching source. A point found outside coverage is remembered for 24 hours, so later requests for it skip NWS.
 
 ---
 
-### `gwx <location>`
+### `gwx [location] [option]`
 
-Get global weather information for any location worldwide using Open-Meteo API.
+Weather from Open-Meteo for any location worldwide: current conditions with today's high and low, plus a separate message for extreme heat, cold, wind, heavy rain or snow, or thunderstorms.
 
 **Aliases:** `globalweather`, `gwxa`
 
 **Usage:**
 ```
-gwx <location>
-globalweather <location>
-gwxa <location>
+gwx <city | city, country | zipcode | lat,lon> [tomorrow | hourly | Nd]
+gwx [tomorrow | hourly | Nd]
 ```
 
 **Examples:**
 ```
 gwx Tokyo
 gwx Paris, France
-gwx London
-globalweather New York
-gwx 35.6762,139.6503
+gwx London tomorrow
+gwx 35.6762,139.6503 hourly
+gwx Reykjavik 10d
 ```
 
-**Response:** Current weather conditions and forecast for the specified location, including:
-- Current temperature and conditions
-- Feels-like temperature
-- Wind speed and direction
-- Humidity
-- Dew point
-- Visibility
-- Pressure
-- Forecast for today/tonight and tomorrow
+**Options:** `tomorrow`, `hourly` and `Nd` (2 to 16 days) work as for `wx`. Open-Meteo has no official alerts, so `gwx <location> alerts` says it is not available.
+
+**With no location,** `gwx` uses the same order as `wx`.
+
+**Units** follow `[Weather] temperature_unit`, `wind_speed_unit` and `precipitation_unit`.
+
+**The place is named** in the reply when it adds information: a city in another country than `[Weather] default_country` (in the US, another state than `default_state`, or any US city when `default_state` is not set), or a position a place was found for. A city in the bot's own region and ZIP codes are not named. `[Weather] always_show_location = true` names every place a lookup finds, as for `wx`.
+
+**Custom sources:** a `custom.wxsim.<name>` or `custom.mqtt_weather.<name>` key in `[Weather]` answers `wx <name>` and `gwx <name>` from that station. WXSIM sources answer current conditions, `tomorrow` and `Nd`; MQTT sources answer current conditions only. Options a source cannot answer (`hourly` and `alerts` for both) reply that they are not available instead of sending the current conditions.
+
+**Scheduled messages:** both commands can be used in `{cmd:...}` placeholders, for example `{cmd:gwx Paris}`.
 
 ---
 
@@ -282,7 +305,7 @@ When no location is given, uses the sender's companion location if known, then t
 
 ### `airplanes [location] [options]` / `overhead [lat,lon]`
 
-Get aircraft tracking information using ADS-B data from airplanes.live or compatible APIs.
+Get aircraft tracking information using ADS-B data from adsb.lol or any compatible readsb/ADSBExchange v2 API.
 
 **Aliases:** `aircraft`, `planes`, `adsb`, `overhead`
 
@@ -342,12 +365,12 @@ airplanes 47.6,-122.3 radius=25 closest
 **Configuration:**
 The command can be configured in `config.ini` under `[Airplanes_Command]`:
 - `enabled` - Enable/disable the command
-- `api_url` - API endpoint URL (default: `http://api.airplanes.live/v2/`)
+- `api_url` - API endpoint URL (default: `https://api.adsb.lol/v2/`). Existing configs that still point at `api.airplanes.live` are remapped to this default. A local readsb instance or any other host is left as-is.
 - `default_radius` - Default search radius in nautical miles
 - `max_results` - Maximum number of results to return
 - `url_timeout` - API request timeout in seconds
 
-**Note:** Uses companion location from database if available, otherwise falls back to bot location from config. The API is rate-limited to 1 request per second.
+**Note:** Uses companion location from database if available, otherwise falls back to bot location from config. Keep the command cooldown at 2 seconds to stay within typical public ADS-B rate limits.
 
 ---
 
@@ -750,7 +773,7 @@ tracer
 ```
 With no path, both use the path your message took to reach the bot (like the test command).
 
-**Config:** `[Trace_Command]` — `enabled`, `maximum_hops`, `trace_mode` (one_byte/two_byte), `timeout_base_seconds` (default 1.0), `timeout_per_hop_seconds` (default 0.5), `trace_retry_count` (default 2 attempts), `trace_retry_delay_seconds` (default 1.0), `update_graph_one_byte`, `update_graph_two_byte`. Total wait per attempt = base + (hops × per_hop). On failure, waits then retries up to `trace_retry_count` times.
+**Config:** `[Trace_Command]` — `enabled`, `maximum_hops`, `trace_mode` (one_byte/two_byte), `timeout_base_seconds` (default 2.0), `timeout_per_hop_seconds` (default 1.5), `trace_retry_count` (default 2 attempts), `trace_retry_delay_seconds` (default 1.0), `update_graph_one_byte`, `update_graph_two_byte`. Total wait per attempt = base + (hops × per_hop). On failure, waits then retries up to `trace_retry_count` times; a reply to an earlier attempt still counts until the last attempt times out.
 
 **Response:** Compact trace result: tag, hop count, SNR per hop, and optional graph update when enabled.
 
@@ -779,6 +802,27 @@ prefix free
 - Status (active/inactive)
 - Last seen time
 - Location (if available)
+
+**Data source:** By default the bot answers from its own database of repeaters it has
+heard. No external service is required, and `[External_Data] repeater_prefix_api_url`
+should be left **empty** — leaving it empty does not disable the command.
+
+Setting that option adds an optional external dataset on top: node counts come from the
+API while names and locations still come from the local database. The setting dates from
+when the project fetched data from `map.w0z.is`, which is defunct, and there is no
+drop-in public replacement. To serve your own, answer a plain `GET` with HTTP 200 and:
+
+```json
+{
+  "data": [
+    {"prefix": "AB", "node_count": 3, "node_names": ["Node One", "Node Two", "Node Three"]}
+  ]
+}
+```
+
+`prefix` is upper-cased by the bot, `node_count` is an integer, and `node_names` is a
+list of strings. The request times out after 10 seconds, and responses are cached for
+`repeater_prefix_cache_hours` (default 1).
 
 ---
 
@@ -858,8 +902,7 @@ Some commands use location data:
 - **`sun` and `moon`** - Use the bot's configured default location (`bot_latitude` and `bot_longitude` in config.ini), not the user's location from their advert
 - **`solar`** - Does not require location (provides global solar conditions)
 - **`solarforecast`** - Requires a location parameter (location name, repeater name, coordinates, or zipcode)
-- **`wx`** - Requires a zipcode parameter
-- **`gwx`** - Requires a location parameter
+- **`wx`** and **`gwx`** - Use the given location, or fall back to the sender's advertised position, `default_city` or the bot's position (see each command above)
 - **`aqi`** - Requires a location parameter
 
 ### API Keys
@@ -870,9 +913,9 @@ Some commands require API keys to be configured in `config.ini`:
 
 ### Weather Data
 
-- `wx` uses NOAA API (US locations only)
-- `gwx` uses Open-Meteo API (global locations)
-- Both provide current conditions and forecasts
+- `wx` uses the NOAA API (US locations only), or Open-Meteo with `weather_provider = openmeteo`
+- `gwx` uses the Open-Meteo API (global locations)
+- Both provide current conditions, tomorrow, hourly and multi-day forecasts, in the configured units
 
 ### Command Categories
 
@@ -1087,7 +1130,7 @@ schedule
 
 **Response:** Lists configured scheduled posts (each line shows the cron or preset schedule, or legacy `HH:MM` if you still use deprecated HHMM keys) plus current advert timing.
 
-**Note:** DM-only command by default. Cron day-of-week uses APScheduler numbering (0=Monday), not Vixie cron — see [Scheduled messages](configuration.md#scheduled-messages-scheduled_messages).
+**Note:** DM-only command by default. Cron day-of-week uses APScheduler numbering (0=Monday), not Vixie cron — see [Scheduled messages](scheduled-messages.md).
 
 ---
 

@@ -9,6 +9,7 @@ Documentation for the MeshCore bot: setup, configuration, commands, and services
 - [README](https://github.com/agessaman/meshcore-bot/blob/main/README.md) – Getting started, installation, quick start
 - [Command Reference](command-reference.md) – Full command reference
 - [Docker deployment](docker.md) – Docker deployment
+- [Home Assistant](home-assistant.md) – Add-on for Home Assistant OS and Supervised
 - [Service installation](service-installation.md) – Systemd service setup
 - [Web Viewer](web-viewer.md) – Web viewer module
 - [Upgrade guide](upgrade.md) – What changes between releases, and how to upgrade
@@ -33,6 +34,7 @@ Documentation for the MeshCore bot: setup, configuration, commands, and services
 | [Feed Management](FEEDS.md) | RSS/REST feeds and posting to channels |
 | [Web Viewer](web-viewer.md) | Web-based data viewer and API |
 | [Custom command website](command-reference-website.md) | Generate an HTML command reference for your users |
+| [Develop commands](develop-command-scripts.md) | Guide for developing bot commands |
 
 ## Service Plugins
 

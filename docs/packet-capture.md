@@ -41,29 +41,41 @@ mqtt1_topic_packets = meshcore/{IATA}/{PUBLIC_KEY}/packets
 
 ```ini
 [PacketCapture]
-enabled = true                    # Enable packet capture
-output_file = packets.json        # Optional: save to file
-verbose = false                   # Detailed packet logging
-debug = false                     # Debug mode
-mqtt_skip_unparseable_packets = true   # Skip MQTT when content hash is all zeros (strict path reject / short buffer)
+# Enable packet capture
+enabled = true
+# Optional: save to file
+output_file = packets.json
+# Detailed packet logging
+verbose = false
+# Debug mode
+debug = false
+# Skip MQTT when content hash is all zeros (strict path reject / short buffer)
+mqtt_skip_unparseable_packets = true
 
 # Optional: skip MQTT for ADVERT packets whose Ed25519 signature does not verify (damaged or spoofed mesh payload).
 # Does not affect file/JSONL capture.
 advert_require_valid_signature = false
+
+# Optional name reported as the MQTT observer "origin".
+# Defaults to the connected MeshCore device/bot name.
+observer_name = CustomObserverBot
 ```
 
 ### Authentication
 
 #### Option 1: On-Device Signing (Recommended)
 ```ini
-auth_token_method = device        # Use device's built-in signing
+# Use device's built-in signing
+auth_token_method = device
 # No private key file needed
 ```
 
 #### Option 2: Python Signing
 ```ini
-auth_token_method = python        # Use Python signing
-private_key_path = /path/to/key.txt  # Path to private key file
+# Use Python signing
+auth_token_method = python
+# Path to private key file
+private_key_path = /path/to/key.txt
 ```
 
 ### MQTT Brokers
@@ -75,7 +87,8 @@ Configure multiple brokers using `mqttN_*` pattern:
 mqtt1_enabled = true
 mqtt1_server = mqtt-us-v1.letsmesh.net
 mqtt1_port = 443
-mqtt1_transport = websockets      # tcp or websockets
+# tcp or websockets
+mqtt1_transport = websockets
 mqtt1_use_tls = true
 mqtt1_use_auth_token = true
 mqtt1_topic_status = meshcore/{IATA}/{PUBLIC_KEY}/status
@@ -89,6 +102,22 @@ mqtt2_transport = tcp
 mqtt2_username = user
 mqtt2_password = pass
 ```
+
+A working waev.app broker is in [waev.app](#waevapp).
+
+#### Connection tuning
+
+| Key | Default | What it does |
+|-----|---------|--------------|
+| `mqttN_keepalive` | `60` | Seconds between PINGREQs. Lower it to `30` for websockets through a proxy that drops idle connections. |
+| `mqttN_client_id` | generated | MQTT client ID. One is generated per broker; set this only if the broker requires a fixed value. |
+
+**Two brokers must never share a client ID.** A broker evicts an existing session
+when a second connection arrives under the same ID, so brokers that sit behind one
+cluster — `mqtt-a.example` and `mqtt-b.example` of the same service — will kick each
+other off in a loop, seconds apart, forever. The generated IDs already differ per
+broker; you only reintroduce the problem by setting `mqtt1_client_id` and
+`mqtt2_client_id` to the same string.
 
 #### Filtering by packet type
 
@@ -136,18 +165,65 @@ Two separate settings:
 - **`jwt_ttl_seconds`** (global) / **`mqttN_jwt_ttl_seconds`** (per broker): lifetime of the JWT in the `exp` claim (`exp = iat + ttl`). Use this when the broker enforces a maximum token lifetime (e.g. 60 minutes → `3600`).
 - **`jwt_renewal_interval`** (global) / **`mqttN_jwt_renewal_interval`** (per broker): how often the bot refreshes the MQTT password for that broker. Set **less than** the TTL (e.g. TTL 3600s and renewal every 1800s) so the connection does not outlive the token.
 
+- **`mqttN_jwt_reconnect_on_renew`** (per broker, default `true`): reconnect right
+  after minting a new token. MQTT presents credentials once, at CONNECT, so a
+  renewed token does nothing for a session that is already open — brokers that
+  enforce the JWT's `exp` drop that session the moment the *original* token
+  expires. Reconnecting on renewal turns that eviction into one clean, scheduled
+  reconnect. Turn it off only if your broker ignores expiry on live sessions.
+
 Per-broker keys override the global values for that broker only. Omit them to inherit globals.
 
 ```ini
-stats_in_status_enabled = true    # Include device stats in status
-stats_refresh_interval = 300      # Publish status every 5 minutes
+# Include device stats in status
+stats_in_status_enabled = true
+# Publish status every 5 minutes
+stats_refresh_interval = 300
 
-jwt_ttl_seconds = 86400           # Default JWT exp − iat (24 hours) for all brokers unless overridden
-jwt_renewal_interval = 43200      # Default proactive refresh cadence (12 hours); 0 = no renewal task
+# Default JWT exp − iat (24 hours) for all brokers unless overridden
+jwt_ttl_seconds = 86400
+# Default proactive refresh cadence (12 hours); 0 = no renewal task
+jwt_renewal_interval = 43200
 
 # Example on a broker that requires 60-minute tokens and refresh halfway through:
 # mqtt1_jwt_ttl_seconds = 3600
 # mqtt1_jwt_renewal_interval = 1800
+```
+
+### waev.app
+
+`mqtt-a.waev.app` connects with the block below: TLS websockets on port 443,
+path `/mqtt`, a JWT whose audience is the broker hostname, and the usual
+MeshCore status and packet topics. waev.app accepts a token for one hour, so
+the TTL is 3600 seconds and renewal is 3500. Leave `client_id` empty and the
+bot generates one for this broker.
+
+Brokers are numbered from 1 with no gaps. The bot reads `mqtt1_server`, then
+`mqtt2_server`, and stops at the first number with no server line, so the `5`
+below is the next slot only when brokers 1–4 each have a server. On a copy of
+`config.ini.example` the next slot is `mqtt3_`, where the same keys are
+commented out. `mqttN_enabled` defaults to true when the server line is
+present; the block sets it so the slot is on.
+
+When `jwt_ttl_seconds` and `jwt_renewal_interval` are present, a waev.app
+broker uses those values. The example config sets both to 86400, which
+waev.app rejects, so the block sets the two per-broker timings. With both
+globals absent, a `waev.app` hostname already gets 3600 and 3500.
+
+```ini
+mqtt5_enabled = true
+mqtt5_server = mqtt-a.waev.app
+mqtt5_port = 443
+mqtt5_transport = websockets
+mqtt5_use_tls = true
+mqtt5_use_auth_token = true
+mqtt5_token_audience = mqtt-a.waev.app
+mqtt5_topic_status = meshcore/{IATA}/{PUBLIC_KEY}/status
+mqtt5_topic_packets = meshcore/{IATA}/{PUBLIC_KEY}/packets
+mqtt5_websocket_path = /mqtt
+mqtt5_jwt_ttl_seconds = 3600
+mqtt5_jwt_renewal_interval = 3500
+mqtt5_client_id =
 ```
 
 ---
@@ -159,7 +235,7 @@ jwt_renewal_interval = 43200      # Default proactive refresh cadence (12 hours)
 {
   "origin": "MyBot",
   "origin_id": "ABCD1234...",
-  "timestamp": "2026-01-04T12:34:56",
+  "timestamp": "2026-01-04T12:34:56Z",
   "type": "PACKET",
   "direction": "rx",
   "len": "42",
@@ -172,6 +248,10 @@ jwt_renewal_interval = 43200      # Default proactive refresh cadence (12 hours)
   "hash": "ABC123..."
 }
 ```
+
+Every timestamp the bot publishes is UTC and carries a `Z` suffix, so a consumer never has
+to guess the host's timezone. A payload showing a bare local time came from a build older
+than v1.0.0 (issue #276).
 
 ### Decoded Payloads
 
@@ -225,16 +305,16 @@ independent of this setting.
 ```json
 {
   "status": "online",
-  "timestamp": "2026-01-04T12:34:56",
+  "timestamp": "2026-01-04T12:34:56Z",
   "origin": "MyBot",
   "origin_id": "ABCD1234...",
   "model": "Heltec V3",
   "firmware_version": "v3.1.2",
   "radio": "915000000,250,9,8",
-  "client_version": "meshcore-bot/v1.0.0",
+  "client_version": "meshcore-bot/v1.2.0",
   "stats": {
-    "rx_packets": 1234,
-    "tx_packets": 567
+    "packets_received": 1234,
+    "packets_sent": 567
   }
 }
 ```
@@ -264,6 +344,29 @@ Common issues:
 3. **Check authentication** - Verify JWT token generation
 4. **Check logs** - Look for connection errors
 
+### MQTT Connecting and Disconnecting in a Loop
+
+Repeated `Disconnected from MQTT broker ... (rc=7: The connection was lost.)`
+followed immediately by `✓ Connected to MQTT broker`, over and over:
+
+1. **Check for a shared client ID** — if two brokers alternate (one connects as the
+   other drops, every few seconds), they are almost certainly one cluster behind two
+   hostnames, evicting each other's session. Give them distinct `mqttN_client_id`
+   values, or leave the key empty so one is generated per broker.
+2. **Check whether it lines up with your JWT TTL** — roughly one disconnect per
+   broker per `mqttN_jwt_ttl_seconds` means the broker is enforcing token expiry.
+   Leave `mqttN_jwt_reconnect_on_renew` on and set the renewal interval below the
+   TTL so the reconnect happens on your schedule instead of theirs.
+3. **Check for a second client on the same identity** — another capture tool running
+   against the same brokers with the same node public key can compete with the bot.
+4. **Lower `mqttN_keepalive`** to `30` if you are on websockets through a proxy.
+
+Note that `rc=` on a *disconnect* is a paho `MQTT_ERR_*` code, not a CONNACK code:
+`rc=7` is a lost connection and `rc=2` is a protocol error. They do not mean the same
+thing as the numbers in a `Failed to connect` line.
+
+A waev.app broker that fails to authenticate needs the block in [waev.app](#waevapp).
+
 ### No Packets Being Published
 
 1. **Verify MQTT connection** - Check logs for "Connected to MQTT broker"
@@ -282,8 +385,10 @@ Configure up to 10 brokers (mqtt1_* through mqtt10_*). Each broker has independe
 ### Health Monitoring
 
 ```ini
-health_check_interval = 30        # Check connection every 30s
-health_check_grace_period = 2     # Allow 2 failures before warning
+# Check connection every 30s
+health_check_interval = 30
+# Allow 2 failures before warning
+health_check_grace_period = 2
 ```
 
 ### Log Rotation
@@ -341,8 +446,10 @@ first-party RF measurement between two full 32-byte public keys.
 ```ini
 [PacketCapture]
 enabled = true
-neighbors_enabled = true          # the only switch you need
-neighbors_interval_hours = 24     # clamped to 12-336
+# the only switch you need
+neighbors_enabled = true
+# clamped to 12-336
+neighbors_interval_hours = 24
 ```
 
 That one setting turns the whole feature on. Every enabled broker publishes the
@@ -426,24 +533,20 @@ more minute" would be followed by fourteen more minutes of personal cooldown.
 ### Region scopes are opt-in, and why
 
 `neighbors_collect_scopes` additionally asks each neighbour for its region scopes.
-It defaults to **false** for two reasons specific to running inside the bot:
+It defaults to **false** for a reason specific to running inside the bot:
 
-1. **It stalls bot replies.** Every bot radio command is serialised through one lock
-   (`modules/core.py` `_SerializedCommands`), and `req_regions_sync` waits for its
-   reply *inside* the call — so one request holds the radio for up to ~25 s. With 32
-   neighbours the bot's own messages stall in bursts for minutes.
-2. **It mutates device contact state.** The zero-hop probe relies on the neighbour
-   *not* being a known contact. The bot does track contacts, and for a repeater with
-   no stored path the meshcore library reaches zero-hop by calling
-   `change_contact_path()` and then `reset_path()` — temporarily rewriting that
-   contact's path on the device. Those two calls are not paired by a
-   `try`/`finally` upstream, and one error path returns between them, so a request
-   cut short — or one whose path change was applied but not acknowledged — would
-   leave the contact pinned to zero-hop and every later message to it sent
-   direct-only. `modules/neighbors_discovery.py` restores the path itself in each
-   of those cases, and warns if the device rejects the restore (which it reports
-   as an error event rather than an exception), since that contact's routing is
-   then wrong until something else fixes it.
+- **It mutates device contact state.** The zero-hop probe relies on the neighbour
+  *not* being a known contact. The bot does track contacts, and for a repeater with
+  no stored path the meshcore library reaches zero-hop by calling
+  `change_contact_path()` and then `reset_path()` — temporarily rewriting that
+  contact's path on the device. Those two calls are not paired by a
+  `try`/`finally` upstream, and one error path returns between them, so a request
+  cut short — or one whose path change was applied but not acknowledged — would
+  leave the contact pinned to zero-hop and every later message to it sent
+  direct-only. `modules/neighbors_discovery.py` restores the path itself in each
+  of those cases, and warns if the device rejects the restore (which it reports
+  as an error event rather than an exception), since that contact's routing is
+  then wrong until something else fixes it.
 
 With it off, the snapshot reports every neighbour it heard with empty `scopes` and
 `status: responded`. Enable it on a bench radio first.
